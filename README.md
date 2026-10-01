@@ -6,13 +6,13 @@ Teste de infraestrutura Android em repositório público próprio. Não contém 
 
 Actions → **Android KVM proof of concept** → **Run workflow** → branch `main`.
 
-O workflow usa `ubuntu-latest`, habilita e verifica leitura/escrita de `/dev/kvm`, inicia Android API 35 x86_64 com aceleração obrigatória, valida ADB e boot completo, abre a tela inicial e verifica a assinatura PNG do screenshot. Limite: 20 minutos; uma execução por vez. Não depende de computador ou celular ligado após o disparo.
+O workflow usa `ubuntu-latest`, habilita e verifica leitura/escrita de `/dev/kvm`, inicia Android API 35 x86_64 com aceleração obrigatória, valida ADB e boot completo, aguarda a interface, captura a tela inicial, abre Configurações, verifica a presença do pacote `com.android.settings` na hierarquia da tela e captura uma segunda imagem. Verifica também a assinatura PNG dos screenshots. Limite: 20 minutos; uma execução por vez. Não depende de computador ou celular ligado após o disparo.
 
-Em **Artifacts**, o ZIP `android-poc-<run_id>` contém o screenshot e as evidências de KVM, ADB, versão, modelo, ABIs e resultado. Retenção de um dia para minimizar armazenamento. Nenhum snapshot do Android ou cache é persistido.
+Em **Artifacts**, o ZIP `android-poc-<run_id>` contém os screenshots, a hierarquia das Configurações e as evidências de KVM, ADB, versão, modelo, ABIs e resultado. Retenção de um dia para minimizar armazenamento. Nenhum snapshot do Android ou cache é persistido.
 
 ## Kwai: instalação condicional
 
-Fonte consultada: [site oficial](https://www.kwai.com/about) e [Central de Ajuda](https://www.kwai.com/pt-BR/support/app). Ambos direcionam à distribuição pelas lojas oficiais. Não foi obtido um APK direto oficial com compatibilidade x86_64 verificada. Portanto a instalação está **SKIPPED**, documentada em `kwai-status.txt`; não usamos APKs de terceiros.
+Fonte consultada: [site oficial](https://www.kwai.com/about) e [Central de Ajuda](https://www.kwai.com/pt-BR/support/app). Ambos direcionam à distribuição pelas lojas oficiais. Não foi obtido um APK direto oficial com compatibilidade x86_64 verificada. Portanto a instalação está **SKIPPED**, documentada em `kwai-status.txt`; não usamos APKs de terceiros. A navegação pelo botão Google Play também foi bloqueada pela proteção do navegador nesta sessão; o bloqueio não foi contornado.
 
 A validação da infraestrutura não comprova que o Kwai aceita esse emulador, login, persistência de sessão ou automação. Esses pontos permanecem pendentes.
 
