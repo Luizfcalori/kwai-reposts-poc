@@ -26,9 +26,26 @@ jobs:
           test -r /dev/kvm && test -w /dev/kvm
           ls -l /dev/kvm | tee artifacts/kvm.txt
           printf 'Kwai installation: SKIPPED\nOfficial source reviewed: https://www.kwai.com/about\nOfficial help: https://www.kwai.com/pt-BR/support/app\nGoogle Play is the verified Android distribution. No official direct APK with verified x86_64 compatibility was obtained. No third-party APK, account login or posting attempted.\n' > artifacts/kwai-status.txt
+          cat > /tmp/validate-android.sh <<'VALIDATE_ANDROID'
+          set -euo pipefail
+          adb wait-for-device
+          test "$(adb get-state)" = device
+          test "$(adb shell getprop sys.boot_completed | tr -d '\r')" = 1
+          adb devices -l | tee artifacts/adb-devices.txt
+          adb shell getprop ro.build.version.release | tee artifacts/android-version.txt
+          adb shell getprop ro.product.model | tee artifacts/android-model.txt
+          adb shell getprop ro.product.cpu.abilist | tee artifacts/android-abis.txt
+          "$ANDROID_HOME/emulator/emulator" -accel-check | tee artifacts/acceleration.txt
+          adb shell input keyevent 82
+          adb shell input keyevent 3
+          sleep 5
+          adb exec-out screencap -p > artifacts/android-home.png
+          python3 -c "from pathlib import Path; p=Path('artifacts/android-home.png'); b=p.read_bytes(); assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000; print('Valid PNG:', len(b), 'bytes')"
+          printf 'PASS: KVM, Android boot, ADB and PNG screenshot validated.\n' > artifacts/result.txt
+          VALIDATE_ANDROID
 
       - name: Boot Android and validate ADB
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 35
           target: google_apis
@@ -40,22 +57,7 @@ jobs:
           emulator-boot-timeout: 600
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
-          script: |
-            set -euo pipefail
-            adb wait-for-device
-            test "$(adb get-state)" = device
-            test "$(adb shell getprop sys.boot_completed | tr -d '\r')" = 1
-            adb devices -l | tee artifacts/adb-devices.txt
-            adb shell getprop ro.build.version.release | tee artifacts/android-version.txt
-            adb shell getprop ro.product.model | tee artifacts/android-model.txt
-            adb shell getprop ro.product.cpu.abilist | tee artifacts/android-abis.txt
-            "$ANDROID_HOME/emulator/emulator" -accel-check | tee artifacts/acceleration.txt
-            adb shell input keyevent 82
-            adb shell input keyevent 3
-            sleep 5
-            adb exec-out screencap -p > artifacts/android-home.png
-            python3 -c "from pathlib import Path; p=Path('artifacts/android-home.png'); b=p.read_bytes(); assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000; print('Valid PNG:', len(b), 'bytes')"
-            printf 'PASS: KVM, Android boot, ADB and PNG screenshot validated.\n' > artifacts/result.txt
+          script: bash /tmp/validate-android.sh
 
       - name: Publish test summary
         if: always()
@@ -72,7 +74,7 @@ jobs:
 
       - name: Upload diagnostic evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: android-poc-${{ github.run_id }}
           path: artifacts/
