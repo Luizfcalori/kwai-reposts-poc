@@ -1,0 +1,80 @@
+name: Android KVM proof of concept
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kwai-poc
+  cancel-in-progress: false
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Prepare evidence and enable KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          ls -l /dev/kvm | tee artifacts/kvm.txt
+          printf 'Kwai installation: SKIPPED\nOfficial source reviewed: https://www.kwai.com/about\nOfficial help: https://www.kwai.com/pt-BR/support/app\nGoogle Play is the verified Android distribution. No official direct APK with verified x86_64 compatibility was obtained. No third-party APK, account login or posting attempted.\n' > artifacts/kwai-status.txt
+
+      - name: Boot Android and validate ADB
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 2048M
+          heap-size: 512M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          script: |
+            set -euo pipefail
+            adb wait-for-device
+            test "$(adb get-state)" = device
+            test "$(adb shell getprop sys.boot_completed | tr -d '\r')" = 1
+            adb devices -l | tee artifacts/adb-devices.txt
+            adb shell getprop ro.build.version.release | tee artifacts/android-version.txt
+            adb shell getprop ro.product.model | tee artifacts/android-model.txt
+            adb shell getprop ro.product.cpu.abilist | tee artifacts/android-abis.txt
+            "$ANDROID_HOME/emulator/emulator" -accel-check | tee artifacts/acceleration.txt
+            adb shell input keyevent 82
+            adb shell input keyevent 3
+            sleep 5
+            adb exec-out screencap -p > artifacts/android-home.png
+            python3 -c "from pathlib import Path; p=Path('artifacts/android-home.png'); b=p.read_bytes(); assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000; print('Valid PNG:', len(b), 'bytes')"
+            printf 'PASS: KVM, Android boot, ADB and PNG screenshot validated.\n' > artifacts/result.txt
+
+      - name: Publish test summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai Reposts - isolated Android proof of concept'
+            if test -f artifacts/result.txt; then cat artifacts/result.txt; else echo 'FAIL: Android validation did not finish. Inspect the failed step.'; fi
+            echo
+            cat artifacts/kwai-status.txt 2>/dev/null || true
+            echo
+            echo 'No secrets, session snapshots, video downloads or posts. No schedule enabled.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-poc-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
