@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+*cookie*
+*credential*
+*token*
+*session*
+*.apk
+*.aab
+*.jks
+*.keystore
+*.pem
+*.key
+*.avd/
+.android/
+artifacts/
+secrets/
