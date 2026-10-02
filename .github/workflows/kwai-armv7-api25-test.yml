@@ -1,0 +1,91 @@
+name: Kwai ARMv7 API25 proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-armv7-api25-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  kwai-armv7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Download Kwai bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai-xapk
+          curl -fL --retry 4 --retry-delay 3 -A 'Mozilla/5.0' \
+            'https://d.apkpure.net/b/XAPK/com.kwai.video?version=latest' \
+            -o /tmp/kwai.xapk
+          unzip -q /tmp/kwai.xapk -d /tmp/kwai-xapk
+          sha256sum /tmp/kwai.xapk | tee artifacts/xapk-sha256.txt
+          cat > /tmp/test-armv7.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 5; done
+          {
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo "abilist32=$(adb shell getprop ro.product.cpu.abilist32 | tr -d '\r')"
+            echo "native_bridge=$(adb shell getprop ro.dalvik.vm.native.bridge | tr -d '\r')"
+          } | tee artifacts/abi.txt
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          BASE='/tmp/kwai-xapk/com.kwai.video.apk'
+          "$APKSIGNER" verify --print-certs "$BASE" > artifacts/base-cert.txt 2>&1
+          SHA1="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-1 digest:/{print tolower($NF); exit}' artifacts/base-cert.txt)"
+          test "$SHA1" = '5283fea03bd6e2ff0458a7b4879c97283b784deb'
+
+          adb install-multiple -r \
+            /tmp/kwai-xapk/com.kwai.video.apk \
+            /tmp/kwai-xapk/config.armeabi_v7a.apk \
+            /tmp/kwai-xapk/config.mdpi.apk \
+            /tmp/kwai-xapk/dfm_ug.apk | tee artifacts/install.txt
+          adb shell pm path com.kwai.video | tee artifacts/installed-paths.txt
+          adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
+          sleep 25
+          adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+          adb pull /sdcard/window.xml artifacts/kwai-ui.xml >/dev/null 2>&1 || true
+          adb exec-out screencap -p > artifacts/kwai.png
+          echo 'PASS: Kwai installed and opened on ARMv7 API25 emulator.' | tee artifacts/result.txt
+          SH
+          chmod +x /tmp/test-armv7.sh
+
+      - name: Boot ARMv7 Android 7.1 without KVM
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 25
+          target: google_apis
+          arch: armeabi-v7a
+          profile: Nexus 5
+          cores: 2
+          ram-size: 2048M
+          emulator-boot-timeout: 900
+          disable-animations: true
+          disable-linux-hw-accel: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel off
+          script: bash /tmp/test-armv7.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai ARMv7 API25 test'
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: inspect logs.'
+            cat artifacts/abi.txt 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-armv7-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
