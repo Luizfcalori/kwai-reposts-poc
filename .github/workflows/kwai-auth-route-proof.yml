@@ -2,6 +2,9 @@ name: Kwai sanitized auth route proof
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/kwai-auth-trigger.txt'
 
 permissions:
   contents: read
