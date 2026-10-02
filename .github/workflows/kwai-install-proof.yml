@@ -31,14 +31,14 @@ jobs:
 
           echo '=== Trying x86/x86_64-compatible package first ===' | tee artifacts/download.txt
           if docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
-              -a com.kwai.video -d apk-pure -o 'arch=x86_64;x86' /output \
+              -a com.kwai.video -d apk-pure -o 'acknowledge_dangers=true,arch=x86_64;x86' /output \
               2>&1 | tee -a artifacts/download.txt; then
             echo 'DOWNLOAD_MODE=x86-first' | tee -a artifacts/download.txt
           else
             echo 'x86-specific download failed; falling back to the latest package metadata.' | tee -a artifacts/download.txt
             rm -f apks/*
             docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
-              -a com.kwai.video -d apk-pure /output \
+              -a com.kwai.video -d apk-pure -o 'acknowledge_dangers=true' /output \
               2>&1 | tee -a artifacts/download.txt
             echo 'DOWNLOAD_MODE=default-fallback' | tee -a artifacts/download.txt
           fi
