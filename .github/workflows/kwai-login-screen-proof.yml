@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/kwai-login-screen-proof.yml'
       - 'scripts/kwai_ui_probe.py'
+      - 'scripts/kwai_ui_probe_confirm.py'
 
 permissions:
   contents: read
@@ -72,7 +73,7 @@ jobs:
 
           adb logcat -c || true
           set +e
-          python3 scripts/kwai_ui_probe.py 2>&1 | tee artifacts/ui-probe-console.txt
+          python3 scripts/kwai_ui_probe_confirm.py 2>&1 | tee artifacts/ui-probe-console.txt
           PROBE_RC=${PIPESTATUS[0]}
           set -e
           adb logcat -d -t 1500 > artifacts/ui-logcat.txt 2>&1 || true
