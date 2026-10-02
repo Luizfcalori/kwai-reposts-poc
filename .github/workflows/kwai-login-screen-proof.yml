@@ -70,6 +70,20 @@ jobs:
             | grep -E 'versionName=|versionCode=|primaryCpuAbi=|secondaryCpuAbi=' \
             | head -n 20 | tee artifacts/installed-package.txt || true
 
+          # Kwai asks for a second confirmation after tapping Skip on the
+          # preparation/download screen. Patch the probe in the ephemeral
+          # runner so the proof only continues after "Yes, skip" is accepted.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/kwai_ui_probe.py')
+          s = p.read_text(encoding='utf-8')
+          old = '''    time.sleep(7)\n    root, texts = dump(tag)\n    return root, texts, skipped\n'''
+          new = '''    time.sleep(2)\n    root, texts = dump(tag + "-confirm")\n    if contains(texts, r"Skip the preparation|^Yes, skip$"):\n        confirmed = tap_node(root, lambda s: s.strip().lower() == "yes, skip")\n        if not confirmed:\n            adb("shell", "input", "tap", str(int(w*0.35)), str(int(h*0.62)))\n        time.sleep(7)\n    root, texts = dump(tag)\n    return root, texts, skipped\n'''
+          if old not in s:
+              raise SystemExit('Expected skip_slow_loader block not found')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+          PY
+
           adb logcat -c || true
           set +e
           python3 scripts/kwai_ui_probe.py 2>&1 | tee artifacts/ui-probe-console.txt
