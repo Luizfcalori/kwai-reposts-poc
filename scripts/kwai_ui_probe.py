@@ -49,9 +49,12 @@ def dump(tag):
     adb("shell", "uiautomator", "dump", remote)
     xml_path = ART / f"{tag}.xml"
     adb("pull", remote, str(xml_path))
-    adb("exec-out", "screencap", "-p")
     with open(ART / f"{tag}.png", "wb") as f:
-        p = subprocess.run(["adb", "exec-out", "screencap", "-p"], stdout=f, stderr=subprocess.DEVNULL)
+        p = subprocess.run(
+            ["adb", "exec-out", "screencap", "-p"],
+            stdout=f,
+            stderr=subprocess.DEVNULL,
+        )
         if p.returncode:
             raise RuntimeError("screencap failed")
     if not xml_path.exists():
@@ -69,7 +72,9 @@ def tap_node(root, matcher):
     if root is None:
         return False
     for node in root.iter("node"):
-        label = " ".join(filter(None, [node.attrib.get("text", ""), node.attrib.get("content-desc", "")])).strip()
+        label = " ".join(
+            filter(None, [node.attrib.get("text", ""), node.attrib.get("content-desc", "")])
+        ).strip()
         if matcher(label):
             point = parse_bounds(node.attrib.get("bounds", ""))
             if point:
@@ -106,7 +111,13 @@ def main():
     # Avoid first-run notification modal masking Kwai UI.
     adb("shell", "pm", "grant", "com.kwai.video", "android.permission.POST_NOTIFICATIONS")
     adb("shell", "am", "force-stop", "com.kwai.video")
-    adb("shell", "am", "start", "-n", "com.kwai.video/com.yxcorp.gifshow.tiny.TinyLaunchActivity")
+    adb(
+        "shell",
+        "am",
+        "start",
+        "-n",
+        "com.kwai.video/com.yxcorp.gifshow.tiny.TinyLaunchActivity",
+    )
     time.sleep(12)
 
     for i in range(3):
@@ -118,7 +129,10 @@ def main():
     # First-run preference onboarding is 1/5 ... 5/5. Choosing a preference is harmless.
     for step in range(1, 8):
         joined = "\n".join(texts)
-        if not (re.search(r"\b[1-5]/5\b", joined) or re.search(r"like or dislike|know you better", joined, re.I)):
+        if not (
+            re.search(r"\b[1-5]/5\b", joined)
+            or re.search(r"like or dislike|know you better", joined, re.I)
+        ):
             break
         # Left preference button observed on first-run screen; relative coordinate survives density changes.
         adb("shell", "input", "tap", str(int(w * 0.27)), str(int(h * 0.93)))
@@ -142,8 +156,14 @@ def main():
 
     # If a login entry point is present, open it but never enter credentials.
     login_labels = [
-        r"^Log in$", r"^Login$", r"^Sign in$", r"^Entrar$", r"^Fazer login$",
-        r"^Sign up or log in$", r"^Cadastre-se ou entre$", r"^Entrar ou cadastrar$"
+        r"^Log in$",
+        r"^Login$",
+        r"^Sign in$",
+        r"^Entrar$",
+        r"^Fazer login$",
+        r"^Sign up or log in$",
+        r"^Cadastre-se ou entre$",
+        r"^Entrar ou cadastrar$",
     ]
     clicked_login = False
     for pat in login_labels:
@@ -155,10 +175,13 @@ def main():
 
     root, texts = dump("05-final")
     joined = "\n".join(texts)
-    login_screen = bool(re.search(
-        r"phone|telefone|mobile|email|google|facebook|log in|login|sign in|entrar|verification|c[oó]digo",
-        joined, re.I,
-    ))
+    login_screen = bool(
+        re.search(
+            r"phone|telefone|mobile|email|google|facebook|log in|login|sign in|entrar|verification|c[oó]digo",
+            joined,
+            re.I,
+        )
+    )
 
     result = {
         "clicked_profile": clicked_profile,
