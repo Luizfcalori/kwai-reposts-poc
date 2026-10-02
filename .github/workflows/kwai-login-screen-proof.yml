@@ -1,4 +1,4 @@
-name: Kwai login screen proof
+name: Kwai Google sign-in proof
 
 on:
   workflow_dispatch:
@@ -7,6 +7,7 @@ on:
       - '.github/workflows/kwai-login-screen-proof.yml'
       - 'scripts/kwai_ui_probe.py'
       - 'scripts/kwai_ui_probe_confirm.py'
+      - 'scripts/kwai_google_continue.py'
 
 permissions:
   contents: read
@@ -39,7 +40,7 @@ jobs:
           cat > /tmp/install-and-probe.sh <<'SH'
           set -euo pipefail
           EXPECTED_CERT='bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
-          mkdir -p artifacts/ui /tmp/kwai-package
+          mkdir -p artifacts/ui artifacts/google /tmp/kwai-package
 
           adb wait-for-device
           while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
@@ -75,14 +76,20 @@ jobs:
           set +e
           python3 scripts/kwai_ui_probe_confirm.py 2>&1 | tee artifacts/ui-probe-console.txt
           PROBE_RC=${PIPESTATUS[0]}
+          GOOGLE_RC=$PROBE_RC
+          if [ "$PROBE_RC" -eq 0 ]; then
+            python3 scripts/kwai_google_continue.py 2>&1 | tee artifacts/google-probe-console.txt
+            GOOGLE_RC=${PIPESTATUS[0]}
+          fi
           set -e
           adb logcat -d -t 1500 > artifacts/ui-logcat.txt 2>&1 || true
           adb exec-out screencap -p > artifacts/final-screen.png || true
-          exit "$PROBE_RC"
+          if [ "$PROBE_RC" -ne 0 ]; then exit "$PROBE_RC"; fi
+          exit "$GOOGLE_RC"
           SH
           chmod +x /tmp/install-and-probe.sh
 
-      - name: Boot Android, install Kwai and reach login safely
+      - name: Boot Android, install Kwai and reach Google sign-in safely
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         with:
           api-level: 34
@@ -102,20 +109,22 @@ jobs:
         shell: bash
         run: |
           {
-            echo '## Kwai safe login-screen proof'
+            echo '## Kwai safe Google sign-in proof'
             echo
             cat artifacts/installed-package.txt 2>/dev/null || true
             echo
-            cat artifacts/ui-result.txt 2>/dev/null || echo 'UI result not produced.'
+            cat artifacts/ui-result.txt 2>/dev/null || echo 'Kwai login result not produced.'
             echo
-            echo 'Safety boundary: no credentials entered, no account authenticated, no upload or publication attempted.'
+            cat artifacts/google-result.txt 2>/dev/null || echo 'Google-step result not produced.'
+            echo
+            echo 'Safety boundary: no email, password, verification code, account authentication, upload, or publication attempted.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload UI evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: kwai-login-screen-proof-${{ github.run_id }}
+          name: kwai-google-signin-proof-${{ github.run_id }}
           path: artifacts/
           if-no-files-found: error
           retention-days: 1
