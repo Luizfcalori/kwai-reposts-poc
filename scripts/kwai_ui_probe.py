@@ -83,6 +83,18 @@ def tap_node(root, matcher):
     return False
 
 
+def tap_resource_id(root, resource_id):
+    if root is None:
+        return False
+    for node in root.iter("node"):
+        if node.attrib.get("resource-id") == resource_id:
+            point = parse_bounds(node.attrib.get("bounds", ""))
+            if point:
+                adb("shell", "input", "tap", str(point[0]), str(point[1]))
+                return True
+    return False
+
+
 def contains(texts, pattern):
     rx = re.compile(pattern, re.I)
     return any(rx.search(t) for t in texts)
@@ -93,9 +105,9 @@ def tap_profile(root, w, h):
     for pat in profile_patterns:
         rx = re.compile(pat, re.I)
         if tap_node(root, lambda s, rx=rx: bool(rx.search(s))):
-            return True
+            return "semantic"
     adb("shell", "input", "tap", str(int(w * 0.92)), str(int(h * 0.965)))
-    return False
+    return "coordinate"
 
 
 def dismiss_safe_system_overlays(round_no):
@@ -105,8 +117,6 @@ def dismiss_safe_system_overlays(round_no):
         if tap_node(root, lambda s: s.strip().lower() == "close app"):
             time.sleep(2)
             return True
-    # Never accept account, purchase, publish, or destructive dialogs here.
-    # Notification permission is granted with pm grant before launch; this is a fallback only.
     if contains(texts, r"send you notifications|notifications"):
         if tap_node(root, lambda s: s.strip().lower() in {"allow", "while using the app"}):
             time.sleep(2)
@@ -114,11 +124,55 @@ def dismiss_safe_system_overlays(round_no):
     return False
 
 
+def run_preference_onboarding(root, texts, w, h):
+    steps = 0
+    for step in range(1, 21):
+        joined = "\n".join(texts)
+        active = bool(
+            re.search(r"\b\d+/(?:5|12)\b", joined)
+            or re.search(r"choose like or dislike|know you better|swipe up to view the next video", joined, re.I)
+        )
+        if not active:
+            break
+
+        steps += 1
+        # This is only the pre-login preference selector; it does not act on an authenticated account.
+        chose = tap_resource_id(root, "com.kwai.video:id/tiny_discovery_like_button")
+        if not chose and re.search(r"choose like or dislike|know you better", joined, re.I):
+            adb("shell", "input", "tap", str(int(w * 0.27)), str(int(h * 0.915)))
+            chose = True
+
+        if chose:
+            time.sleep(1.2)
+            root, texts = dump(f"02-onboarding-{step:02d}-chosen")
+
+        joined = "\n".join(texts)
+        if re.search(r"swipe up to view the next video", joined, re.I) or re.search(r"\b\d+/12\b", joined):
+            adb(
+                "shell",
+                "input",
+                "swipe",
+                str(int(w * 0.50)),
+                str(int(h * 0.72)),
+                str(int(w * 0.50)),
+                str(int(h * 0.28)),
+                "350",
+            )
+            time.sleep(2)
+            root, texts = dump(f"02-onboarding-{step:02d}-swiped")
+        elif chose:
+            time.sleep(1)
+            root, texts = dump(f"02-onboarding-{step:02d}-advanced")
+        else:
+            break
+
+    return root, texts, steps
+
+
 def main():
     w, h = screen_size()
     print(f"screen={w}x{h}")
 
-    # Avoid first-run notification modal masking Kwai UI.
     adb("shell", "pm", "grant", "com.kwai.video", "android.permission.POST_NOTIFICATIONS")
     adb("shell", "am", "force-stop", "com.kwai.video")
     adb(
@@ -135,23 +189,10 @@ def main():
             break
 
     root, texts = dump("01-first-clear-view")
-
-    # First-run preference onboarding is 1/5 ... 5/5. Choosing a preference is harmless.
-    for step in range(1, 8):
-        joined = "\n".join(texts)
-        if not (
-            re.search(r"\b[1-5]/5\b", joined)
-            or re.search(r"like or dislike|know you better", joined, re.I)
-        ):
-            break
-        adb("shell", "input", "tap", str(int(w * 0.27)), str(int(h * 0.93)))
-        time.sleep(2)
-        root, texts = dump(f"02-onboarding-{step}")
-
+    root, texts, onboarding_steps = run_preference_onboarding(root, texts, w, h)
     root, texts = dump("03-after-onboarding")
 
-    # Open Profile. On first use Kwai can download an additional resource module.
-    clicked_profile = tap_profile(root, w, h)
+    profile_tap_method = tap_profile(root, w, h)
     time.sleep(5)
     root, texts = dump("04-profile-attempt")
 
@@ -176,13 +217,10 @@ def main():
             time.sleep(3)
             root, texts = dump("04-resource-hidden")
 
-        # The first Profile tap starts the module download but does not navigate.
-        # Retry after the download wait/hide phase.
         tap_profile(root, w, h)
         time.sleep(8)
         root, texts = dump("04-profile-retry")
 
-    # If a login entry point is present, open it but never enter credentials.
     login_patterns = [
         r"^Log in$",
         r"^Login$",
@@ -214,7 +252,8 @@ def main():
     )
 
     result = {
-        "clicked_profile": clicked_profile,
+        "onboarding_steps": onboarding_steps,
+        "profile_tap_method": profile_tap_method,
         "resource_seen": resource_seen,
         "resource_completed": resource_completed,
         "resource_wait_seconds": resource_wait_seconds,
@@ -227,7 +266,6 @@ def main():
     )
     print(result)
 
-    # The proof remains non-destructive: no credentials, uploads, or publication actions are used.
     if not result["pid"]:
         raise SystemExit("Kwai process stopped during safe UI probe")
 
