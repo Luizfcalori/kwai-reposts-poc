@@ -102,10 +102,13 @@ def contains(texts, pattern):
 
 def onboarding_counter(texts):
     joined = "\n".join(texts)
-    m = re.search(r"\b(\d+)/(5|12)\b", joined)
+    m = re.search(r"\b(\d+)/(\d+)\b", joined)
     if not m:
         return None
-    return int(m.group(1)), int(m.group(2))
+    current, total = int(m.group(1)), int(m.group(2))
+    if total < 2 or total > 50 or current < 1 or current > total:
+        return None
+    return current, total
 
 
 def tap_profile(root, w, h):
@@ -173,10 +176,10 @@ def run_preference_onboarding(root, texts, w, h):
     swipe_failures = 0
     last_counter = onboarding_counter(texts)
 
-    for step in range(1, 25):
+    for step in range(1, 51):
         joined = "\n".join(texts)
         active = bool(
-            re.search(r"\b\d+/(?:5|12)\b", joined)
+            onboarding_counter(texts)
             or re.search(r"choose like or dislike|know you better|swipe up to view the next video", joined, re.I)
         )
         if not active:
@@ -197,7 +200,16 @@ def run_preference_onboarding(root, texts, w, h):
             root, texts = dump(f"02-onboarding-{step:02d}-chosen")
 
         joined = "\n".join(texts)
-        if re.search(r"swipe up to view the next video", joined, re.I) or re.search(r"\b\d+/12\b", joined):
+        current_counter = onboarding_counter(texts)
+        if re.search(r"swipe up to view the next video", joined, re.I) or current_counter:
+            if current_counter and current_counter[0] >= current_counter[1] and not re.search(
+                r"swipe up to view the next video", joined, re.I
+            ):
+                time.sleep(2)
+                root, texts = dump(f"02-onboarding-{step:02d}-complete-check")
+                last_counter = onboarding_counter(texts)
+                continue
+
             root, texts, advanced, attempts = swipe_to_next_onboarding(root, texts, w, h, step)
             if not advanced:
                 swipe_failures += 1
@@ -210,10 +222,6 @@ def run_preference_onboarding(root, texts, w, h):
             last_counter = onboarding_counter(texts)
         else:
             break
-
-        # If the tutorial explicitly reaches its last card, allow the next loop to verify it cleared.
-        if last_counter and last_counter[0] >= last_counter[1]:
-            time.sleep(2)
 
     return root, texts, steps, swipe_failures, last_counter
 
