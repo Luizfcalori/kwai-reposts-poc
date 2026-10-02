@@ -1,0 +1,132 @@
+name: Kwai verified install proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-install-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  kwai:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download bundle, prepare verifier and KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai-xapk
+          curl -fL --retry 4 --retry-delay 3 \
+            -A 'Mozilla/5.0' \
+            'https://d.apkpure.net/b/XAPK/com.kwai.video?version=latest' \
+            -o /tmp/kwai.xapk
+          stat -c '%s bytes' /tmp/kwai.xapk | tee artifacts/xapk-size.txt
+          sha256sum /tmp/kwai.xapk | tee artifacts/xapk-sha256.txt
+          unzip -q /tmp/kwai.xapk -d /tmp/kwai-xapk
+          find /tmp/kwai-xapk -maxdepth 3 -type f -printf '%P\t%s bytes\n' | sort | tee artifacts/xapk-files.txt
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          cat > /tmp/install-kwai.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          adb shell getprop ro.product.cpu.abilist | tee artifacts/emulator-abis.txt
+
+          EXPECTED_SHA1='5283fea03bd6e2ff0458a7b4879c97283b784deb'
+          EXPECTED_SHA256='bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+          BASE=''
+          : > artifacts/apk-badging.txt
+          while IFS= read -r -d '' apk; do
+            echo "### $apk" >> artifacts/apk-badging.txt
+            aapt dump badging "$apk" 2>/dev/null | head -5 >> artifacts/apk-badging.txt || true
+            first="$(aapt dump badging "$apk" 2>/dev/null | head -1 || true)"
+            if [[ "$first" == *"name='com.kwai.video'"* && "$first" != *"split='"* ]]; then BASE="$apk"; fi
+          done < <(find /tmp/kwai-xapk -type f -name '*.apk' -print0)
+
+          if [ -z "$BASE" ]; then
+            echo 'Could not identify com.kwai.video base APK' | tee artifacts/result.txt
+            exit 2
+          fi
+          echo "$BASE" | tee artifacts/base-apk.txt
+          apksigner verify --print-certs "$BASE" | tee artifacts/base-cert.txt
+          ACTUAL_SHA1="$(apksigner verify --print-certs "$BASE" | sed -n 's/^Signer #1 certificate SHA-1 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
+          ACTUAL_SHA256="$(apksigner verify --print-certs "$BASE" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
+          echo "sha1=$ACTUAL_SHA1" | tee artifacts/cert-check.txt
+          echo "sha256=$ACTUAL_SHA256" | tee -a artifacts/cert-check.txt
+          test "$ACTUAL_SHA1" = "$EXPECTED_SHA1"
+          test "$ACTUAL_SHA256" = "$EXPECTED_SHA256"
+          echo 'CERTIFICATE MATCH' | tee -a artifacts/cert-check.txt
+
+          mapfile -d '' APKS < <(find /tmp/kwai-xapk -type f -name '*.apk' -print0)
+          printf '%s\n' "${APKS[@]}" > artifacts/apks-to-install.txt
+          adb install-multiple -r "${APKS[@]}" | tee artifacts/install.txt
+          adb shell pm path com.kwai.video | tee artifacts/installed-paths.txt
+          adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=' | head -10 | tee artifacts/installed-version.txt || true
+
+          adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
+          sleep 18
+          adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+          adb pull /sdcard/window.xml artifacts/kwai-ui.xml >/dev/null 2>&1 || true
+          adb exec-out screencap -p > artifacts/kwai.png
+          python3 - <<'PY'
+          from pathlib import Path
+          b=Path('artifacts/kwai.png').read_bytes()
+          assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000
+          PY
+          python3 - <<'PY'
+          import re,pathlib
+          p=pathlib.Path('artifacts/kwai-ui.xml')
+          if p.exists():
+              s=p.read_text(errors='ignore')
+              vals=[]
+              for key in ('text','content-desc'):
+                  vals += re.findall(fr'{key}="([^"]+)"',s)
+              seen=[]
+              for v in vals:
+                  if v.strip() and v not in seen: seen.append(v)
+              pathlib.Path('artifacts/kwai-texts.txt').write_text('\n'.join(seen))
+          PY
+          echo 'PASS: Kwai certificate verified, package installed, and launcher opened.' | tee artifacts/result.txt
+          SH
+          chmod +x /tmp/install-kwai.sh
+
+      - name: Boot Android and install verified Kwai bundle
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis_playstore
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 512M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          script: bash /tmp/install-kwai.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai verified install proof'
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: inspect diagnostic artifact.'
+            echo
+            cat artifacts/cert-check.txt 2>/dev/null || true
+            echo
+            echo 'No Kwai account login and no publication attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-install-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
