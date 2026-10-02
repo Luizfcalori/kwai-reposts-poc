@@ -57,29 +57,54 @@ def tap_label(root, pattern):
     return False
 
 
+def classify(texts):
+    joined = "\n".join(texts)
+    if re.search(r"Checking info", joined, re.I):
+        return "checking_info"
+    if re.search(r"Choose an account|Use another account|Add account", joined, re.I):
+        return "account_chooser"
+    if re.search(r"Email or phone|Sign in.*Google|Google.*Sign in", joined, re.I | re.S):
+        return "google_signin"
+    if re.search(r"Couldn't sign you in|This browser or app may not be secure|There was a problem|Something went wrong", joined, re.I):
+        return "google_error"
+    if re.search(r"Welcome to Kwai|Continue with Google", joined, re.I):
+        return "kwai_login"
+    return "other"
+
+
 def main():
     root, texts = dump("01-kwai-login")
-    joined = "\n".join(texts)
-    if not re.search(r"Welcome to Kwai|Continue with Google", joined, re.I):
+    if classify(texts) != "kwai_login":
         raise SystemExit("Kwai Google entry screen not present")
 
     clicked = tap_label(root, r"^Continue with Google$")
     if not clicked:
         raise SystemExit("Continue with Google button not tappable")
 
-    time.sleep(10)
-    root, texts = dump("02-google-screen")
-    joined = "\n".join(texts)
+    state = "unknown"
+    wait_seconds = 0
+    final_texts = []
+    for step in range(1, 19):
+        time.sleep(5)
+        wait_seconds += 5
+        root, texts = dump(f"02-google-wait-{step:02d}")
+        state = classify(texts)
+        final_texts = texts
+        print(f"google wait={wait_seconds}s state={state} texts={texts}")
+        if state in {"account_chooser", "google_signin", "google_error"}:
+            break
+        if state == "kwai_login" and wait_seconds >= 15:
+            break
 
-    next_step = bool(re.search(
-        r"Choose an account|Sign in|Google|Use another account|Add account|Email or phone|Couldn't sign you in|This browser or app may not be secure",
-        joined,
-        re.I,
-    ))
+    next_step = state in {"account_chooser", "google_signin", "google_error"}
+    stuck_checking = state == "checking_info"
 
     result = {
         "clicked_continue_with_google": clicked,
+        "google_state": state,
+        "google_wait_seconds": wait_seconds,
         "google_next_step_detected": next_step,
+        "stuck_checking_info": stuck_checking,
         "kwai_pid": adb("shell", "pidof", "com.kwai.video").stdout.strip(),
     }
     pathlib.Path("artifacts/google-result.txt").write_text(
@@ -88,11 +113,13 @@ def main():
     )
     print(result)
     print("Visible Google-step text:")
-    for text in texts:
+    for text in final_texts:
         print(text)
 
     if not next_step:
-        raise SystemExit("Google sign-in next step not detected")
+        if stuck_checking:
+            raise SystemExit("Google remained on Checking info for 90 seconds")
+        raise SystemExit(f"Google sign-in next step not detected; final_state={state}")
 
 
 if __name__ == "__main__":
