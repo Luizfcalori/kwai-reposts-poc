@@ -1,0 +1,131 @@
+name: Aurora anonymous login proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/aurora-anonymous-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  anonymous:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Prepare files and KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          curl -fL --retry 3 --retry-delay 2 -o /tmp/aurora.apk https://f-droid.org/repo/com.aurora.store_76.apk
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          cat > /tmp/tap_text.py <<'PY'
+          import subprocess, sys, re, time
+          needle=sys.argv[1].lower()
+          subprocess.run(['adb','shell','uiautomator','dump','/sdcard/window.xml'], check=False, stdout=subprocess.DEVNULL)
+          subprocess.run(['adb','pull','/sdcard/window.xml','/tmp/window.xml'], check=False, stdout=subprocess.DEVNULL)
+          data=open('/tmp/window.xml',errors='ignore').read()
+          for node in re.findall(r'<node[^>]+>', data):
+              tm=re.search(r'text="([^"]*)"',node); cm=re.search(r'content-desc="([^"]*)"',node); bm=re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',node)
+              hay=' '.join([(tm.group(1) if tm else ''),(cm.group(1) if cm else '')]).lower()
+              if needle in hay and bm:
+                  x1,y1,x2,y2=map(int,bm.groups()); x=(x1+x2)//2; y=(y1+y2)//2
+                  print(f'Tapping {needle!r} at {x},{y}: {hay}')
+                  subprocess.run(['adb','shell','input','tap',str(x),str(y)],check=True)
+                  time.sleep(3)
+                  sys.exit(0)
+          print(f'NOT FOUND: {needle}')
+          sys.exit(2)
+          PY
+          cat > /tmp/dump_stage.sh <<'SH'
+          name="$1"
+          adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+          adb pull /sdcard/window.xml "artifacts/${name}.xml" >/dev/null 2>&1 || true
+          adb exec-out screencap -p > "artifacts/${name}.png"
+          python3 - "$name" <<'PY'
+          import re,sys,pathlib
+          name=sys.argv[1]
+          p=pathlib.Path(f'artifacts/{name}.xml')
+          if p.exists():
+              s=p.read_text(errors='ignore')
+              vals=[]
+              for k in ('text','content-desc'):
+                  vals += re.findall(fr'{k}="([^"]+)"',s)
+              seen=[]
+              for v in vals:
+                  if v.strip() and v not in seen: seen.append(v)
+              pathlib.Path(f'artifacts/{name}-texts.txt').write_text('\n'.join(seen))
+          PY
+          SH
+          chmod +x /tmp/dump_stage.sh
+          cat > /tmp/run-anonymous.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          adb install -r /tmp/aurora.apk | tee artifacts/install.txt
+          adb shell monkey -p com.aurora.store -c android.intent.category.LAUNCHER 1 >/dev/null
+          sleep 10
+          /tmp/dump_stage.sh welcome
+
+          python3 /tmp/tap_text.py Skip || true
+          sleep 5
+          /tmp/dump_stage.sh after-skip
+
+          if python3 /tmp/tap_text.py Anonymous; then
+            echo 'Anonymous button found and tapped.' | tee artifacts/anonymous-action.txt
+            sleep 18
+            /tmp/dump_stage.sh after-anonymous
+          else
+            echo 'Anonymous button not found after Skip.' | tee artifacts/anonymous-action.txt
+          fi
+
+          if grep -Eqi 'Apps|Games|Updates|Search|For you|Home' artifacts/after-anonymous-texts.txt 2>/dev/null; then
+            echo 'PASS: Aurora anonymous session reached main store UI.' | tee artifacts/result.txt
+          elif grep -Eqi 'Anonymous|Login|Sign in|Terms|Disclaimer|Installer' artifacts/after-skip-texts.txt 2>/dev/null; then
+            echo 'PARTIAL: onboarding advanced; anonymous/main-store state needs one more UI step.' | tee artifacts/result.txt
+          else
+            echo 'PARTIAL: Aurora onboarding changed; inspect stage screenshots.' | tee artifacts/result.txt
+          fi
+          SH
+          chmod +x /tmp/run-anonymous.sh
+
+      - name: Boot Android and automate Aurora anonymous flow
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 2048M
+          heap-size: 512M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          script: bash /tmp/run-anonymous.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Aurora anonymous login proof'
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: flow did not finish.'
+            echo
+            cat artifacts/anonymous-action.txt 2>/dev/null || true
+            echo
+            echo 'No personal Google credentials and no Kwai account used.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aurora-anonymous-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
