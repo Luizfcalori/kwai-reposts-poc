@@ -92,6 +92,17 @@ def contains(texts, pattern):
     return any(rx.search(t) for t in texts)
 
 
+def is_login_screen(texts):
+    joined = "\n".join(texts)
+    return bool(re.search(
+        r"phone number|telefone|mobile number|e-?mail|continue with|google|facebook|"
+        r"log in|login|sign in|entrar|verification code|c[oó]digo de verifica|"
+        r"sign up|cadastre-se|create account",
+        joined,
+        re.I,
+    ))
+
+
 def onboarding_counter(texts):
     m = re.search(r"\b(\d+)/(\d+)\b", "\n".join(texts))
     if not m:
@@ -201,6 +212,76 @@ def tap_profile(root, w, h):
     return "coordinate"
 
 
+def try_login_button(root, texts):
+    login_patterns = [
+        r"^Log in$", r"^Login$", r"^Sign in$", r"^Entrar$", r"^Fazer login$",
+        r"^Sign up or log in$", r"^Cadastre-se ou entre$", r"^Entrar ou cadastrar$",
+        r"Log in to", r"Sign in to",
+    ]
+    for pat in login_patterns:
+        rx = re.compile(pat, re.I)
+        if tap_node(root, lambda s, rx=rx: bool(rx.search(s))):
+            time.sleep(5)
+            root, texts = dump("04-login-button")
+            return True, root, texts
+    return False, root, texts
+
+
+def auth_fallback(root, texts, w, h):
+    attempts = []
+    if contains(texts, r"Resource downloading|access to all the features when it.s done"):
+        hidden = tap_node(root, lambda s: s.strip().lower() == "hide")
+        attempts.append(f"hide_resource={hidden}")
+        time.sleep(3)
+        root, texts = dump("04-fallback-hidden")
+
+    inbox_rx = re.compile(r"^(Inbox|Messages|Caixa de entrada|Mensagens)$", re.I)
+    inbox = tap_node(root, lambda s: bool(inbox_rx.search(s)))
+    if not inbox:
+        adb("shell", "input", "tap", str(int(w*0.70)), str(int(h*0.955)))
+        inbox = True
+    attempts.append(f"inbox={inbox}")
+    time.sleep(6)
+    root, texts = dump("04-fallback-inbox")
+    if is_login_screen(texts):
+        return root, texts, "inbox", attempts
+
+    if contains(texts, r"Resource downloading|access to all the features when it.s done"):
+        tap_node(root, lambda s: s.strip().lower() == "hide")
+        time.sleep(2)
+        root, texts = dump("04-fallback-inbox-hidden")
+
+    follow_rx = re.compile(r"^(Follow|Seguir)$", re.I)
+    followed = tap_node(root, lambda s: bool(follow_rx.search(s)))
+    attempts.append(f"follow_entry={followed}")
+    if followed:
+        time.sleep(6)
+        root, texts = dump("04-fallback-follow")
+        if is_login_screen(texts):
+            return root, texts, "follow", attempts
+
+    tap_profile(root, w, h)
+    time.sleep(6)
+    root, texts = dump("04-fallback-profile")
+    clicked, root, texts = try_login_button(root, texts)
+    attempts.append(f"profile_login_button={clicked}")
+    if clicked or is_login_screen(texts):
+        return root, texts, "profile", attempts
+
+    return root, texts, "none", attempts
+
+
+def save_package_diagnostics():
+    _, out = adb("shell", "dumpsys", "package", "com.kwai.video")
+    interesting = []
+    for line in out.splitlines():
+        if re.search(r"login|sign.?in|auth|account|profile|activity", line, re.I):
+            interesting.append(line)
+    pathlib.Path("artifacts/package-activity-candidates.txt").write_text(
+        "\n".join(interesting[:4000]) + "\n", encoding="utf-8"
+    )
+
+
 def main():
     w, h = screen_size()
     print(f"screen={w}x{h}")
@@ -226,40 +307,24 @@ def main():
     resource_completed = not resource_seen
     resource_wait_seconds = 0
     if resource_seen:
-        for step in range(1, 13):
+        for step in range(1, 4):
             time.sleep(10)
             resource_wait_seconds += 10
             root, texts = dump(f"04-resource-wait-{step:02d}")
             if not contains(texts, r"Resource downloading|access to all the features when it.s done"):
                 resource_completed = True
                 break
-        if not resource_completed:
-            tap_node(root, lambda s: s.strip().lower() == "hide")
-            time.sleep(3)
-            root, texts = dump("04-resource-hidden")
-        tap_profile(root, w, h)
-        time.sleep(8)
-        root, texts = dump("04-profile-retry")
 
-    login_patterns = [
-        r"^Log in$", r"^Login$", r"^Sign in$", r"^Entrar$", r"^Fazer login$",
-        r"^Sign up or log in$", r"^Cadastre-se ou entre$", r"^Entrar ou cadastrar$",
-        r"Log in to", r"Sign in to",
-    ]
-    clicked_login = False
-    for pat in login_patterns:
-        rx = re.compile(pat, re.I)
-        if tap_node(root, lambda s, rx=rx: bool(rx.search(s))):
-            clicked_login = True
-            time.sleep(5)
-            break
+    clicked_login, root, texts = try_login_button(root, texts)
+    fallback_method = "not_needed"
+    fallback_attempts = []
+    if not clicked_login and not is_login_screen(texts):
+        root, texts, fallback_method, fallback_attempts = auth_fallback(root, texts, w, h)
 
     root, texts = dump("05-final")
-    joined = "\n".join(texts)
-    login_screen = bool(re.search(
-        r"phone|telefone|mobile|email|google|facebook|log in|login|sign in|entrar|verification|c[oó]digo|continue with",
-        joined, re.I
-    ))
+    login_screen = is_login_screen(texts)
+    save_package_diagnostics()
+
     result = {
         "onboarding_steps": onboarding_steps,
         "swipe_failures": swipe_failures,
@@ -270,6 +335,8 @@ def main():
         "resource_completed": resource_completed,
         "resource_wait_seconds": resource_wait_seconds,
         "clicked_login": clicked_login,
+        "fallback_method": fallback_method,
+        "fallback_attempts": ";".join(fallback_attempts),
         "login_screen_detected": login_screen,
         "pid": adb("shell", "pidof", "com.kwai.video")[1].strip(),
     }
@@ -279,6 +346,8 @@ def main():
     print(result)
     if not result["pid"]:
         raise SystemExit("Kwai process stopped during safe UI probe")
+    if not login_screen:
+        raise SystemExit("Login screen not reached yet; evidence saved for the next targeted adjustment")
 
 
 if __name__ == "__main__":
