@@ -100,13 +100,21 @@ def contains(texts, pattern):
     return any(rx.search(t) for t in texts)
 
 
+def onboarding_counter(texts):
+    joined = "\n".join(texts)
+    m = re.search(r"\b(\d+)/(5|12)\b", joined)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
 def tap_profile(root, w, h):
     profile_patterns = [r"^Profile$", r"^Me$", r"^Eu$", r"^Perfil$", r"^Account$", r"^Conta$"]
     for pat in profile_patterns:
         rx = re.compile(pat, re.I)
         if tap_node(root, lambda s, rx=rx: bool(rx.search(s))):
             return "semantic"
-    adb("shell", "input", "tap", str(int(w * 0.92)), str(int(h * 0.965)))
+    adb("shell", "input", "tap", str(int(w * 0.92)), str(int(h * 0.955)))
     return "coordinate"
 
 
@@ -124,9 +132,48 @@ def dismiss_safe_system_overlays(round_no):
     return False
 
 
+def swipe_to_next_onboarding(root, texts, w, h, step):
+    before = onboarding_counter(texts)
+    attempts = [
+        (0.50, 0.79, 0.50, 0.18, 900),
+        (0.38, 0.82, 0.38, 0.16, 1200),
+        (0.62, 0.80, 0.62, 0.14, 700),
+        (0.50, 0.86, 0.50, 0.12, 1500),
+    ]
+
+    for attempt, (x1, y1, x2, y2, duration) in enumerate(attempts, start=1):
+        adb(
+            "shell",
+            "input",
+            "touchscreen",
+            "swipe",
+            str(int(w * x1)),
+            str(int(h * y1)),
+            str(int(w * x2)),
+            str(int(h * y2)),
+            str(duration),
+        )
+        time.sleep(3)
+        root, texts = dump(f"02-onboarding-{step:02d}-swipe-{attempt}")
+        after = onboarding_counter(texts)
+        print(f"onboarding swipe attempt={attempt} before={before} after={after} duration_ms={duration}")
+
+        if before and after and after != before:
+            return root, texts, True, attempt
+        if before and not after:
+            return root, texts, True, attempt
+        if not contains(texts, r"swipe up to view the next video") and after != before:
+            return root, texts, True, attempt
+
+    return root, texts, False, len(attempts)
+
+
 def run_preference_onboarding(root, texts, w, h):
     steps = 0
-    for step in range(1, 21):
+    swipe_failures = 0
+    last_counter = onboarding_counter(texts)
+
+    for step in range(1, 25):
         joined = "\n".join(texts)
         active = bool(
             re.search(r"\b\d+/(?:5|12)\b", joined)
@@ -136,6 +183,9 @@ def run_preference_onboarding(root, texts, w, h):
             break
 
         steps += 1
+        counter = onboarding_counter(texts)
+        print(f"onboarding step={step} counter={counter}")
+
         # This is only the pre-login preference selector; it does not act on an authenticated account.
         chose = tap_resource_id(root, "com.kwai.video:id/tiny_discovery_like_button")
         if not chose and re.search(r"choose like or dislike|know you better", joined, re.I):
@@ -143,30 +193,29 @@ def run_preference_onboarding(root, texts, w, h):
             chose = True
 
         if chose:
-            time.sleep(1.2)
+            time.sleep(1.5)
             root, texts = dump(f"02-onboarding-{step:02d}-chosen")
 
         joined = "\n".join(texts)
         if re.search(r"swipe up to view the next video", joined, re.I) or re.search(r"\b\d+/12\b", joined):
-            adb(
-                "shell",
-                "input",
-                "swipe",
-                str(int(w * 0.50)),
-                str(int(h * 0.72)),
-                str(int(w * 0.50)),
-                str(int(h * 0.28)),
-                "350",
-            )
-            time.sleep(2)
-            root, texts = dump(f"02-onboarding-{step:02d}-swiped")
+            root, texts, advanced, attempts = swipe_to_next_onboarding(root, texts, w, h, step)
+            if not advanced:
+                swipe_failures += 1
+                print(f"onboarding swipe failed after {attempts} gesture variants; stopping instead of looping blindly")
+                break
+            last_counter = onboarding_counter(texts)
         elif chose:
             time.sleep(1)
             root, texts = dump(f"02-onboarding-{step:02d}-advanced")
+            last_counter = onboarding_counter(texts)
         else:
             break
 
-    return root, texts, steps
+        # If the tutorial explicitly reaches its last card, allow the next loop to verify it cleared.
+        if last_counter and last_counter[0] >= last_counter[1]:
+            time.sleep(2)
+
+    return root, texts, steps, swipe_failures, last_counter
 
 
 def main():
@@ -189,7 +238,7 @@ def main():
             break
 
     root, texts = dump("01-first-clear-view")
-    root, texts, onboarding_steps = run_preference_onboarding(root, texts, w, h)
+    root, texts, onboarding_steps, swipe_failures, final_onboarding_counter = run_preference_onboarding(root, texts, w, h)
     root, texts = dump("03-after-onboarding")
 
     profile_tap_method = tap_profile(root, w, h)
@@ -253,6 +302,8 @@ def main():
 
     result = {
         "onboarding_steps": onboarding_steps,
+        "swipe_failures": swipe_failures,
+        "final_onboarding_counter": final_onboarding_counter,
         "profile_tap_method": profile_tap_method,
         "resource_seen": resource_seen,
         "resource_completed": resource_completed,
