@@ -190,6 +190,19 @@ def run_onboarding(root, texts, w, h):
     return root, texts, steps, failures, last_counter
 
 
+def skip_slow_loader(root, texts, w, h, tag):
+    slow = contains(texts, r"internet.?s a bit slow|hang in there|^Skip$")
+    if not slow:
+        return root, texts, False
+    skipped = tap_node(root, lambda s: s.strip().lower() == "skip")
+    if not skipped:
+        adb("shell", "input", "tap", str(int(w*0.73)), str(int(h*0.88)))
+        skipped = True
+    time.sleep(7)
+    root, texts = dump(tag)
+    return root, texts, skipped
+
+
 def finish_onboarding(root, texts, w, h):
     finished = False
     if contains(texts, r"you.?re all set|hope you enjoy the kwai|^start now$"):
@@ -246,6 +259,19 @@ def auth_fallback(root, texts, w, h):
     if is_login_screen(texts):
         return root, texts, "inbox", attempts
 
+    root, texts, skipped = skip_slow_loader(root, texts, w, h, "04-fallback-inbox-skip")
+    if skipped:
+        attempts.append("skip_after_inbox=True")
+        if is_login_screen(texts):
+            return root, texts, "inbox-skip", attempts
+        inbox = tap_node(root, lambda s: bool(inbox_rx.search(s)))
+        if not inbox:
+            adb("shell", "input", "tap", str(int(w*0.70)), str(int(h*0.955)))
+        time.sleep(6)
+        root, texts = dump("04-fallback-inbox-retry")
+        if is_login_screen(texts):
+            return root, texts, "inbox-retry", attempts
+
     if contains(texts, r"Resource downloading|access to all the features when it.s done"):
         tap_node(root, lambda s: s.strip().lower() == "hide")
         time.sleep(2)
@@ -263,6 +289,9 @@ def auth_fallback(root, texts, w, h):
     tap_profile(root, w, h)
     time.sleep(6)
     root, texts = dump("04-fallback-profile")
+    root, texts, skipped = skip_slow_loader(root, texts, w, h, "04-fallback-profile-skip")
+    if skipped:
+        attempts.append("skip_after_profile=True")
     clicked, root, texts = try_login_button(root, texts)
     attempts.append(f"profile_login_button={clicked}")
     if clicked or is_login_screen(texts):
@@ -298,6 +327,7 @@ def main():
     root, texts, onboarding_steps, swipe_failures, final_onboarding_counter = run_onboarding(root, texts, w, h)
     root, texts = dump("03-after-onboarding")
     root, texts, clicked_start_now = finish_onboarding(root, texts, w, h)
+    root, texts, clicked_skip_slow = skip_slow_loader(root, texts, w, h, "03c-after-slow-skip")
 
     profile_tap_method = tap_profile(root, w, h)
     time.sleep(6)
@@ -330,6 +360,7 @@ def main():
         "swipe_failures": swipe_failures,
         "final_onboarding_counter": final_onboarding_counter,
         "clicked_start_now": clicked_start_now,
+        "clicked_skip_slow": clicked_skip_slow,
         "profile_tap_method": profile_tap_method,
         "resource_seen": resource_seen,
         "resource_completed": resource_completed,
