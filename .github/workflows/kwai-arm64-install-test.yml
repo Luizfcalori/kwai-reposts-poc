@@ -1,0 +1,134 @@
+name: Kwai ARM64 verified install proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-arm64-install-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  kwai-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Download verified Kwai bundle and inspect ARM host
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai-xapk
+          uname -a | tee artifacts/host-uname.txt
+          uname -m | tee artifacts/host-arch.txt
+          ls -l /dev/kvm | tee artifacts/kvm.txt
+          test -r /dev/kvm && test -w /dev/kvm
+          curl -fL --retry 4 --retry-delay 3 -A 'Mozilla/5.0' \
+            'https://d.apkpure.net/b/XAPK/com.kwai.video?version=latest' \
+            -o /tmp/kwai.xapk
+          sha256sum /tmp/kwai.xapk | tee artifacts/xapk-sha256.txt
+          unzip -q /tmp/kwai.xapk -d /tmp/kwai-xapk
+          find /tmp/kwai-xapk -maxdepth 2 -type f -printf '%P\t%s bytes\n' | sort | tee artifacts/xapk-files.txt
+
+          cat > /tmp/install-kwai-arm64.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          adb shell getprop ro.product.cpu.abilist | tr -d '\r' | tee artifacts/emulator-abis.txt
+          adb shell getprop ro.product.cpu.abilist32 | tr -d '\r' | tee artifacts/emulator-abis32.txt
+          adb shell getprop ro.product.cpu.abilist64 | tr -d '\r' | tee artifacts/emulator-abis64.txt
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          AAPT="$BUILD_TOOLS/aapt"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          BASE='/tmp/kwai-xapk/com.kwai.video.apk'
+          "$AAPT" dump badging "$BASE" > artifacts/base-badging.txt
+          PACKAGE="$(awk -F"'" '/^package: name=/{print $2; exit}' artifacts/base-badging.txt)"
+          VERSION="$(awk -F"'" '/^package: name=/{print $6; exit}' artifacts/base-badging.txt)"
+          echo "package=$PACKAGE" | tee artifacts/package-check.txt
+          test "$PACKAGE" = 'com.kwai.video'
+
+          "$APKSIGNER" verify --print-certs "$BASE" > artifacts/base-cert.txt 2>&1
+          ACTUAL_SHA1="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-1 digest:/{print tolower($NF); exit}' artifacts/base-cert.txt)"
+          ACTUAL_SHA256="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-256 digest:/{print tolower($NF); exit}' artifacts/base-cert.txt)"
+          {
+            echo "sha1=$ACTUAL_SHA1"
+            echo "sha256=$ACTUAL_SHA256"
+          } | tee artifacts/cert-check.txt
+          test "$ACTUAL_SHA1" = '5283fea03bd6e2ff0458a7b4879c97283b784deb'
+          test "$ACTUAL_SHA256" = 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+          echo 'CERTIFICATE MATCH' | tee -a artifacts/cert-check.txt
+
+          mapfile -d '' APKS < <(find /tmp/kwai-xapk -maxdepth 1 -type f -name '*.apk' -print0)
+          printf '%s\n' "${APKS[@]}" | tee artifacts/apks-to-install.txt
+          adb install-multiple -r "${APKS[@]}" | tee artifacts/install.txt
+
+          adb shell pm path com.kwai.video | tee artifacts/installed-paths.txt
+          adb shell dumpsys package com.kwai.video > artifacts/package-dumpsys.txt
+          grep -E 'versionName=|versionCode=|primaryCpuAbi=' artifacts/package-dumpsys.txt | sed -n '1,15p' | tee artifacts/installed-version.txt || true
+
+          adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
+          sleep 20
+          adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+          adb pull /sdcard/window.xml artifacts/kwai-ui.xml >/dev/null 2>&1 || true
+          adb exec-out screencap -p > artifacts/kwai.png
+          python3 - <<'PY'
+          from pathlib import Path
+          b=Path('artifacts/kwai.png').read_bytes()
+          assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000
+          PY
+          python3 - <<'PY'
+          import re, pathlib
+          p=pathlib.Path('artifacts/kwai-ui.xml')
+          if p.exists():
+              s=p.read_text(errors='ignore')
+              vals=[]
+              for key in ('text','content-desc'):
+                  vals += re.findall(fr'{key}="([^"]+)"', s)
+              seen=[]
+              for v in vals:
+                  if v.strip() and v not in seen: seen.append(v)
+              pathlib.Path('artifacts/kwai-texts.txt').write_text('\n'.join(seen))
+          PY
+          echo 'PASS: verified Kwai installed and launcher opened on ARM64 Android.' | tee artifacts/result.txt
+          SH
+          chmod +x /tmp/install-kwai-arm64.sh
+
+      - name: Boot ARM64 Android and install Kwai
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 30
+          target: google_apis
+          arch: arm64-v8a
+          profile: pixel_3a
+          cores: 2
+          ram-size: 3072M
+          heap-size: 512M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          script: bash /tmp/install-kwai-arm64.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai ARM64 install proof'
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: inspect job logs/evidence.'
+            echo
+            cat artifacts/host-arch.txt 2>/dev/null || true
+            cat artifacts/emulator-abis.txt 2>/dev/null || true
+            cat artifacts/cert-check.txt 2>/dev/null || true
+            echo
+            echo 'No Kwai account login and no publication attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-arm64-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
