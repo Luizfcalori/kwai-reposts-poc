@@ -1,0 +1,139 @@
+name: Kwai onboarding probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-onboarding-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Download ARM64 Kwai bundle and prepare KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai
+          curl -fL --retry 4 --retry-delay 3 -A 'Mozilla/5.0' \
+            'https://d.apkpure.net/b/XAPK/com.kwai.video?versionCode=646404' \
+            -o /tmp/kwai.xapk
+          unzip -q /tmp/kwai.xapk -d /tmp/kwai
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/tap_text.py <<'PY'
+          import subprocess, sys, re, time
+          needle=sys.argv[1].lower()
+          subprocess.run(['adb','shell','uiautomator','dump','/sdcard/window.xml'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+          subprocess.run(['adb','pull','/sdcard/window.xml','/tmp/window.xml'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+          data=open('/tmp/window.xml',errors='ignore').read()
+          for node in re.findall(r'<node[^>]+>',data):
+              tm=re.search(r'text="([^"]*)"',node)
+              cm=re.search(r'content-desc="([^"]*)"',node)
+              bm=re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',node)
+              hay=' '.join([(tm.group(1) if tm else ''),(cm.group(1) if cm else '')]).lower()
+              if needle in hay and bm:
+                  x1,y1,x2,y2=map(int,bm.groups())
+                  subprocess.run(['adb','shell','input','tap',str((x1+x2)//2),str((y1+y2)//2)],check=True)
+                  print(f'TAPPED {needle}: {hay}')
+                  time.sleep(4)
+                  sys.exit(0)
+          print(f'NOT FOUND: {needle}')
+          sys.exit(2)
+          PY
+
+          cat > /tmp/dump_stage.sh <<'SH'
+          name="$1"
+          adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+          adb pull /sdcard/window.xml "artifacts/${name}.xml" >/dev/null 2>&1 || true
+          adb exec-out screencap -p > "artifacts/${name}.png" || true
+          adb shell dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' > "artifacts/${name}-activity.txt" || true
+          python3 - "$name" <<'PY'
+          import re,sys,pathlib
+          name=sys.argv[1]
+          p=pathlib.Path(f'artifacts/{name}.xml')
+          vals=[]
+          if p.exists():
+              s=p.read_text(errors='ignore')
+              for k in ('text','content-desc'):
+                  vals += re.findall(fr'{k}="([^"]+)"',s)
+          seen=[]
+          for v in vals:
+              v=v.replace('&amp;','&').strip()
+              if v and v not in seen: seen.append(v)
+          pathlib.Path(f'artifacts/{name}-texts.txt').write_text('\n'.join(seen))
+          PY
+          SH
+          chmod +x /tmp/dump_stage.sh
+
+          cat > /tmp/probe.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          BASE='/tmp/kwai/com.kwai.video.apk'
+          "$APKSIGNER" verify --print-certs "$BASE" > artifacts/cert.txt 2>&1
+          SHA1="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-1 digest:/{print tolower($NF); exit}' artifacts/cert.txt)"
+          test "$SHA1" = '5283fea03bd6e2ff0458a7b4879c97283b784deb'
+          mapfile -d '' APKS < <(find /tmp/kwai -type f -name '*.apk' -print0)
+          adb install-multiple -r "${APKS[@]}" | tee artifacts/install.txt
+          adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 >/dev/null
+          sleep 15
+          /tmp/dump_stage.sh 00-interests
+
+          python3 /tmp/tap_text.py Skip
+          sleep 12
+          /tmp/dump_stage.sh 01-after-skip
+
+          # Do not accept account/legal actions. Only dismiss harmless onboarding if plainly labeled.
+          python3 /tmp/tap_text.py 'Not now' || true
+          python3 /tmp/tap_text.py 'Maybe later' || true
+          sleep 6
+          /tmp/dump_stage.sh 02-settled
+
+          echo 'PASS: Kwai onboarding skipped and next state captured.' | tee artifacts/result.txt
+          SH
+          chmod +x /tmp/probe.sh
+
+      - name: Boot Android 15 and probe Kwai onboarding
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 4096M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          script: bash /tmp/probe.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai onboarding probe'
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: inspect captured stages.'
+            echo
+            echo '### Final visible texts'
+            cat artifacts/02-settled-texts.txt 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-onboarding-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
