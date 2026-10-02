@@ -19,8 +19,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts /tmp/kwai-xapk
-          curl -fL --retry 4 --retry-delay 3 \
-            -A 'Mozilla/5.0' \
+          curl -fL --retry 4 --retry-delay 3 -A 'Mozilla/5.0' \
             'https://d.apkpure.net/b/XAPK/com.kwai.video?version=latest' \
             -o /tmp/kwai.xapk
           file /tmp/kwai.xapk | tee artifacts/file-type.txt
@@ -31,18 +30,19 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+
           cat > /tmp/install-kwai.sh <<'SH'
           set -euo pipefail
           adb wait-for-device
           while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+
           EMU_ABIS="$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
           echo "$EMU_ABIS" | tee artifacts/emulator-abis.txt
 
           BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
           AAPT="$BUILD_TOOLS/aapt"
           APKSIGNER="$BUILD_TOOLS/apksigner"
-          test -x "$AAPT"
-          test -x "$APKSIGNER"
+          test -x "$AAPT" && test -x "$APKSIGNER"
           {
             echo "BUILD_TOOLS=$BUILD_TOOLS"
             "$AAPT" version
@@ -51,16 +51,22 @@ jobs:
 
           BASE='/tmp/kwai-xapk/com.kwai.video.apk'
           test -f "$BASE"
-          "$AAPT" dump badging "$BASE" | head -20 | tee artifacts/base-badging.txt
-          PACKAGE="$("$AAPT" dump badging "$BASE" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -1)"
+
+          # Dump once to a file. Avoid `aapt | head` under pipefail (SIGPIPE 141).
+          "$AAPT" dump badging "$BASE" > artifacts/base-badging.txt
+          sed -n '1,20p' artifacts/base-badging.txt
+          PACKAGE="$(awk -F"'" '/^package: name=/{print $2; exit}' artifacts/base-badging.txt)"
           echo "package=$PACKAGE" | tee artifacts/package-check.txt
           test "$PACKAGE" = 'com.kwai.video'
 
           EXPECTED_SHA1='5283fea03bd6e2ff0458a7b4879c97283b784deb'
           EXPECTED_SHA256='bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
-          "$APKSIGNER" verify --print-certs "$BASE" | tee artifacts/base-cert.txt
-          ACTUAL_SHA1="$("$APKSIGNER" verify --print-certs "$BASE" | sed -n 's/^.*Signer: certificate SHA-1 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
-          ACTUAL_SHA256="$("$APKSIGNER" verify --print-certs "$BASE" | sed -n 's/^.*Signer: certificate SHA-256 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
+
+          # Capture verifier output once, then parse the app signer (not Source Stamp).
+          "$APKSIGNER" verify --print-certs "$BASE" > artifacts/base-cert.txt 2>&1
+          cat artifacts/base-cert.txt
+          ACTUAL_SHA1="$(awk -F': ' '/Signer: certificate SHA-1 digest:/ && $0 !~ /Source Stamp/{print tolower($2); exit}' artifacts/base-cert.txt)"
+          ACTUAL_SHA256="$(awk -F': ' '/Signer: certificate SHA-256 digest:/ && $0 !~ /Source Stamp/{print tolower($2); exit}' artifacts/base-cert.txt)"
           {
             echo "sha1=$ACTUAL_SHA1"
             echo "sha256=$ACTUAL_SHA256"
@@ -86,9 +92,19 @@ jobs:
           done < <(find /tmp/kwai-xapk -maxdepth 1 -type f -name '*.apk' -print0)
 
           printf '%s\n' "${INSTALL_APKS[@]}" | tee artifacts/apks-to-install.txt
-          adb install-multiple -r "${INSTALL_APKS[@]}" | tee artifacts/install.txt
+
+          set +e
+          adb install-multiple -r "${INSTALL_APKS[@]}" > artifacts/install.txt 2>&1
+          INSTALL_RC=$?
+          set -e
+          cat artifacts/install.txt
+          echo "install_rc=$INSTALL_RC" | tee artifacts/install-result.txt
+          test "$INSTALL_RC" -eq 0
+
           adb shell pm path com.kwai.video | tee artifacts/installed-paths.txt
-          adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=|primaryCpuAbi=' | head -15 | tee artifacts/installed-version.txt || true
+          adb shell dumpsys package com.kwai.video > artifacts/package-dumpsys.txt
+          grep -E 'versionName=|versionCode=|primaryCpuAbi=' artifacts/package-dumpsys.txt | sed -n '1,15p' | tee artifacts/installed-version.txt || true
+
           adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
           sleep 20
           adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
@@ -100,13 +116,13 @@ jobs:
           assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000
           PY
           python3 - <<'PY'
-          import re,pathlib
+          import re, pathlib
           p=pathlib.Path('artifacts/kwai-ui.xml')
           if p.exists():
               s=p.read_text(errors='ignore')
               vals=[]
               for key in ('text','content-desc'):
-                  vals += re.findall(fr'{key}="([^"]+)"',s)
+                  vals += re.findall(fr'{key}="([^"]+)"', s)
               seen=[]
               for v in vals:
                   if v.strip() and v not in seen: seen.append(v)
@@ -142,6 +158,7 @@ jobs:
             cat artifacts/package-check.txt 2>/dev/null || true
             cat artifacts/cert-check.txt 2>/dev/null || true
             cat artifacts/split-selection.txt 2>/dev/null || true
+            cat artifacts/install-result.txt 2>/dev/null || true
             echo
             echo 'No Kwai account login and no publication attempted.'
           } >> "$GITHUB_STEP_SUMMARY"
