@@ -1,0 +1,152 @@
+name: Kwai full ARM64 bundle proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-full-arm64-apkmirror-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  kwai-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Download full APKMirror bundle and prepare KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai-full
+          URL='https://www.apkmirror.com/wp-content/themes/APKMirror/download.php?id=16206618&key=11820c5728c6d2f5ced623938636146b80ab5ed4'
+          curl -fL --retry 3 --retry-delay 2 \
+            -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36' \
+            -e 'https://www.apkmirror.com/' \
+            "$URL" -o /tmp/kwai.apkm
+          file /tmp/kwai.apkm | tee artifacts/file-type.txt
+          stat -c '%s bytes' /tmp/kwai.apkm | tee artifacts/apkm-size.txt
+          sha256sum /tmp/kwai.apkm | tee artifacts/apkm-sha256.txt
+          ACTUAL="$(sha256sum /tmp/kwai.apkm | awk '{print $1}')"
+          EXPECTED='536ae315a4d5d5742ba5d2073c4058a57e6f3abc89150fd4b3af23ab4159492a'
+          test "$ACTUAL" = "$EXPECTED"
+          echo 'APKMirror bundle SHA256 MATCH' | tee artifacts/bundle-check.txt
+          unzip -q /tmp/kwai.apkm -d /tmp/kwai-full
+          find /tmp/kwai-full -type f -printf '%P\t%s bytes\n' | sort | tee artifacts/bundle-files.txt
+
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/install-full.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          {
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo "native_bridge=$(adb shell getprop ro.dalvik.vm.native.bridge | tr -d '\r')"
+          } | tee artifacts/abi.txt
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          AAPT="$BUILD_TOOLS/aapt"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+
+          : > artifacts/splits.txt
+          BASE=''
+          ALL_APKS=()
+          while IFS= read -r -d '' apk; do
+            ALL_APKS+=("$apk")
+            "$AAPT" dump badging "$apk" > /tmp/badging.txt 2>/dev/null || true
+            first="$(sed -n '1p' /tmp/badging.txt)"
+            pkg="$(printf '%s\n' "$first" | awk -F"'" '/^package: name=/{print $2}')"
+            split="$(printf '%s\n' "$first" | sed -n "s/.* split='\([^']*\)'.*/\1/p")"
+            printf '%s\tpackage=%s\tsplit=%s\n' "$(basename "$apk")" "$pkg" "$split" >> artifacts/splits.txt
+            if [ "$pkg" = 'com.kwai.video' ] && [ -z "$split" ]; then BASE="$apk"; fi
+          done < <(find /tmp/kwai-full -type f -name '*.apk' -print0)
+
+          test -n "$BASE"
+          "$APKSIGNER" verify --print-certs "$BASE" > artifacts/base-cert.txt 2>&1
+          SHA1="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-1 digest:/{print tolower($NF); exit}' artifacts/base-cert.txt)"
+          SHA256="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-256 digest:/{print tolower($NF); exit}' artifacts/base-cert.txt)"
+          echo "sha1=$SHA1" | tee artifacts/cert-check.txt
+          echo "sha256=$SHA256" | tee -a artifacts/cert-check.txt
+          test "$SHA1" = '5283fea03bd6e2ff0458a7b4879c97283b784deb'
+          test "$SHA256" = 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+          echo 'CERTIFICATE MATCH' | tee -a artifacts/cert-check.txt
+
+          # Android 15 x86_64 advertises arm64-v8a through native translation.
+          # Install the complete bundle except the ARM32 architecture split.
+          INSTALL=()
+          while IFS= read -r -d '' apk; do
+            "$AAPT" dump badging "$apk" > /tmp/badging.txt 2>/dev/null || true
+            first="$(sed -n '1p' /tmp/badging.txt)"
+            split="$(printf '%s\n' "$first" | sed -n "s/.* split='\([^']*\)'.*/\1/p")"
+            if [[ "$split" == *armeabi_v7a* ]]; then
+              echo "SKIP $split" | tee -a artifacts/selection.txt
+              continue
+            fi
+            echo "INCLUDE ${split:-base}: $(basename "$apk")" | tee -a artifacts/selection.txt
+            INSTALL+=("$apk")
+          done < <(find /tmp/kwai-full -type f -name '*.apk' -print0)
+
+          set +e
+          adb install-multiple -r "${INSTALL[@]}" > artifacts/install.txt 2>&1
+          RC=$?
+          set -e
+          cat artifacts/install.txt
+          echo "install_rc=$RC" | tee artifacts/install-result.txt
+          test "$RC" -eq 0
+
+          adb shell pm path com.kwai.video | tee artifacts/installed-paths.txt
+          adb shell dumpsys package com.kwai.video > artifacts/package-dumpsys.txt
+          grep -E 'versionName=|versionCode=|primaryCpuAbi=' artifacts/package-dumpsys.txt | sed -n '1,20p' | tee artifacts/installed-version.txt || true
+          adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
+          sleep 25
+          adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+          adb pull /sdcard/window.xml artifacts/kwai-ui.xml >/dev/null 2>&1 || true
+          adb exec-out screencap -p > artifacts/kwai.png
+          python3 - <<'PY'
+          from pathlib import Path
+          b=Path('artifacts/kwai.png').read_bytes()
+          assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000
+          PY
+          echo 'PASS: full ARM64 Kwai bundle installed and launcher opened on Android 15 translation.' | tee artifacts/result.txt
+          SH
+          chmod +x /tmp/install-full.sh
+
+      - name: Boot Android 15 and install full ARM64 bundle
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 4096M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          script: bash /tmp/install-full.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai full ARM64 bundle test'
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: inspect diagnostics.'
+            cat artifacts/bundle-check.txt 2>/dev/null || true
+            cat artifacts/abi.txt 2>/dev/null || true
+            cat artifacts/cert-check.txt 2>/dev/null || true
+            cat artifacts/install-result.txt 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-full-arm64-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
