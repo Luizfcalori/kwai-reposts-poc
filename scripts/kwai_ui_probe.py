@@ -88,6 +88,16 @@ def contains(texts, pattern):
     return any(rx.search(t) for t in texts)
 
 
+def tap_profile(root, w, h):
+    profile_patterns = [r"^Profile$", r"^Me$", r"^Eu$", r"^Perfil$", r"^Account$", r"^Conta$"]
+    for pat in profile_patterns:
+        rx = re.compile(pat, re.I)
+        if tap_node(root, lambda s, rx=rx: bool(rx.search(s))):
+            return True
+    adb("shell", "input", "tap", str(int(w * 0.92)), str(int(h * 0.965)))
+    return False
+
+
 def dismiss_safe_system_overlays(round_no):
     root, texts = dump(f"overlay-{round_no}")
     joined = "\n".join(texts)
@@ -134,28 +144,46 @@ def main():
             or re.search(r"like or dislike|know you better", joined, re.I)
         ):
             break
-        # Left preference button observed on first-run screen; relative coordinate survives density changes.
         adb("shell", "input", "tap", str(int(w * 0.27)), str(int(h * 0.93)))
         time.sleep(2)
         root, texts = dump(f"02-onboarding-{step}")
 
     root, texts = dump("03-after-onboarding")
 
-    # Try a semantic profile tab first, then the conventional bottom-right profile position.
-    profile_patterns = [r"^Profile$", r"^Me$", r"^Eu$", r"^Perfil$", r"^Account$", r"^Conta$"]
-    clicked_profile = False
-    for pat in profile_patterns:
-        rx = re.compile(pat, re.I)
-        if tap_node(root, lambda s, rx=rx: bool(rx.search(s))):
-            clicked_profile = True
-            break
-    if not clicked_profile:
-        adb("shell", "input", "tap", str(int(w * 0.92)), str(int(h * 0.965)))
+    # Open Profile. On first use Kwai can download an additional resource module.
+    clicked_profile = tap_profile(root, w, h)
     time.sleep(5)
     root, texts = dump("04-profile-attempt")
 
+    resource_seen = contains(texts, r"Resource downloading|access to all the features when it.s done")
+    resource_completed = not resource_seen
+    resource_wait_seconds = 0
+
+    if resource_seen:
+        print("Kwai profile resource download detected; waiting safely before retrying Profile.")
+        for step in range(1, 13):
+            time.sleep(10)
+            resource_wait_seconds += 10
+            root, texts = dump(f"04-resource-wait-{step:02d}")
+            if not contains(texts, r"Resource downloading|access to all the features when it.s done"):
+                resource_completed = True
+                print(f"Kwai profile resource overlay cleared after {resource_wait_seconds}s.")
+                break
+
+        if not resource_completed:
+            print("Resource overlay still present after 120s; hiding only the progress overlay and retrying Profile.")
+            tap_node(root, lambda s: s.strip().lower() == "hide")
+            time.sleep(3)
+            root, texts = dump("04-resource-hidden")
+
+        # The first Profile tap starts the module download but does not navigate.
+        # Retry after the download wait/hide phase.
+        tap_profile(root, w, h)
+        time.sleep(8)
+        root, texts = dump("04-profile-retry")
+
     # If a login entry point is present, open it but never enter credentials.
-    login_labels = [
+    login_patterns = [
         r"^Log in$",
         r"^Login$",
         r"^Sign in$",
@@ -164,9 +192,11 @@ def main():
         r"^Sign up or log in$",
         r"^Cadastre-se ou entre$",
         r"^Entrar ou cadastrar$",
+        r"Log in to",
+        r"Sign in to",
     ]
     clicked_login = False
-    for pat in login_labels:
+    for pat in login_patterns:
         rx = re.compile(pat, re.I)
         if tap_node(root, lambda s, rx=rx: bool(rx.search(s))):
             clicked_login = True
@@ -177,7 +207,7 @@ def main():
     joined = "\n".join(texts)
     login_screen = bool(
         re.search(
-            r"phone|telefone|mobile|email|google|facebook|log in|login|sign in|entrar|verification|c[oó]digo",
+            r"phone|telefone|mobile|email|google|facebook|log in|login|sign in|entrar|verification|c[oó]digo|continue with",
             joined,
             re.I,
         )
@@ -185,6 +215,9 @@ def main():
 
     result = {
         "clicked_profile": clicked_profile,
+        "resource_seen": resource_seen,
+        "resource_completed": resource_completed,
+        "resource_wait_seconds": resource_wait_seconds,
         "clicked_login": clicked_login,
         "login_screen_detected": login_screen,
         "pid": adb("shell", "pidof", "com.kwai.video")[1].strip(),
@@ -194,8 +227,7 @@ def main():
     )
     print(result)
 
-    # This probe is intentionally successful if Kwai remains alive even if UI labels change.
-    # Evidence is uploaded for the next deterministic adjustment.
+    # The proof remains non-destructive: no credentials, uploads, or publication actions are used.
     if not result["pid"]:
         raise SystemExit("Kwai process stopped during safe UI probe")
 
