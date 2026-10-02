@@ -1,0 +1,124 @@
+name: Kwai Android 15 ARM translation proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-api35-translation-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  kwai-api35:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download and verify Kwai bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai-xapk
+          curl -fL --retry 4 --retry-delay 3 -A 'Mozilla/5.0' \
+            'https://d.apkpure.net/b/XAPK/com.kwai.video?version=latest' \
+            -o /tmp/kwai.xapk
+          sha256sum /tmp/kwai.xapk | tee artifacts/xapk-sha256.txt
+          unzip -q /tmp/kwai.xapk -d /tmp/kwai-xapk
+          find /tmp/kwai-xapk -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort | tee artifacts/xapk-files.txt
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          cat > /tmp/test-api35.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+
+          {
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo "abilist32=$(adb shell getprop ro.product.cpu.abilist32 | tr -d '\r')"
+            echo "abilist64=$(adb shell getprop ro.product.cpu.abilist64 | tr -d '\r')"
+            echo "native_bridge=$(adb shell getprop ro.dalvik.vm.native.bridge | tr -d '\r')"
+            echo "native_bridge_exec=$(adb shell getprop ro.enable.native.bridge.exec | tr -d '\r')"
+          } | tee artifacts/abi.txt
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          AAPT="$BUILD_TOOLS/aapt"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          BASE='/tmp/kwai-xapk/com.kwai.video.apk'
+          "$AAPT" dump badging "$BASE" > artifacts/base-badging.txt
+          PACKAGE="$(awk -F"'" '/^package: name=/{print $2; exit}' artifacts/base-badging.txt)"
+          test "$PACKAGE" = 'com.kwai.video'
+          "$APKSIGNER" verify --print-certs "$BASE" > artifacts/base-cert.txt 2>&1
+          SHA1="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-1 digest:/{print tolower($NF); exit}' artifacts/base-cert.txt)"
+          SHA256="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-256 digest:/{print tolower($NF); exit}' artifacts/base-cert.txt)"
+          echo "sha1=$SHA1" | tee artifacts/cert-check.txt
+          echo "sha256=$SHA256" | tee -a artifacts/cert-check.txt
+          test "$SHA1" = '5283fea03bd6e2ff0458a7b4879c97283b784deb'
+          test "$SHA256" = 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+          echo 'CERTIFICATE MATCH' | tee -a artifacts/cert-check.txt
+
+          APKS=(
+            /tmp/kwai-xapk/com.kwai.video.apk
+            /tmp/kwai-xapk/config.armeabi_v7a.apk
+            /tmp/kwai-xapk/config.mdpi.apk
+            /tmp/kwai-xapk/dfm_ug.apk
+          )
+          set +e
+          adb install-multiple -r "${APKS[@]}" > artifacts/install.txt 2>&1
+          RC=$?
+          set -e
+          cat artifacts/install.txt
+          echo "install_rc=$RC" | tee artifacts/install-result.txt
+          test "$RC" -eq 0
+
+          adb shell pm path com.kwai.video | tee artifacts/installed-paths.txt
+          adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
+          sleep 25
+          adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+          adb pull /sdcard/window.xml artifacts/kwai-ui.xml >/dev/null 2>&1 || true
+          adb exec-out screencap -p > artifacts/kwai.png
+          python3 - <<'PY'
+          from pathlib import Path
+          b=Path('artifacts/kwai.png').read_bytes()
+          assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000
+          PY
+          echo 'PASS: Android 15 accepted ARMv7 Kwai bundle and launcher opened.' | tee artifacts/result.txt
+          SH
+          chmod +x /tmp/test-api35.sh
+
+      - name: Boot Android 15 and try ARM-translated Kwai
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 512M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          script: bash /tmp/test-api35.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Android 15 ARM translation test'
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: inspect diagnostics.'
+            echo
+            cat artifacts/abi.txt 2>/dev/null || true
+            cat artifacts/cert-check.txt 2>/dev/null || true
+            cat artifacts/install-result.txt 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-api35-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
