@@ -1,0 +1,89 @@
+name: Aurora Store proof of concept
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/aurora-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  aurora:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Prepare Aurora APK and KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          curl -fL --retry 3 --retry-delay 2 \
+            -o /tmp/aurora.apk \
+            https://f-droid.org/repo/com.aurora.store_76.apk
+          sha256sum /tmp/aurora.apk | tee artifacts/aurora-sha256.txt
+          test "$(stat -c%s /tmp/aurora.apk)" -gt 1000000
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          cat > /tmp/test-aurora.sh <<'SCRIPT'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          adb install -r /tmp/aurora.apk | tee artifacts/aurora-install.txt
+          adb shell pm path com.aurora.store | tee artifacts/aurora-package-path.txt
+          adb shell dumpsys package com.aurora.store | grep -E 'versionName=|versionCode=' | head -5 | tee artifacts/aurora-version.txt || true
+          adb shell monkey -p com.aurora.store -c android.intent.category.LAUNCHER 1 > artifacts/aurora-launch.txt
+          sleep 12
+          adb shell uiautomator dump /sdcard/window.xml || true
+          adb pull /sdcard/window.xml artifacts/aurora-ui.xml || true
+          adb exec-out screencap -p > artifacts/aurora.png
+          python3 - <<'PY'
+          from pathlib import Path
+          b=Path('artifacts/aurora.png').read_bytes()
+          assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000
+          PY
+          if grep -Eqi 'Aurora|anonymous|anônimo|Welcome|Bem-vindo|Terms|termos' artifacts/aurora-ui.xml 2>/dev/null; then
+            echo 'PASS: Aurora Store installed and first-run UI rendered.' | tee artifacts/result.txt
+          else
+            echo 'PARTIAL: Aurora Store installed and launched; inspect UI/screenshot.' | tee artifacts/result.txt
+          fi
+          SCRIPT
+
+      - name: Boot Android, install and open Aurora Store
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 2048M
+          heap-size: 512M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          script: bash /tmp/test-aurora.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Aurora Store proof of concept'
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: test did not reach result stage.'
+            echo
+            echo 'Aurora APK source: F-Droid com.aurora.store versionCode 76.'
+            echo 'No Google account, Kwai account, video download or publication attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aurora-poc-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
