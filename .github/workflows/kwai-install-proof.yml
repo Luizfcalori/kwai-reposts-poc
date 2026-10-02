@@ -87,6 +87,20 @@ jobs:
           echo "APK_COUNT=${#APKS[@]}" | tee -a artifacts/package-info.txt
           printf '%s\n' "${APKS[@]}" | tee artifacts/apk-files.txt
 
+          BASE_APK="$(find /tmp/kwai-package -type f -name 'com.kwai.video.apk' -print -quit)"
+          if [ -z "$BASE_APK" ]; then
+            BASE_APK="${APKS[0]}"
+          fi
+          echo "BASE_APK=$BASE_APK" | tee -a artifacts/package-info.txt
+
+          AAPT="$(command -v aapt || true)"
+          if [ -z "$AAPT" ]; then
+            AAPT="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -type f -name aapt 2>/dev/null | sort -V | tail -n1)"
+          fi
+          if [ -n "$AAPT" ]; then
+            "$AAPT" dump badging "$BASE_APK" 2>&1 | tee artifacts/base-badging.txt || true
+          fi
+
           APKSIGNER="$(command -v apksigner || true)"
           if [ -z "$APKSIGNER" ]; then
             APKSIGNER="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -type f -name apksigner 2>/dev/null | sort -V | tail -n1)"
@@ -96,11 +110,16 @@ jobs:
           : > artifacts/certificates.txt
           for apk in "${APKS[@]}"; do
             echo "=== $apk ===" | tee -a artifacts/certificates.txt
-            CERT="$($APKSIGNER verify --print-certs "$apk" 2>&1 | tee -a artifacts/certificates.txt | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n1 | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
+            CERT="$($APKSIGNER verify --print-certs "$apk" 2>&1 \
+              | tee -a artifacts/certificates.txt \
+              | awk -F': ' '/^(V[0-9.]+ Signer|Signer #[0-9]+): certificate SHA-256 digest:/ {print $NF; exit}' \
+              | tr '[:upper:]' '[:lower:]' \
+              | tr -d ':[:space:]')"
             if [ -z "$CERT" ]; then
-              echo "FAIL: could not read certificate from $apk" | tee artifacts/result.txt
+              echo "FAIL: could not read signer certificate from $apk" | tee artifacts/result.txt
               exit 1
             fi
+            echo "$apk $CERT" | tee -a artifacts/verified-signers.txt
             if [ "$CERT" != "$EXPECTED_CERT" ]; then
               echo "FAIL: Kwai certificate mismatch on $apk: $CERT" | tee artifacts/result.txt
               exit 1
@@ -118,6 +137,7 @@ jobs:
           set -e
 
           if [ "$INSTALL_RC" -ne 0 ]; then
+            adb logcat -d -t 500 > artifacts/logcat-install.txt 2>&1 || true
             echo "FAIL_INSTALL: com.kwai.video package was downloaded and signature-verified, but Android rejected installation. See install.txt and emulator-info.txt." | tee artifacts/result.txt
             exit 1
           fi
@@ -127,16 +147,38 @@ jobs:
             exit 1
           fi
 
+          adb shell dumpsys package com.kwai.video \
+            | grep -E 'versionName=|versionCode=|primaryCpuAbi=|secondaryCpuAbi=' \
+            | head -n 20 \
+            | tee artifacts/installed-package.txt || true
+
+          adb logcat -c || true
           adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 2>&1 | tee artifacts/launch.txt || true
           sleep 15
           adb exec-out screencap -p > artifacts/kwai-open.png
           adb shell uiautomator dump /sdcard/kwai.xml >/dev/null 2>&1 || true
           adb pull /sdcard/kwai.xml artifacts/kwai-open.xml >/dev/null 2>&1 || true
+          adb logcat -d -t 1000 > artifacts/logcat-launch.txt 2>&1 || true
+
+          python3 - <<'PY'
+          import pathlib, re
+          p=pathlib.Path('artifacts/kwai-open.xml')
+          if p.exists():
+              s=p.read_text(errors='ignore')
+              values=[]
+              for key in ('text','content-desc'):
+                  values += re.findall(fr'{key}="([^"]+)"', s)
+              seen=[]
+              for value in values:
+                  if value.strip() and value not in seen:
+                      seen.append(value)
+              pathlib.Path('artifacts/kwai-open-texts.txt').write_text('\n'.join(seen))
+          PY
 
           if adb shell pidof com.kwai.video | tee artifacts/pid.txt | grep -Eq '[0-9]'; then
-            echo 'PASS: com.kwai.video installed, certificate verified, and Kwai process is running in the cloud Android emulator.' | tee artifacts/result.txt
+            echo 'PASS: com.kwai.video installed, all APK splits matched the expected Kwai certificate, and the Kwai process is running in the cloud Android emulator.' | tee artifacts/result.txt
           else
-            echo 'PARTIAL: com.kwai.video installed, but the Kwai process was not running after launch attempt.' | tee artifacts/result.txt
+            echo 'PARTIAL: com.kwai.video installed and signatures verified, but the Kwai process was not running after launch attempt. Inspect screenshot and logcat.' | tee artifacts/result.txt
             exit 1
           fi
           SH
@@ -166,6 +208,8 @@ jobs:
             cat artifacts/result.txt 2>/dev/null || echo 'FAIL: proof did not finish.'
             echo
             cat artifacts/emulator-info.txt 2>/dev/null || true
+            echo
+            cat artifacts/installed-package.txt 2>/dev/null || true
             echo
             cat artifacts/downloaded-files.txt 2>/dev/null || true
             echo
