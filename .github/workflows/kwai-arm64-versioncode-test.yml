@@ -1,0 +1,154 @@
+name: Kwai APKPure ARM64 version proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-arm64-versioncode-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  kwai-arm64-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Download Kwai ARM64 version and prepare KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai
+          curl -fL --retry 4 --retry-delay 3 -A 'Mozilla/5.0' \
+            'https://d.apkpure.net/b/XAPK/com.kwai.video?versionCode=646404' \
+            -o /tmp/kwai.xapk
+          file /tmp/kwai.xapk | tee artifacts/file-type.txt
+          stat -c '%s bytes' /tmp/kwai.xapk | tee artifacts/xapk-size.txt
+          sha256sum /tmp/kwai.xapk | tee artifacts/xapk-sha256.txt
+          unzip -q /tmp/kwai.xapk -d /tmp/kwai
+          find /tmp/kwai -type f -printf '%P\t%s bytes\n' | sort | tee artifacts/files.txt
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/install.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          {
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo "native_bridge=$(adb shell getprop ro.dalvik.vm.native.bridge | tr -d '\r')"
+          } | tee artifacts/abi.txt
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          AAPT="$BUILD_TOOLS/aapt"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          : > artifacts/splits.txt
+          BASE=''
+          while IFS= read -r -d '' apk; do
+            "$AAPT" dump badging "$apk" > /tmp/badging.txt 2>/dev/null || true
+            first="$(sed -n '1p' /tmp/badging.txt)"
+            pkg="$(printf '%s\n' "$first" | awk -F"'" '/^package: name=/{print $2}')"
+            split="$(printf '%s\n' "$first" | sed -n "s/.* split='\([^']*\)'.*/\1/p")"
+            printf '%s\tpackage=%s\tsplit=%s\n' "$(basename "$apk")" "$pkg" "$split" >> artifacts/splits.txt
+            if [ "$pkg" = 'com.kwai.video' ] && [ -z "$split" ]; then BASE="$apk"; fi
+          done < <(find /tmp/kwai -type f -name '*.apk' -print0)
+          cat artifacts/splits.txt
+          test -n "$BASE"
+
+          "$APKSIGNER" verify --print-certs "$BASE" > artifacts/cert.txt 2>&1
+          SHA1="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-1 digest:/{print tolower($NF); exit}' artifacts/cert.txt)"
+          SHA256="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-256 digest:/{print tolower($NF); exit}' artifacts/cert.txt)"
+          echo "sha1=$SHA1" | tee artifacts/cert-check.txt
+          echo "sha256=$SHA256" | tee -a artifacts/cert-check.txt
+          test "$SHA1" = '5283fea03bd6e2ff0458a7b4879c97283b784deb'
+          test "$SHA256" = 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+          echo 'CERTIFICATE MATCH' | tee -a artifacts/cert-check.txt
+
+          INSTALL=()
+          while IFS= read -r -d '' apk; do
+            "$AAPT" dump badging "$apk" > /tmp/badging.txt 2>/dev/null || true
+            first="$(sed -n '1p' /tmp/badging.txt)"
+            split="$(printf '%s\n' "$first" | sed -n "s/.* split='\([^']*\)'.*/\1/p")"
+            if [[ "$split" == *armeabi_v7a* ]]; then
+              echo "SKIP $split" | tee -a artifacts/selection.txt
+              continue
+            fi
+            echo "INCLUDE ${split:-base}: $(basename "$apk")" | tee -a artifacts/selection.txt
+            INSTALL+=("$apk")
+          done < <(find /tmp/kwai -type f -name '*.apk' -print0)
+
+          set +e
+          adb install-multiple -r "${INSTALL[@]}" > artifacts/install.txt 2>&1
+          RC=$?
+          set -e
+          cat artifacts/install.txt
+          echo "install_rc=$RC" | tee artifacts/install-result.txt
+          test "$RC" -eq 0
+
+          adb shell pm path com.kwai.video | tee artifacts/installed-paths.txt
+          adb shell dumpsys package com.kwai.video > artifacts/package-dumpsys.txt
+          grep -E 'versionName=|versionCode=|primaryCpuAbi=' artifacts/package-dumpsys.txt | sed -n '1,20p' | tee artifacts/installed-version.txt || true
+          adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
+          sleep 25
+          adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+          adb pull /sdcard/window.xml artifacts/kwai-ui.xml >/dev/null 2>&1 || true
+          adb exec-out screencap -p > artifacts/kwai.png
+          python3 - <<'PY'
+          from pathlib import Path
+          b=Path('artifacts/kwai.png').read_bytes()
+          assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000
+          PY
+          python3 - <<'PY'
+          import re, pathlib
+          p=pathlib.Path('artifacts/kwai-ui.xml')
+          if p.exists():
+              s=p.read_text(errors='ignore')
+              vals=[]
+              for key in ('text','content-desc'):
+                  vals += re.findall(fr'{key}="([^"]+)"', s)
+              seen=[]
+              for v in vals:
+                  if v.strip() and v not in seen: seen.append(v)
+              pathlib.Path('artifacts/kwai-texts.txt').write_text('\n'.join(seen))
+          PY
+          echo 'PASS: specific ARM64 Kwai version installed and launcher opened.' | tee artifacts/result.txt
+          SH
+          chmod +x /tmp/install.sh
+
+      - name: Boot Android 15 and install ARM64 Kwai
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 4096M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          script: bash /tmp/install.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai APKPure ARM64 version test'
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: inspect diagnostics.'
+            cat artifacts/xapk-size.txt 2>/dev/null || true
+            cat artifacts/abi.txt 2>/dev/null || true
+            cat artifacts/cert-check.txt 2>/dev/null || true
+            cat artifacts/install-result.txt 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-arm64-version-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
