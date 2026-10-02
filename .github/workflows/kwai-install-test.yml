@@ -14,19 +14,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Download bundle, prepare verifier and KVM
+      - name: Download single APK, prepare verifier and KVM
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifacts /tmp/kwai-xapk
+          mkdir -p artifacts
           curl -fL --retry 4 --retry-delay 3 \
             -A 'Mozilla/5.0' \
-            'https://d.apkpure.net/b/XAPK/com.kwai.video?version=latest' \
-            -o /tmp/kwai.xapk
-          stat -c '%s bytes' /tmp/kwai.xapk | tee artifacts/xapk-size.txt
-          sha256sum /tmp/kwai.xapk | tee artifacts/xapk-sha256.txt
-          unzip -q /tmp/kwai.xapk -d /tmp/kwai-xapk
-          find /tmp/kwai-xapk -maxdepth 3 -type f -printf '%P\t%s bytes\n' | sort | tee artifacts/xapk-files.txt
+            'https://d.apkpure.net/b/APK/com.kwai.video?version=latest' \
+            -o /tmp/kwai.apk
+          file /tmp/kwai.apk | tee artifacts/file-type.txt
+          stat -c '%s bytes' /tmp/kwai.apk | tee artifacts/apk-size.txt
+          sha256sum /tmp/kwai.apk | tee artifacts/apk-sha256.txt
+          aapt dump badging /tmp/kwai.apk | head -20 | tee artifacts/apk-badging.txt
+          unzip -l /tmp/kwai.apk | grep -E 'lib/[^/]+/.*\.so$' | sed -E 's#.*lib/([^/]+)/.*#\1#' | sort -u | tee artifacts/native-abis.txt || true
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
@@ -36,39 +37,28 @@ jobs:
           while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
           adb shell getprop ro.product.cpu.abilist | tee artifacts/emulator-abis.txt
 
+          PACKAGE="$(aapt dump badging /tmp/kwai.apk | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -1)"
+          echo "package=$PACKAGE" | tee artifacts/package-check.txt
+          test "$PACKAGE" = 'com.kwai.video'
+
           EXPECTED_SHA1='5283fea03bd6e2ff0458a7b4879c97283b784deb'
           EXPECTED_SHA256='bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
-          BASE=''
-          : > artifacts/apk-badging.txt
-          while IFS= read -r -d '' apk; do
-            echo "### $apk" >> artifacts/apk-badging.txt
-            aapt dump badging "$apk" 2>/dev/null | head -5 >> artifacts/apk-badging.txt || true
-            first="$(aapt dump badging "$apk" 2>/dev/null | head -1 || true)"
-            if [[ "$first" == *"name='com.kwai.video'"* && "$first" != *"split='"* ]]; then BASE="$apk"; fi
-          done < <(find /tmp/kwai-xapk -type f -name '*.apk' -print0)
-
-          if [ -z "$BASE" ]; then
-            echo 'Could not identify com.kwai.video base APK' | tee artifacts/result.txt
-            exit 2
-          fi
-          echo "$BASE" | tee artifacts/base-apk.txt
-          apksigner verify --print-certs "$BASE" | tee artifacts/base-cert.txt
-          ACTUAL_SHA1="$(apksigner verify --print-certs "$BASE" | sed -n 's/^Signer #1 certificate SHA-1 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
-          ACTUAL_SHA256="$(apksigner verify --print-certs "$BASE" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
-          echo "sha1=$ACTUAL_SHA1" | tee artifacts/cert-check.txt
-          echo "sha256=$ACTUAL_SHA256" | tee -a artifacts/cert-check.txt
+          apksigner verify --print-certs /tmp/kwai.apk | tee artifacts/cert.txt
+          ACTUAL_SHA1="$(apksigner verify --print-certs /tmp/kwai.apk | sed -n 's/^Signer #1 certificate SHA-1 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
+          ACTUAL_SHA256="$(apksigner verify --print-certs /tmp/kwai.apk | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
+          {
+            echo "sha1=$ACTUAL_SHA1"
+            echo "sha256=$ACTUAL_SHA256"
+          } | tee artifacts/cert-check.txt
           test "$ACTUAL_SHA1" = "$EXPECTED_SHA1"
           test "$ACTUAL_SHA256" = "$EXPECTED_SHA256"
           echo 'CERTIFICATE MATCH' | tee -a artifacts/cert-check.txt
 
-          mapfile -d '' APKS < <(find /tmp/kwai-xapk -type f -name '*.apk' -print0)
-          printf '%s\n' "${APKS[@]}" > artifacts/apks-to-install.txt
-          adb install-multiple -r "${APKS[@]}" | tee artifacts/install.txt
+          adb install -r /tmp/kwai.apk | tee artifacts/install.txt
           adb shell pm path com.kwai.video | tee artifacts/installed-paths.txt
-          adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=' | head -10 | tee artifacts/installed-version.txt || true
-
+          adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=|primaryCpuAbi=' | head -15 | tee artifacts/installed-version.txt || true
           adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
-          sleep 18
+          sleep 20
           adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
           adb pull /sdcard/window.xml artifacts/kwai-ui.xml >/dev/null 2>&1 || true
           adb exec-out screencap -p > artifacts/kwai.png
@@ -90,11 +80,11 @@ jobs:
                   if v.strip() and v not in seen: seen.append(v)
               pathlib.Path('artifacts/kwai-texts.txt').write_text('\n'.join(seen))
           PY
-          echo 'PASS: Kwai certificate verified, package installed, and launcher opened.' | tee artifacts/result.txt
+          echo 'PASS: Kwai package/certificate verified, APK installed, launcher opened.' | tee artifacts/result.txt
           SH
           chmod +x /tmp/install-kwai.sh
 
-      - name: Boot Android and install verified Kwai bundle
+      - name: Boot Android and install verified Kwai APK
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         with:
           api-level: 34
@@ -117,6 +107,7 @@ jobs:
             echo '## Kwai verified install proof'
             cat artifacts/result.txt 2>/dev/null || echo 'FAIL: inspect diagnostic artifact.'
             echo
+            cat artifacts/package-check.txt 2>/dev/null || true
             cat artifacts/cert-check.txt 2>/dev/null || true
             echo
             echo 'No Kwai account login and no publication attempted.'
