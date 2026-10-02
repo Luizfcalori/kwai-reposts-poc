@@ -194,12 +194,24 @@ def skip_slow_loader(root, texts, w, h, tag):
     slow = contains(texts, r"internet.?s a bit slow|hang in there|^Skip$")
     if not slow:
         return root, texts, False
+
     skipped = tap_node(root, lambda s: s.strip().lower() == "skip")
     if not skipped:
         adb("shell", "input", "tap", str(int(w*0.73)), str(int(h*0.88)))
         skipped = True
-    time.sleep(7)
-    root, texts = dump(tag)
+
+    time.sleep(3)
+    root, texts = dump(f"{tag}-confirm")
+    if contains(texts, r"skip the preparation|^yes, skip$"):
+        confirmed = tap_node(root, lambda s: s.strip().lower() == "yes, skip")
+        if not confirmed:
+            adb("shell", "input", "tap", str(int(w*0.35)), str(int(h*0.62)))
+        time.sleep(7)
+        root, texts = dump(tag)
+    else:
+        time.sleep(4)
+        root, texts = dump(tag)
+
     return root, texts, skipped
 
 
