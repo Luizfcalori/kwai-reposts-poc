@@ -1,0 +1,45 @@
+name: Android ABI compatibility matrix
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/android-abi-matrix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  abi:
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [28, 29, 30, 31, 32, 33, 34]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Enable KVM
+        shell: bash
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Boot API ${{ matrix.api }} and report ABIs
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: ${{ matrix.api }}
+          target: google_apis
+          arch: x86_64
+          profile: pixel_3a
+          cores: 2
+          ram-size: 2048M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -accel on
+          script: |
+            echo "API=${{ matrix.api }}"
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo "abilist32=$(adb shell getprop ro.product.cpu.abilist32 | tr -d '\r')"
+            echo "abilist64=$(adb shell getprop ro.product.cpu.abilist64 | tr -d '\r')"
+            adb shell getprop ro.dalvik.vm.native.bridge | sed 's/^/native_bridge=/'
