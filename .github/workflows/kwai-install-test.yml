@@ -14,20 +14,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Download single APK, prepare verifier and KVM
+      - name: Download bundle and prepare KVM
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifacts
+          mkdir -p artifacts /tmp/kwai-xapk
           curl -fL --retry 4 --retry-delay 3 \
             -A 'Mozilla/5.0' \
-            'https://d.apkpure.net/b/APK/com.kwai.video?version=latest' \
-            -o /tmp/kwai.apk
-          file /tmp/kwai.apk | tee artifacts/file-type.txt
-          stat -c '%s bytes' /tmp/kwai.apk | tee artifacts/apk-size.txt
-          sha256sum /tmp/kwai.apk | tee artifacts/apk-sha256.txt
-          aapt dump badging /tmp/kwai.apk | head -20 | tee artifacts/apk-badging.txt
-          unzip -l /tmp/kwai.apk | grep -E 'lib/[^/]+/.*\.so$' | sed -E 's#.*lib/([^/]+)/.*#\1#' | sort -u | tee artifacts/native-abis.txt || true
+            'https://d.apkpure.net/b/XAPK/com.kwai.video?version=latest' \
+            -o /tmp/kwai.xapk
+          file /tmp/kwai.xapk | tee artifacts/file-type.txt
+          stat -c '%s bytes' /tmp/kwai.xapk | tee artifacts/xapk-size.txt
+          sha256sum /tmp/kwai.xapk | tee artifacts/xapk-sha256.txt
+          unzip -q /tmp/kwai.xapk -d /tmp/kwai-xapk
+          find /tmp/kwai-xapk -maxdepth 2 -type f -printf '%P\t%s bytes\n' | sort | tee artifacts/xapk-files.txt
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
@@ -35,17 +35,21 @@ jobs:
           set -euo pipefail
           adb wait-for-device
           while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
-          adb shell getprop ro.product.cpu.abilist | tee artifacts/emulator-abis.txt
+          EMU_ABIS="$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+          echo "$EMU_ABIS" | tee artifacts/emulator-abis.txt
 
-          PACKAGE="$(aapt dump badging /tmp/kwai.apk | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -1)"
+          BASE='/tmp/kwai-xapk/com.kwai.video.apk'
+          test -f "$BASE"
+          aapt dump badging "$BASE" | head -20 | tee artifacts/base-badging.txt
+          PACKAGE="$(aapt dump badging "$BASE" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -1)"
           echo "package=$PACKAGE" | tee artifacts/package-check.txt
           test "$PACKAGE" = 'com.kwai.video'
 
           EXPECTED_SHA1='5283fea03bd6e2ff0458a7b4879c97283b784deb'
           EXPECTED_SHA256='bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
-          apksigner verify --print-certs /tmp/kwai.apk | tee artifacts/cert.txt
-          ACTUAL_SHA1="$(apksigner verify --print-certs /tmp/kwai.apk | sed -n 's/^Signer #1 certificate SHA-1 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
-          ACTUAL_SHA256="$(apksigner verify --print-certs /tmp/kwai.apk | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
+          apksigner verify --print-certs "$BASE" | tee artifacts/base-cert.txt
+          ACTUAL_SHA1="$(apksigner verify --print-certs "$BASE" | sed -n 's/^Signer #1 certificate SHA-1 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
+          ACTUAL_SHA256="$(apksigner verify --print-certs "$BASE" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
           {
             echo "sha1=$ACTUAL_SHA1"
             echo "sha256=$ACTUAL_SHA256"
@@ -54,7 +58,24 @@ jobs:
           test "$ACTUAL_SHA256" = "$EXPECTED_SHA256"
           echo 'CERTIFICATE MATCH' | tee -a artifacts/cert-check.txt
 
-          adb install -r /tmp/kwai.apk | tee artifacts/install.txt
+          INSTALL_APKS=("$BASE")
+          while IFS= read -r -d '' apk; do
+            [ "$apk" = "$BASE" ] && continue
+            name="$(basename "$apk")"
+            if [[ "$name" == config.armeabi_v7a.apk ]] && [[ "$EMU_ABIS" != *armeabi-v7a* ]]; then
+              echo "SKIP incompatible split: $name" | tee -a artifacts/split-selection.txt
+              continue
+            fi
+            if [[ "$name" == config.arm64_v8a.apk ]] && [[ "$EMU_ABIS" != *arm64-v8a* ]]; then
+              echo "SKIP incompatible split: $name" | tee -a artifacts/split-selection.txt
+              continue
+            fi
+            echo "INCLUDE split: $name" | tee -a artifacts/split-selection.txt
+            INSTALL_APKS+=("$apk")
+          done < <(find /tmp/kwai-xapk -maxdepth 1 -type f -name '*.apk' -print0)
+
+          printf '%s\n' "${INSTALL_APKS[@]}" | tee artifacts/apks-to-install.txt
+          adb install-multiple -r "${INSTALL_APKS[@]}" | tee artifacts/install.txt
           adb shell pm path com.kwai.video | tee artifacts/installed-paths.txt
           adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=|primaryCpuAbi=' | head -15 | tee artifacts/installed-version.txt || true
           adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
@@ -80,11 +101,11 @@ jobs:
                   if v.strip() and v not in seen: seen.append(v)
               pathlib.Path('artifacts/kwai-texts.txt').write_text('\n'.join(seen))
           PY
-          echo 'PASS: Kwai package/certificate verified, APK installed, launcher opened.' | tee artifacts/result.txt
+          echo 'PASS: Kwai certificate verified, compatible bundle installed, launcher opened.' | tee artifacts/result.txt
           SH
           chmod +x /tmp/install-kwai.sh
 
-      - name: Boot Android and install verified Kwai APK
+      - name: Boot Android and install verified Kwai bundle
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         with:
           api-level: 34
@@ -109,6 +130,7 @@ jobs:
             echo
             cat artifacts/package-check.txt 2>/dev/null || true
             cat artifacts/cert-check.txt 2>/dev/null || true
+            cat artifacts/split-selection.txt 2>/dev/null || true
             echo
             echo 'No Kwai account login and no publication attempted.'
           } >> "$GITHUB_STEP_SUMMARY"
