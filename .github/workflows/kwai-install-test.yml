@@ -59,8 +59,8 @@ jobs:
           EXPECTED_SHA1='5283fea03bd6e2ff0458a7b4879c97283b784deb'
           EXPECTED_SHA256='bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
           "$APKSIGNER" verify --print-certs "$BASE" | tee artifacts/base-cert.txt
-          ACTUAL_SHA1="$("$APKSIGNER" verify --print-certs "$BASE" | sed -n 's/^Signer #1 certificate SHA-1 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
-          ACTUAL_SHA256="$("$APKSIGNER" verify --print-certs "$BASE" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
+          ACTUAL_SHA1="$("$APKSIGNER" verify --print-certs "$BASE" | sed -n 's/^.*Signer: certificate SHA-1 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
+          ACTUAL_SHA256="$("$APKSIGNER" verify --print-certs "$BASE" | sed -n 's/^.*Signer: certificate SHA-256 digest: //p' | tr -d ':' | tr 'A-F' 'a-f' | head -1)"
           {
             echo "sha1=$ACTUAL_SHA1"
             echo "sha256=$ACTUAL_SHA256"
