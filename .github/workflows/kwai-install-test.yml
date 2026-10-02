@@ -51,8 +51,6 @@ jobs:
 
           BASE='/tmp/kwai-xapk/com.kwai.video.apk'
           test -f "$BASE"
-
-          # Dump once to a file. Avoid `aapt | head` under pipefail (SIGPIPE 141).
           "$AAPT" dump badging "$BASE" > artifacts/base-badging.txt
           sed -n '1,20p' artifacts/base-badging.txt
           PACKAGE="$(awk -F"'" '/^package: name=/{print $2; exit}' artifacts/base-badging.txt)"
@@ -61,12 +59,10 @@ jobs:
 
           EXPECTED_SHA1='5283fea03bd6e2ff0458a7b4879c97283b784deb'
           EXPECTED_SHA256='bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
-
-          # Capture verifier output once, then parse the app signer (not Source Stamp).
           "$APKSIGNER" verify --print-certs "$BASE" > artifacts/base-cert.txt 2>&1
           cat artifacts/base-cert.txt
-          ACTUAL_SHA1="$(awk -F': ' '/Signer: certificate SHA-1 digest:/ && $0 !~ /Source Stamp/{print tolower($2); exit}' artifacts/base-cert.txt)"
-          ACTUAL_SHA256="$(awk -F': ' '/Signer: certificate SHA-256 digest:/ && $0 !~ /Source Stamp/{print tolower($2); exit}' artifacts/base-cert.txt)"
+          ACTUAL_SHA1="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-1 digest:/{print tolower($NF); exit}' artifacts/base-cert.txt)"
+          ACTUAL_SHA256="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-256 digest:/{print tolower($NF); exit}' artifacts/base-cert.txt)"
           {
             echo "sha1=$ACTUAL_SHA1"
             echo "sha256=$ACTUAL_SHA256"
@@ -92,7 +88,6 @@ jobs:
           done < <(find /tmp/kwai-xapk -maxdepth 1 -type f -name '*.apk' -print0)
 
           printf '%s\n' "${INSTALL_APKS[@]}" | tee artifacts/apks-to-install.txt
-
           set +e
           adb install-multiple -r "${INSTALL_APKS[@]}" > artifacts/install.txt 2>&1
           INSTALL_RC=$?
