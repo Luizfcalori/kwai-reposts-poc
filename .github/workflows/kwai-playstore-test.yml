@@ -1,0 +1,94 @@
+name: Kwai Google Play proof of concept
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-playstore-test.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kwai-playstore-poc
+  cancel-in-progress: false
+
+jobs:
+  playstore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Enable KVM and prepare evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          cat > /tmp/check-playstore.sh <<'SCRIPT'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          adb devices -l | tee artifacts/adb-devices.txt
+          adb shell getprop ro.product.cpu.abilist | tee artifacts/android-abis.txt
+          adb shell pm list packages | sort > artifacts/packages.txt
+          grep -q '^package:com.android.vending$' artifacts/packages.txt
+          adb shell dumpsys package com.android.vending | grep -E 'versionName=|versionCode=' | head -5 | tee artifacts/playstore-version.txt || true
+          adb shell input keyevent 82 || true
+          adb shell input keyevent 3 || true
+          sleep 5
+          adb shell am start -W -a android.intent.action.VIEW -d 'market://details?id=com.kwai.video' > artifacts/kwai-market-launch.txt || true
+          sleep 20
+          adb shell uiautomator dump /sdcard/window.xml || true
+          adb pull /sdcard/window.xml artifacts/kwai-market-ui.xml || true
+          adb exec-out screencap -p > artifacts/kwai-playstore.png
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('artifacts/kwai-playstore.png')
+          b=p.read_bytes()
+          assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000
+          print('Valid screenshot:', len(b), 'bytes')
+          PY
+          if grep -Eqi 'Kwai|com\.kwai\.video|Sign in|Fazer login|Google Play' artifacts/kwai-market-ui.xml 2>/dev/null; then
+            echo 'PASS: official Google Play image booted and Kwai market route rendered.' | tee artifacts/result.txt
+          else
+            echo 'PARTIAL: Play Store exists and route launched; inspect screenshot/UI dump.' | tee artifacts/result.txt
+          fi
+          SCRIPT
+
+      - name: Boot Android with Google Play and open Kwai listing
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis_playstore
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 2048M
+          heap-size: 512M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          script: bash /tmp/check-playstore.sh
+
+      - name: Publish summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai Google Play proof of concept'
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: test did not reach result stage.'
+            echo
+            echo 'No account login, no Kwai installation from third-party sources, and no publication attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-playstore-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
