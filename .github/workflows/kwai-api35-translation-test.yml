@@ -136,14 +136,25 @@ jobs:
 
           phone=[r'phone number',r'mobile number',r'n[uú]mero de telefone',r'n[uú]mero do celular',r'country code',r'c[oó]digo do pa[ií]s',r'get code',r'send code',r'verification code',r'c[oó]digo de verifica',r'sms code']
           crash=[r'keeps stopping',r'has stopped',r'isn.?t responding']
+          def is_phone_form(root,texts):
+              # A phone choice in the provider menu is not yet the phone entry form.
+              if root is None:return False
+              fields=[n for n in root.iter('node')
+                      if n.attrib.get('package')=='com.kwai.video'
+                      and n.attrib.get('class')=='android.widget.EditText'
+                      and n.attrib.get('enabled')=='true']
+              return bool(fields) and has(texts,phone)
           root,texts=dump('01-launch')
 
-          # Current Kwai presents a three-card preference onboarding. Advance it by stable resource ID.
+          # Preference cards require a vote followed by an upward swipe (observed 1/9).
           onboarding_steps=0
-          for i in range(4):
+          for i in range(24):
               if not has_id(root,'tiny_discovery_like_button'):
                   break
-              if not tap_id(root,'tiny_discovery_like_button'):
+              if has(texts,[r'Swipe up',r'Deslize.*cima']):
+                  adb('shell','input','swipe','540','1750','540','500','450')
+                  time.sleep(4)
+              elif not tap_id(root,'tiny_discovery_like_button'):
                   break
               onboarding_steps += 1
               root,texts=dump(f'01-onboarding-{onboarding_steps}')
@@ -156,23 +167,24 @@ jobs:
               tap(root,[r'^Skip$',r'^Pular$',r'Not now',r'Agora n[aã]o'])
               root,texts=dump('02-after-skip')
               (root,texts),_=hide_overlay(root,texts,'02b-after-hide')
-              if not has(texts,phone):
+              if not is_phone_form(root,texts):
                   root,texts=open_profile(root,texts,'03-profile')
                   (root,texts),hidden=hide_overlay(root,texts,'03b-after-hide')
-                  if hidden and not has(texts,phone):
+                  if hidden and not is_phone_form(root,texts):
                       root,texts=open_profile(root,texts,'03c-profile-retry')
                       (root,texts),_=hide_overlay(root,texts,'03d-after-second-hide')
-              if not has(texts,phone):
+              if not is_phone_form(root,texts):
                   tap(root,[r'^Log in$',r'^Login$',r'^Sign in$',r'^Entrar$',r'^Fazer login$',r'Sign up or log in',r'Cadastre-se ou entre'])
                   root,texts=dump('04-login')
                   (root,texts),_=hide_overlay(root,texts,'04b-after-hide')
-              if not has(texts,phone):
+              if not is_phone_form(root,texts):
                   tap(root,[r'phone number',r'mobile number',r'continue with phone',r'log in with phone',r'sign in with phone',r'usar telefone',r'entrar com telefone',r'^Phone$',r'^Telefone$'])
                   root,texts=dump('05-phone')
                   (root,texts),_=hide_overlay(root,texts,'05b-after-hide')
-              state='phone_login' if has(texts,phone) else ('login_screen' if has(texts,[r'login',r'log in',r'sign in',r'entrar',r'google']) else 'app_open')
+              state='phone_login' if is_phone_form(root,texts) else ('login_screen' if has(texts,[r'login',r'log in',r'sign in',r'entrar',r'google']) else 'app_open')
           pathlib.Path('artifacts/result.txt').write_text(f'state={state}\nphone_route_detected={str(state=="phone_login").lower()}\nonboarding_steps={onboarding_steps}\n')
           print('state=',state)
+          print('final_screen_texts=',texts)
           PY
 
           cat > /tmp/test-api35.sh <<'SH'
