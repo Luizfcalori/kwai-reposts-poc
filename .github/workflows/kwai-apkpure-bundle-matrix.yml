@@ -1,0 +1,71 @@
+name: Kwai APKPure bundle matrix
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-apkpure-bundle-matrix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: default
+            options: acknowledge_dangers=true
+          - name: arm64
+            options: acknowledge_dangers=true,arch=arm64-v8a
+          - name: all-arch
+            options: acknowledge_dangers=true,arch=arm64-v8a;armeabi-v7a;armeabi;x86;x86_64
+    steps:
+      - name: Download ${{ matrix.variant.name }} APKPure bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out artifacts/unpacked
+          docker run --rm -v "$PWD/out:/output" ghcr.io/efforg/apkeep:stable \
+            -a com.kwai.video@13.8.30.646601 -d apk-pure \
+            -o '${{ matrix.variant.options }}' /output \
+            2>&1 | tee artifacts/download.txt
+          find out -maxdepth 1 -type f -printf '%f\t%s bytes\n' | tee artifacts/files.txt
+          F="$(find out -maxdepth 1 -type f | head -n1)"
+          test -n "$F"
+          stat -c '%s' "$F" | tee artifacts/size-bytes.txt
+          sha256sum "$F" | tee artifacts/sha256.txt
+          case "$F" in
+            *.xapk|*.zip) unzip -q "$F" -d artifacts/unpacked ;;
+            *.apk) cp "$F" artifacts/unpacked/base.apk ;;
+          esac
+          find artifacts/unpacked -type f -printf '%P\t%s bytes\n' | sort | tee artifacts/contents.txt
+          if find artifacts/unpacked -type f | grep -Eq '/(basis|basis_extension)(\.apk|$)|basis'; then
+            echo 'FULL_DYNAMIC_FEATURES_PRESENT=true' | tee artifacts/result.txt
+          else
+            echo 'FULL_DYNAMIC_FEATURES_PRESENT=false' | tee artifacts/result.txt
+          fi
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## APKPure bundle probe - ${{ matrix.variant.name }}'
+            cat artifacts/files.txt 2>/dev/null || true
+            cat artifacts/result.txt 2>/dev/null || true
+            echo 'Largest entries:'
+            sort -k2 -nr artifacts/contents.txt 2>/dev/null | head -n 15 || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-apkpure-${{ matrix.variant.name }}-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
