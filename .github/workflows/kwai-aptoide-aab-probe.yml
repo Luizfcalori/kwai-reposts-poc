@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Query Aptoide app and AAB metadata
+      - name: Query Aptoide app, AAB and dynamic split metadata
         shell: bash
         run: |
           set -euo pipefail
@@ -66,13 +66,54 @@ jobs:
           pathlib.Path('artifacts/versions.txt').write_text('\n'.join(vlines)+'\n')
 
           blob=json.dumps(aab,ensure_ascii=False).lower()
-          split_count=blob.count('split')
-          full=any(x in blob for x in ('basis_extension','basis.config','"basis"'))
-          pathlib.Path('artifacts/result.txt').write_text(f'AAB_PRESENT={str(bool(aab)).lower()}\nSPLIT_MARKERS={split_count}\nFULL_DYNAMIC_FEATURES_PRESENT={str(full).lower()}\n')
-          print('\n'.join(lines))
-          print(f'AAB_PRESENT={str(bool(aab)).lower()} SPLIT_MARKERS={split_count} FULL_DYNAMIC_FEATURES_PRESENT={str(full).lower()}')
+          pathlib.Path('artifacts/base-result.txt').write_text(
+              f'AAB_PRESENT={str(bool(aab)).lower()}\n'
+              f'BASE_FULL_DYNAMIC_FEATURES_PRESENT={str(any(x in blob for x in ("basis_extension","basis.config","\"basis\""))).lower()}\n'
+          )
           if data.get('info',{}).get('status') != 'OK':
               raise SystemExit('Aptoide returned non-OK status')
+          PY
+
+          MD5='c9dfcd8ce1e6498ace9c59db173a0805'
+          DYN="https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${MD5}/language=pt_PT"
+          curl -LsS --retry 3 --retry-delay 2 -w '%{http_code}\n' "$DYN" -o "$RUNNER_TEMP/dynamic.json" | tee artifacts/dynamic-http-status.txt
+          python3 - "$RUNNER_TEMP/dynamic.json" <<'PY'
+          import json,sys,pathlib
+          data=json.load(open(sys.argv[1],encoding='utf-8'))
+          pathlib.Path('artifacts/dynamic-status.txt').write_text('info_status='+str(data.get('info',{}).get('status'))+'\n')
+          def walk(obj,prefix=''):
+              out=[]
+              if isinstance(obj,dict):
+                  for k,v in obj.items():
+                      p=f'{prefix}.{k}' if prefix else k
+                      if isinstance(v,(dict,list)):
+                          out.extend(walk(v,p))
+                      elif any(x in k.lower() for x in ('path','name','type','size','md5','split','deliver')):
+                          out.append((p,str(v)))
+              elif isinstance(obj,list):
+                  for i,v in enumerate(obj): out.extend(walk(v,f'{prefix}[{i}]'))
+              return out
+          structure=walk(data)
+          pathlib.Path('artifacts/dynamic-structure.txt').write_text('\n'.join(f'{k}={v}' for k,v in structure)+'\n')
+          blob=json.dumps(data,ensure_ascii=False).lower()
+          names=[]
+          def collect(o):
+              if isinstance(o,dict):
+                  n=o.get('name')
+                  if isinstance(n,str): names.append(n)
+                  for v in o.values(): collect(v)
+              elif isinstance(o,list):
+                  for v in o: collect(v)
+          collect(data)
+          pathlib.Path('artifacts/dynamic-names.txt').write_text('\n'.join(dict.fromkeys(names))+'\n')
+          full=any(x in blob for x in ('basis_extension','basis.config','"basis"'))
+          urls=blob.count('https://')
+          pathlib.Path('artifacts/result.txt').write_text(
+              f'DYNAMIC_FEATURES_PRESENT={str(full).lower()}\nURL_MARKERS={urls}\n'
+          )
+          print('dynamic_status=',data.get('info',{}).get('status'))
+          print('names=',names[:40])
+          print('DYNAMIC_FEATURES_PRESENT=',full,'URL_MARKERS=',urls)
           PY
 
       - name: Summary
@@ -80,15 +121,19 @@ jobs:
         shell: bash
         run: |
           {
-            echo '## Aptoide AAB probe'
+            echo '## Aptoide AAB/dynamic split probe'
             cat artifacts/http-status.txt 2>/dev/null || true
             cat artifacts/status.txt 2>/dev/null || true
             cat artifacts/meta.txt 2>/dev/null || true
+            cat artifacts/base-result.txt 2>/dev/null || true
+            echo 'Dynamic endpoint:'
+            cat artifacts/dynamic-http-status.txt 2>/dev/null || true
+            cat artifacts/dynamic-status.txt 2>/dev/null || true
             cat artifacts/result.txt 2>/dev/null || true
-            echo 'AAB structure:'
-            head -n 120 artifacts/aab-structure.txt 2>/dev/null || true
-            echo 'Known versions:'
-            head -n 30 artifacts/versions.txt 2>/dev/null || true
+            echo 'Dynamic names:'
+            cat artifacts/dynamic-names.txt 2>/dev/null || true
+            echo 'Dynamic structure:'
+            head -n 160 artifacts/dynamic-structure.txt 2>/dev/null || true
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload diagnostics
