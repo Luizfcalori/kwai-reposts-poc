@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Download full official Kwai community XAPK
+      - name: Download exact current official Kwai community XAPK
         shell: bash
         run: |
           set -euo pipefail
@@ -24,7 +24,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
           docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
-            -a com.kwai.kuaishou.video.live -d apk-pure \
+            -a 'com.kwai.kuaishou.video.live@13.8.30.646601' -d apk-pure \
             -o 'acknowledge_dangers=true,arch=arm64-v8a' /output \
             2>&1 | tee artifacts/download.txt
 
@@ -41,13 +41,20 @@ jobs:
           BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
           : > artifacts/certificates.txt
           : > artifacts/packages.txt
+          VERSION_OK=0
           while IFS= read -r apk; do
             "$BT/apksigner" verify --print-certs "$apk" > /tmp/cert.txt 2>&1
             CERT="$(awk -F': ' '/certificate SHA-256 digest:/{print tolower($NF); exit}' /tmp/cert.txt | tr -d '[:space:]')"
             echo "$(basename "$apk") $CERT" | tee -a artifacts/certificates.txt
             test "$CERT" = '588774ea798843484c7100da2450005090522fda0dcb64be01c04079349c0acc'
-            "$BT/aapt" dump badging "$apk" | head -1 | tee -a artifacts/packages.txt || true
+            LINE="$("$BT/aapt" dump badging "$apk" | head -1 || true)"
+            echo "$(basename "$apk") :: $LINE" | tee -a artifacts/packages.txt
+            if echo "$LINE" | grep -q "package: name='com.kwai.kuaishou.video.live'" && echo "$LINE" | grep -q "versionName='13.8.30.646601'"; then
+              VERSION_OK=1
+            fi
           done < <(find /tmp/kwai-full -type f -name '*.apk' | sort)
+          test "$VERSION_OK" -eq 1
+          echo 'exact_version_verified=true' | tee artifacts/version-check.txt
 
           cat > /tmp/probe-full.py <<'PY'
           import pathlib,re,subprocess,time,xml.etree.ElementTree as ET
@@ -84,36 +91,31 @@ jobs:
               return False
           def has(t,pats):
               s='\n'.join(t); return any(re.search(p,s,re.I) for p in pats)
-          phone=[r'phone number',r'mobile number',r'n[uú]mero de telefone',r'n[uú]mero do celular',r'country code',r'get code',r'send code',r'verification code',r'c[oó]digo de verifica',r'sms']
+          phone=[r'phone number',r'mobile number',r'n[uú]mero de telefone',r'n[uú]mero do celular',r'country code',r'get code',r'send code',r'verification code',r'c[oó]digo de verifica',r'continue with phone',r'log in with phone',r'sign in with phone',r'usar telefone',r'entrar com telefone',r'celular',r'sms']
           login=[r'log in',r'login',r'sign in',r'entrar',r'cadastre',r'sign up']
-          # Allow first-run screens to settle and dismiss safe OS/app prompts only.
-          time.sleep(12)
+          time.sleep(15)
           root,texts=dump('00-launch')
-          for i in range(1,16):
+          for i in range(1,21):
               if has(texts,phone): break
-              # notification / consent / onboarding controls
-              if tap(root,[r'^Allow$',r'^Permitir$',r'^Not now$',r'Agora n[aã]o',r'^Skip$',r'^Pular$',r'^Agree$',r'^Aceitar$',r'^Continue$',r'^Continuar$',r'^Start now$',r'^Começar agora$']):
+              if tap(root,[r'^Allow$',r'^Permitir$',r'^Not now$',r'Agora n[aã]o',r'^Skip$',r'^Pular$',r'^Agree$',r'^Aceitar$',r'^Continue$',r'^Continuar$',r'^Start now$',r'^Começar agora$',r'^Got it$',r'^Entendi$']):
                   root,texts=dump(f'01-step-{i:02d}'); continue
-              # preference onboarding: tap Like then swipe if counter appears
               if re.search(r'\b\d+/\d+\b','\n'.join(texts)) or has(texts,[r'choose like or dislike',r'swipe up']):
                   tap(root,[r'^Like$',r'Gostei',r'like'])
                   adb('shell','input','swipe','540','1950','540','400','1000'); time.sleep(3)
                   root,texts=dump(f'02-onboarding-{i:02d}'); continue
-              # Try profile/me from normal app surface.
               if tap(root,[r'^Profile$',r'^Perfil$',r'^Me$',r'^Eu$',r'^Account$',r'^Conta$']):
                   root,texts=dump(f'03-profile-{i:02d}'); continue
-              # Common bottom-right profile coordinate.
               adb('shell','input','tap','1000','2290'); time.sleep(3)
               root,texts=dump(f'04-bottom-profile-{i:02d}')
               if has(texts,phone): break
-              if tap(root,[r'^Log in$',r'^Login$',r'^Sign in$',r'^Entrar$',r'^Fazer login$',r'Sign up or log in',r'Cadastre-se ou entre']):
+              if tap(root,[r'^Log in$',r'^Login$',r'^Sign in$',r'^Entrar$',r'^Fazer login$',r'Sign up or log in',r'Cadastre-se ou entre',r'Entrar ou cadastrar']):
                   root,texts=dump(f'05-login-{i:02d}')
               if has(texts,phone): break
               if tap(root,[r'phone',r'telefone',r'celular',r'mobile']):
                   root,texts=dump(f'06-phone-{i:02d}')
               if has(texts,phone): break
           state='phone_login' if has(texts,phone) else ('login_screen' if has(texts,login+[r'google',r'facebook']) else 'app_open')
-          pathlib.Path('artifacts/result.txt').write_text('state='+state+'\nphone_route_detected='+str(state=='phone_login').lower()+'\nfinal_texts='+' | '.join(texts[:30])+'\n')
+          pathlib.Path('artifacts/result.txt').write_text('state='+state+'\nphone_route_detected='+str(state=='phone_login').lower()+'\nfinal_texts='+' | '.join(texts[:40])+'\n')
           print('FINAL',state)
           PY
 
@@ -124,7 +126,7 @@ jobs:
           {
             echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
             echo '--- route ---'; adb shell ip route || true
-            echo '--- ping ---'; adb shell ping -c 1 -W 3 www.google.com || true
+            echo '--- DNS resolve ---'; adb shell ping -c 1 -W 3 www.google.com || true
           } | tee artifacts/network.txt
 
           mapfile -d '' ALL < <(find /tmp/kwai-full -type f -name '*.apk' -print0)
@@ -134,10 +136,11 @@ jobs:
           adb shell pm grant com.kwai.kuaishou.video.live android.permission.POST_NOTIFICATIONS 2>/dev/null || true
           adb shell appops set com.kwai.kuaishou.video.live POST_NOTIFICATION allow 2>/dev/null || true
           adb shell dumpsys package com.kwai.kuaishou.video.live | grep -E 'versionName=|versionCode=|primaryCpuAbi=|splitNames=' | head -n40 | tee artifacts/installed-package.txt || true
+          grep -q 'versionName=13.8.30.646601' artifacts/installed-package.txt
           adb shell monkey -p com.kwai.kuaishou.video.live -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
           python3 /tmp/probe-full.py 2>&1 | tee artifacts/probe-console.txt
           adb shell pidof com.kwai.kuaishou.video.live | tee artifacts/pid.txt || true
-          adb logcat -d -t 2500 > artifacts/logcat.txt || true
+          adb logcat -d -t 3000 > artifacts/logcat.txt || true
           SH
           chmod +x /tmp/run-full-community.sh
 
@@ -161,8 +164,9 @@ jobs:
         shell: bash
         run: |
           {
-            echo '## Full official Kwai community package phone route'
+            echo '## Exact current official Kwai community package phone route'
             cat artifacts/downloaded-files.txt 2>/dev/null || true
+            cat artifacts/version-check.txt 2>/dev/null || true
             echo
             cat artifacts/installed-package.txt 2>/dev/null || true
             echo
