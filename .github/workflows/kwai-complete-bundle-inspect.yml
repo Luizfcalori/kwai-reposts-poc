@@ -1,0 +1,35 @@
+name: Kwai complete bundle inspection
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-complete-bundle-inspect.yml'
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Download and verify candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai
+          curl -fL --max-time 180 --retry 2 'https://www.apkmirror.com/wp-content/themes/APKMirror/download.php?id=16206618&key=a1db1ecbde418cd3ba5c01e0e6a8b809d62e4f7e' -o /tmp/kwai.apkm
+          echo '536ae315a4d5d5742ba5d2073c4058a57e6f3abc89150fd4b3af23ab4159492a  /tmp/kwai.apkm' | sha256sum -c - | tee artifacts/hash.txt
+          unzip -l /tmp/kwai.apkm | tee artifacts/contents.txt
+          unzip -q /tmp/kwai.apkm '*.apk' -d /tmp/kwai
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          for apk in /tmp/kwai/*.apk; do
+            "$BT/apksigner" verify --print-certs "$apk" > /tmp/cert.txt
+            grep -qi 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047' /tmp/cert.txt
+            echo "VERIFIED $(basename "$apk")" | tee -a artifacts/certificates.txt
+            "$BT/aapt" dump badging "$apk" | head -1 | tee -a artifacts/packages.txt
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: kwai-complete-bundle-inspection
+          path: artifacts/
+          retention-days: 3
