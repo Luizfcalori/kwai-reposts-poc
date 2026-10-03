@@ -52,42 +52,73 @@ jobs:
               (ART/f'{tag}.txt').write_text('\n'.join(texts),encoding='utf-8')
               return texts
 
-          def has_phone(texts):
+          def looks_like_phone_login(texts):
               s='\n'.join(texts)
-              return bool(re.search(r'phone|mobile|telefone|celular|n[uú]mero|country|pa[ií]s|sms|verification|verifica',s,re.I))
+              strong=[
+                  r'phone number', r'mobile number', r'n[uú]mero de telefone', r'n[uú]mero do celular',
+                  r'country code', r'c[oó]digo do pa[ií]s', r'get code', r'send code',
+                  r'verification code', r'c[oó]digo de verifica', r'sms code'
+              ]
+              return any(re.search(p,s,re.I) for p in strong)
 
           candidates=[
-              'com.yxcorp.gifshow.login.PhoneAccountActivityV2',
+              'com.yxcorp.gifshow.homepage.HomeActivityAlias',
+              'com.yxcorp.gifshow.homepage.HomeActivityNormal',
+              'com.yxcorp.gifshow.homepage.HomeActivity',
               'com.yxcorp.gifshow.login.SplashLoginActivity',
               'com.yxcorp.gifshow.login.LoginActivity',
-              'com.yxcorp.gifshow.homepage.HomeActivity',
+              'com.yxcorp.gifshow.login.LoginHalfActivity',
+              'com.yxcorp.gifshow.login.PhoneAccountActivityV2',
+              'com.yxcorp.gifshow.login.PhoneVerifyActivity',
+              'com.yxcorp.gifshow.homepage.HomeActivityBra',
+              'com.yxcorp.gifshow.homepage.HomeActivityMex',
+              'com.yxcorp.gifshow.homepage.HomeActivityPer',
           ]
           records=[]
           success=None
+          best=None
           for idx,activity in enumerate(candidates,1):
               adb('shell','am','force-stop',PKG)
               adb('logcat','-c')
               start=adb('shell','am','start','-W','-n',f'{PKG}/{activity}').stdout
               (ART/f'{idx:02d}-start.txt').write_text(start,encoding='utf-8')
-              time.sleep(8)
+              denied=bool(re.search(r'SecurityException|Permission Denial|Error:|Exception occurred',start,re.I))
+              time.sleep(6 if not denied else 1)
               pid=adb('shell','pidof',PKG).stdout.strip()
               top=adb('shell','dumpsys','activity','activities').stdout
               (ART/f'{idx:02d}-activities.txt').write_text(top,encoding='utf-8')
+              pkg_foreground=bool(pid) and bool(re.search(r'(mResumedActivity|topResumedActivity|ResumedActivity).*com\.kwai\.video',top,re.I))
+              activity_foreground=pkg_foreground and activity in top
               texts=dump(f'{idx:02d}-{activity.rsplit(".",1)[-1]}')
-              adb('logcat','-d','-t','800').stdout and None
-              log=adb('logcat','-d','-t','800').stdout
+              log=adb('logcat','-d','-t','1000').stdout
               (ART/f'{idx:02d}-logcat.txt').write_text(log,encoding='utf-8')
-              phone=has_phone(texts)
-              foreground=activity in top
-              record=f'activity={activity} pid={bool(pid)} foreground={foreground} phone_text={phone} start={start.strip()!r} texts={texts[:40]!r}'
+              phone=looks_like_phone_login(texts) if pkg_foreground else False
+              record=(
+                  f'activity={activity} denied={denied} pid={bool(pid)} '
+                  f'pkg_foreground={pkg_foreground} activity_foreground={activity_foreground} '
+                  f'phone_login={phone} start={start.strip()!r} texts={texts[:40]!r}'
+              )
               print(record); records.append(record)
+              if pkg_foreground and best is None:
+                  best=activity
               if phone:
                   success=activity
                   break
 
+          # Also ask PackageManager which public MAIN/LAUNCHER entries are actually resolvable.
+          queries=[]
+          for args in [
+              ('cmd','package','query-activities','--brief','-a','android.intent.action.MAIN','-c','android.intent.category.LAUNCHER',PKG),
+              ('cmd','package','query-activities','--brief','-a','android.intent.action.MAIN',PKG),
+          ]:
+              out=adb('shell',*args).stdout
+              queries.append(' '.join(args)+'\n'+out)
+          (ART/'package-queries.txt').write_text('\n---\n'.join(queries),encoding='utf-8')
+
           result={
               'phone_route_detected': bool(success),
               'successful_activity': success or '',
+              'best_public_activity': best or '',
               'attempts': len(records),
               'final_pid': adb('shell','pidof',PKG).stdout.strip(),
           }
@@ -106,11 +137,12 @@ jobs:
           echo "$CERT" | grep -q 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
           echo 'OFFICIAL_CERTIFICATE_MATCH=true' | tee artifacts/direct-phone-cert-check.txt
           adb install -r /tmp/kwai-old.apk 2>&1 | tee artifacts/direct-phone-install.txt
+          adb shell dumpsys package com.kwai.video > artifacts/direct-phone-package.txt 2>&1 || true
           python3 /tmp/direct-phone.py 2>&1 | tee artifacts/direct-phone-console.txt
           SH
           chmod +x /tmp/install-direct-phone.sh
 
-      - name: Boot Android and open phone-auth activity
+      - name: Boot Android and probe public phone-auth routes
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         with:
           api-level: 35
@@ -130,9 +162,11 @@ jobs:
         shell: bash
         run: |
           {
-            echo '## Direct Kwai phone activity proof'
+            echo '## Direct Kwai phone activity proof — corrected detector'
             cat artifacts/direct-phone-cert-check.txt 2>/dev/null || true
             cat artifacts/direct-phone-result.txt 2>/dev/null || echo 'No result produced.'
+            echo
+            cat artifacts/direct-phone/package-queries.txt 2>/dev/null || true
             echo
             head -n 20 artifacts/direct-phone/attempts.txt 2>/dev/null || true
             echo
