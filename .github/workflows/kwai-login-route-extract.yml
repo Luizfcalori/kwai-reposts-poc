@@ -1,0 +1,94 @@
+name: Kwai login route extraction
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-login-route-extract.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download current Kwai base APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/apk
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}
+          u=f.get('path') or f.get('path_alt')
+          if not u: raise SystemExit('no base url')
+          pathlib.Path('/tmp/base-url').write_text(u)
+          print('version',f.get('vername'))
+          PY
+          curl -fL --retry 4 --retry-delay 2 "$(cat /tmp/base-url)" -o /tmp/apk/base.apk
+          unzip -q /tmp/apk/base.apk 'classes*.dex' -d /tmp/apk/dex
+
+      - name: Extract login and router hints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib,re,subprocess
+          dexdir=pathlib.Path('/tmp/apk/dex')
+          raw=[]
+          for p in sorted(dexdir.glob('classes*.dex')):
+              out=subprocess.run(['strings','-a',str(p)],text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL).stdout
+              raw.extend(out.splitlines())
+          pats=[
+              r'phone',r'mobile',r'login',r'log_in',r'log-in',r'signin',r'sign_in',r'verification',r'sms',
+              r'kwai://',r'kwai:',r'router',r'uri_router',r'auth',r'account'
+          ]
+          rx=re.compile('|'.join(pats),re.I)
+          keep=[]
+          seen=set()
+          for s in raw:
+              s=s.strip()
+              if not s or len(s)>300 or not rx.search(s): continue
+              if s in seen: continue
+              seen.add(s); keep.append(s)
+          pathlib.Path('artifacts/login-router-strings.txt').write_text('\n'.join(keep),encoding='utf-8')
+          # Smaller route-like shortlist.
+          route=[]
+          for s in keep:
+              low=s.lower()
+              if ('://' in s or s.startswith('/') or 'router' in low or 'phone' in low or 'login' in low) and len(s)<220:
+                  route.append(s)
+          pathlib.Path('artifacts/route-shortlist.txt').write_text('\n'.join(route[:3000]),encoding='utf-8')
+          print('matched_strings=',len(keep))
+          print('route_candidates=',len(route))
+          print('--- likely phone/login routes ---')
+          score=[]
+          for s in route:
+              l=s.lower(); sc=0
+              if 'phone' in l: sc+=5
+              if 'login' in l or 'sign' in l: sc+=4
+              if '://' in s: sc+=4
+              if 'router' in l: sc+=2
+              if 'auth' in l: sc+=1
+              if sc>=6: score.append((sc,s))
+          for _,s in sorted(score,reverse=True)[:160]: print(s)
+          PY
+
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -n "$BT" ] && [ -x "$BT/aapt2" ]; then
+            "$BT/aapt2" dump xmltree /tmp/apk/base.apk --file AndroidManifest.xml > artifacts/manifest-tree.txt 2>&1 || true
+            grep -Eai -B4 -A8 'phone|login|auth|router' artifacts/manifest-tree.txt > artifacts/manifest-login-excerpts.txt || true
+          fi
+
+      - name: Upload extraction
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-login-route-extract-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 1
