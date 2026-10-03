@@ -1,4 +1,4 @@
-name: Kwai API34 internal phone activity proof
+name: Kwai API34 manifest phone route proof
 
 on:
   workflow_dispatch:
@@ -7,13 +7,13 @@ on:
       - '.github/workflows/kwai-api34-phone-route-proof.yml'
       - 'scripts/kwai_ui_probe.py'
       - 'scripts/kwai_ui_probe_confirm.py'
-      - 'scripts/kwai_internal_phone_activity_probe.py'
+      - 'scripts/kwai_manifest_phone_route_probe.py'
 
 permissions:
   contents: read
 
 jobs:
-  internal-phone-api34:
+  manifest-phone-api34:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -82,7 +82,7 @@ jobs:
           python3 scripts/kwai_ui_probe_confirm.py 2>&1 | tee artifacts/onboarding-console.txt
           ONBOARD_RC=${PIPESTATUS[0]}
           if [ "$ONBOARD_RC" -eq 0 ]; then
-            python3 scripts/kwai_internal_phone_activity_probe.py 2>&1 | tee artifacts/internal-phone-console.txt
+            python3 scripts/kwai_manifest_phone_route_probe.py 2>&1 | tee artifacts/manifest-phone-console.txt
             PHONE_RC=${PIPESTATUS[0]}
           else
             PHONE_RC=$ONBOARD_RC
@@ -92,12 +92,12 @@ jobs:
           adb shell pidof com.kwai.video | tee artifacts/pid.txt || true
           adb logcat -d -t 2500 > artifacts/logcat.txt || true
           echo "onboarding_rc=$ONBOARD_RC" | tee artifacts/result.txt
-          echo "internal_phone_rc=$PHONE_RC" | tee -a artifacts/result.txt
+          echo "manifest_phone_rc=$PHONE_RC" | tee -a artifacts/result.txt
           exit "$PHONE_RC"
           SH
           chmod +x /tmp/run-api34.sh
 
-      - name: Boot connected Android 14 and prove internal phone activity
+      - name: Boot connected Android 14 and prove manifest phone route
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         with:
           api-level: 34
@@ -117,15 +117,16 @@ jobs:
         shell: bash
         run: |
           {
-            echo '## Kwai API34 internal phone activity proof'
+            echo '## Kwai API34 manifest phone route proof'
             cat artifacts/network.txt 2>/dev/null || true
             echo
             cat artifacts/installed-version.txt 2>/dev/null || true
             echo
             cat artifacts/result.txt 2>/dev/null || true
-            cat artifacts/internal-phone-activity/result.txt 2>/dev/null || true
+            cat artifacts/manifest-phone-route/result.txt 2>/dev/null || true
             echo
-            echo 'Static map target: PhoneAccountActivityV2 / PhoneVerifyActivity. No public deep links repeated.'
+            echo 'Routes tested: ikwai://loginchannel, ikwai://bind/phone, kwai://bind/phone.'
+            echo 'No previously discarded login deep links repeated.'
             echo 'No phone number, SMS code, password, account login, upload, or publication attempted.'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -133,7 +134,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: kwai-api34-internal-phone-${{ github.run_id }}
+          name: kwai-api34-manifest-phone-${{ github.run_id }}
           path: artifacts/
           if-no-files-found: error
           retention-days: 1
