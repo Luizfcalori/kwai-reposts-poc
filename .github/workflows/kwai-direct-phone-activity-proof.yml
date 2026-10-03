@@ -1,0 +1,149 @@
+name: Kwai direct phone activity proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-direct-phone-activity-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  phone-activity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Prepare verified Kwai APK and KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/direct-phone
+          URL='https://pool.apk.aptoide.com/appupdater/com-kwai-video-511304-72159650-7b16f3bea9483d98a12611334e22b543.apk'
+          curl -fL --retry 4 --retry-delay 2 "$URL" -o /tmp/kwai-old.apk
+          test "$(md5sum /tmp/kwai-old.apk | awk '{print $1}')" = '7b16f3bea9483d98a12611334e22b543'
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/direct-phone.py <<'PY'
+          import pathlib,re,subprocess,time,xml.etree.ElementTree as ET
+          ART=pathlib.Path('artifacts/direct-phone')
+          PKG='com.kwai.video'
+
+          def adb(*args):
+              return subprocess.run(['adb',*args],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+
+          def dump(tag):
+              remote='/sdcard/direct-phone.xml'
+              adb('shell','uiautomator','dump',remote)
+              xp=ART/f'{tag}.xml'; adb('pull',remote,str(xp))
+              with open(ART/f'{tag}.png','wb') as f:
+                  subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
+              texts=[]
+              try:
+                  root=ET.parse(xp).getroot()
+                  for n in root.iter('node'):
+                      for k in ('text','content-desc','hint'):
+                          v=(n.attrib.get(k) or '').strip()
+                          if v and v not in texts:texts.append(v)
+              except Exception:
+                  pass
+              (ART/f'{tag}.txt').write_text('\n'.join(texts),encoding='utf-8')
+              return texts
+
+          def has_phone(texts):
+              s='\n'.join(texts)
+              return bool(re.search(r'phone|mobile|telefone|celular|n[uú]mero|country|pa[ií]s|sms|verification|verifica',s,re.I))
+
+          candidates=[
+              'com.yxcorp.gifshow.login.PhoneAccountActivityV2',
+              'com.yxcorp.gifshow.login.SplashLoginActivity',
+              'com.yxcorp.gifshow.login.LoginActivity',
+              'com.yxcorp.gifshow.homepage.HomeActivity',
+          ]
+          records=[]
+          success=None
+          for idx,activity in enumerate(candidates,1):
+              adb('shell','am','force-stop',PKG)
+              adb('logcat','-c')
+              start=adb('shell','am','start','-W','-n',f'{PKG}/{activity}').stdout
+              (ART/f'{idx:02d}-start.txt').write_text(start,encoding='utf-8')
+              time.sleep(8)
+              pid=adb('shell','pidof',PKG).stdout.strip()
+              top=adb('shell','dumpsys','activity','activities').stdout
+              (ART/f'{idx:02d}-activities.txt').write_text(top,encoding='utf-8')
+              texts=dump(f'{idx:02d}-{activity.rsplit(".",1)[-1]}')
+              adb('logcat','-d','-t','800').stdout and None
+              log=adb('logcat','-d','-t','800').stdout
+              (ART/f'{idx:02d}-logcat.txt').write_text(log,encoding='utf-8')
+              phone=has_phone(texts)
+              foreground=activity in top
+              record=f'activity={activity} pid={bool(pid)} foreground={foreground} phone_text={phone} start={start.strip()!r} texts={texts[:40]!r}'
+              print(record); records.append(record)
+              if phone:
+                  success=activity
+                  break
+
+          result={
+              'phone_route_detected': bool(success),
+              'successful_activity': success or '',
+              'attempts': len(records),
+              'final_pid': adb('shell','pidof',PKG).stdout.strip(),
+          }
+          (ART/'attempts.txt').write_text('\n'.join(records)+'\n',encoding='utf-8')
+          pathlib.Path('artifacts/direct-phone-result.txt').write_text('\n'.join(f'{k}={v}' for k,v in result.items())+'\n',encoding='utf-8')
+          print(result)
+          PY
+
+          cat > /tmp/install-direct-phone.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          BUILD_TOOLS="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+          CERT="$($BUILD_TOOLS/apksigner verify --print-certs /tmp/kwai-old.apk 2>&1)"
+          printf '%s\n' "$CERT" > artifacts/direct-phone-cert.txt
+          echo "$CERT" | grep -q 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+          echo 'OFFICIAL_CERTIFICATE_MATCH=true' | tee artifacts/direct-phone-cert-check.txt
+          adb install -r /tmp/kwai-old.apk 2>&1 | tee artifacts/direct-phone-install.txt
+          python3 /tmp/direct-phone.py 2>&1 | tee artifacts/direct-phone-console.txt
+          SH
+          chmod +x /tmp/install-direct-phone.sh
+
+      - name: Boot Android and open phone-auth activity
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 4096M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/install-direct-phone.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Direct Kwai phone activity proof'
+            cat artifacts/direct-phone-cert-check.txt 2>/dev/null || true
+            cat artifacts/direct-phone-result.txt 2>/dev/null || echo 'No result produced.'
+            echo
+            head -n 20 artifacts/direct-phone/attempts.txt 2>/dev/null || true
+            echo
+            echo 'No phone number, OTP, password, upload, or publication was attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-direct-phone-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
