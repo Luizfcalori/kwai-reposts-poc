@@ -1,0 +1,202 @@
+name: Kwai monolithic phone login proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-monolithic-phone-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  phone-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Download verified official monolithic Kwai APK and prepare KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          URL='https://pool.apk.aptoide.com/appupdater/com-kwai-video-511304-72159650-7b16f3bea9483d98a12611334e22b543.apk'
+          curl -fL --retry 4 --retry-delay 2 "$URL" -o /tmp/kwai-old.apk
+          stat -c '%s bytes' /tmp/kwai-old.apk | tee artifacts/download-size.txt
+          md5sum /tmp/kwai-old.apk | tee artifacts/download-md5.txt
+          test "$(md5sum /tmp/kwai-old.apk | awk '{print $1}')" = '7b16f3bea9483d98a12611334e22b543'
+          echo 'APTIODE_MD5_MATCH=true' | tee artifacts/download-verification.txt
+
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/old-phone-proof.py <<'PY'
+          import pathlib,re,subprocess,time,xml.etree.ElementTree as ET
+          ART=pathlib.Path('artifacts/old-phone')
+          ART.mkdir(parents=True,exist_ok=True)
+
+          def adb(*args):
+              return subprocess.run(['adb',*args],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+
+          def bounds(v):
+              m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',v or '')
+              if not m:return None
+              x1,y1,x2,y2=map(int,m.groups()); return ((x1+x2)//2,(y1+y2)//2)
+
+          def dump(tag):
+              remote='/sdcard/kwai-old.xml'
+              adb('shell','uiautomator','dump',remote)
+              xp=ART/f'{tag}.xml'; adb('pull',remote,str(xp))
+              with open(ART/f'{tag}.png','wb') as f:
+                  subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
+              try: root=ET.parse(xp).getroot()
+              except Exception: root=None
+              texts=[]
+              if root is not None:
+                  for n in root.iter('node'):
+                      for k in ('text','content-desc','hint'):
+                          v=(n.attrib.get(k) or '').strip()
+                          if v and v not in texts:texts.append(v)
+              (ART/f'{tag}.txt').write_text('\n'.join(texts),encoding='utf-8')
+              print(tag, texts[:80])
+              return root,texts
+
+          def tap(root,pattern):
+              if root is None:return False
+              rx=re.compile(pattern,re.I)
+              for n in root.iter('node'):
+                  label=' '.join(filter(None,[n.attrib.get('text',''),n.attrib.get('content-desc',''),n.attrib.get('hint','')])).strip()
+                  if rx.search(label):
+                      p=bounds(n.attrib.get('bounds',''))
+                      if p:
+                          adb('shell','input','tap',str(p[0]),str(p[1])); return True
+              return False
+
+          def joined(texts): return '\n'.join(texts)
+          def phone_present(texts):
+              return bool(re.search(r'phone number|mobile number|telefone|n[uú]mero de telefone|celular|c[oó]digo de verifica|verification code|sms',joined(texts),re.I))
+
+          def dismiss_system(root,texts):
+              j=joined(texts)
+              patterns=[r'^While using the app$',r'^Only this time$',r'^Allow$',r'^Continue$',r'^OK$',r'^Got it$']
+              if re.search(r'permission|allow .* to|while using|notifications|location|camera|microphone|photos|media',j,re.I):
+                  for p in patterns:
+                      if tap(root,p): time.sleep(2); return True
+              if re.search(r"isn.?t responding",j,re.I) and tap(root,r'^Close app$'):
+                  time.sleep(2); return True
+              return False
+
+          adb('shell','am','force-stop','com.kwai.video')
+          adb('shell','monkey','-p','com.kwai.video','-c','android.intent.category.LAUNCHER','1')
+          time.sleep(15)
+          root,texts=dump('01-launch')
+          for i in range(6):
+              if not dismiss_system(root,texts):break
+              root,texts=dump(f'02-system-{i+1}')
+
+          stages=[('launch',root,texts)]
+          if phone_present(texts):
+              status='phone_route_visible_at_launch'
+          else:
+              # Try visible login/auth entry first.
+              clicked=False
+              for pat in (r'^Log in$',r'^Login$',r'^Sign in$',r'^Entrar$',r'^Fazer login$',r'phone',r'telefone'):
+                  if tap(root,pat): clicked=True; break
+              if clicked:
+                  time.sleep(6); root,texts=dump('03-login-entry'); stages.append(('login-entry',root,texts))
+
+              if not phone_present(texts):
+                  # Old Kwai versions commonly expose account entry via the rightmost Profile/Me tab.
+                  clicked=False
+                  for pat in (r'^Profile$',r'^Me$',r'^Eu$',r'^Perfil$',r'^Account$',r'^Conta$'):
+                      if tap(root,pat): clicked=True; break
+                  if not clicked:
+                      size=adb('shell','wm','size').stdout
+                      m=re.search(r'(\d+)x(\d+)',size); w,h=(1080,2400) if not m else tuple(map(int,m.groups()))
+                      adb('shell','input','tap',str(int(w*.91)),str(int(h*.95)))
+                  time.sleep(7); root,texts=dump('04-profile'); stages.append(('profile',root,texts))
+
+              if not phone_present(texts):
+                  for pat in (r'^Log in$',r'^Login$',r'^Sign in$',r'^Entrar$',r'^Fazer login$',r'Sign up.*log in',r'Cadastre.*entre'):
+                      if tap(root,pat):
+                          time.sleep(6); root,texts=dump('05-profile-login'); stages.append(('profile-login',root,texts)); break
+
+              status='phone_route_detected' if phone_present(texts) else 'phone_route_not_detected'
+
+          result={
+              'status':status,
+              'phone_text_detected':phone_present(texts),
+              'final_text_count':len(texts),
+              'kwai_pid':adb('shell','pidof','com.kwai.video').stdout.strip(),
+          }
+          pathlib.Path('artifacts/old-phone-result.txt').write_text('\n'.join(f'{k}={v}' for k,v in result.items())+'\n',encoding='utf-8')
+          print(result)
+          PY
+
+          cat > /tmp/install-and-probe-old.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+
+          BUILD_TOOLS="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          AAPT="$BUILD_TOOLS/aapt"
+          "$APKSIGNER" verify --print-certs /tmp/kwai-old.apk > artifacts/old-cert.txt 2>&1
+          cat artifacts/old-cert.txt
+          SHA1="$(sed -n -E 's/^(V[0-9.]+ Signer|Signer #[0-9]+): certificate SHA-1 digest: //p' artifacts/old-cert.txt | head -n1 | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
+          SHA256="$(sed -n -E 's/^(V[0-9.]+ Signer|Signer #[0-9]+): certificate SHA-256 digest: //p' artifacts/old-cert.txt | head -n1 | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
+          echo "sha1=$SHA1" | tee artifacts/old-cert-check.txt
+          echo "sha256=$SHA256" | tee -a artifacts/old-cert-check.txt
+          test "$SHA1" = '5283fea03bd6e2ff0458a7b4879c97283b784deb'
+          test "$SHA256" = 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+          echo 'OFFICIAL_CERTIFICATE_MATCH=true' | tee -a artifacts/old-cert-check.txt
+
+          "$AAPT" dump badging /tmp/kwai-old.apk | tee artifacts/old-badging.txt
+          unzip -l /tmp/kwai-old.apk | grep -E ' lib/[^/]+/.*\.so$' | awk '{print $4}' | cut -d/ -f2 | sort -u | tee artifacts/old-native-abis.txt || true
+
+          adb install -r /tmp/kwai-old.apk 2>&1 | tee artifacts/old-install.txt
+          adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=|primaryCpuAbi=' | head -n20 | tee artifacts/old-installed-version.txt || true
+          python3 /tmp/old-phone-proof.py 2>&1 | tee artifacts/old-phone-console.txt
+          SH
+          chmod +x /tmp/install-and-probe-old.sh
+
+      - name: Boot Android and prove old official phone route
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 4096M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/install-and-probe-old.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Verified monolithic Kwai phone-login proof'
+            cat artifacts/download-verification.txt 2>/dev/null || true
+            cat artifacts/old-cert-check.txt 2>/dev/null || true
+            cat artifacts/old-installed-version.txt 2>/dev/null || true
+            cat artifacts/old-phone-result.txt 2>/dev/null || echo 'Phone route result not produced.'
+            echo
+            echo 'No phone number, SMS code, password, upload, or publication was attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-monolithic-phone-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
