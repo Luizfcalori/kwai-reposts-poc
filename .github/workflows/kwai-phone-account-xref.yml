@@ -1,0 +1,94 @@
+name: Kwai PhoneAccount caller xref
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-phone-account-xref.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  phone-account-xref:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download current Kwai base
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai /tmp/jadx
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}
+          url=f.get('path') or f.get('path_alt') or ''
+          if not url: raise SystemExit('missing base url')
+          pathlib.Path('/tmp/base-url').write_text(url)
+          pathlib.Path('artifacts/version.txt').write_text(f"version={f.get('vername')}\nversionCode={f.get('vercode')}\n")
+          PY
+          curl -fL "$(cat /tmp/base-url)" -o /tmp/kwai/base.apk
+
+      - name: Install JADX and decompile
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="$(curl -LsS https://api.github.com/repos/skylot/jadx/releases/latest | jq -r '.assets[] | select(.name|test("jadx-[0-9].*\\.zip$")) | .browser_download_url' | head -1)"
+          curl -fL "$URL" -o /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx-bin
+          set +e
+          timeout 600 /tmp/jadx-bin/bin/jadx --show-bad-code -d /tmp/jadx /tmp/kwai/base.apk > artifacts/jadx-console.txt 2>&1
+          echo "jadx_rc=$?" > artifacts/result.txt
+          set -e
+
+      - name: Map PhoneAccountActivityV2 callers and extras
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=/tmp/jadx/sources
+          RES=/tmp/jadx/resources
+          test -d "$SRC"
+          PATTERN='PhoneAccountActivityV2|PhoneVerifyActivity|ForcePhoneRegisterActivity|CommonLoginActivity|com.yxcorp.gifshow.login.LoginActivity|PHONE_NUMBER_LOGIN_PAGE|PHONE_LOGIN_NEW|CLICK_PHONE_LOGIN|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|phone.?number|phone.?login|login.?phone|mobile.?login|login.?mobile'
+          grep -RInEi "$PATTERN" "$SRC" "$RES" > artifacts/phone-account-all-hits.txt || true
+          python3 - <<'PY'
+          import pathlib,re
+          roots=[pathlib.Path('/tmp/jadx/sources'), pathlib.Path('/tmp/jadx/resources')]
+          rx=re.compile(r'PhoneAccountActivityV2|PhoneVerifyActivity|ForcePhoneRegisterActivity|CommonLoginActivity|com\.yxcorp\.gifshow\.login\.LoginActivity|PHONE_NUMBER_LOGIN_PAGE|PHONE_LOGIN_NEW|CLICK_PHONE_LOGIN|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|phone.?number|phone.?login|login.?phone|mobile.?login|login.?mobile',re.I)
+          out=[]; files=[]
+          for root in roots:
+            if not root.exists(): continue
+            for p in root.rglob('*'):
+              if not p.is_file(): continue
+              try: text=p.read_text(errors='ignore')
+              except Exception: continue
+              if not rx.search(text): continue
+              files.append(str(p.relative_to(root)))
+              lines=text.splitlines()
+              for i,line in enumerate(lines):
+                if rx.search(line):
+                  a=max(0,i-80); b=min(len(lines),i+81)
+                  out.append(f'===== {root.name}/{p.relative_to(root)}:{i+1} =====')
+                  out.extend(f'{n+1:06d}: {lines[n]}' for n in range(a,b))
+          pathlib.Path('artifacts/phone-account-context.txt').write_text('\n'.join(out),encoding='utf-8')
+          pathlib.Path('artifacts/phone-account-hit-files.txt').write_text('\n'.join(sorted(set(files))),encoding='utf-8')
+          PY
+          grep -RInE 'new Intent\(|putExtra\(|get.*Extra\(|startActivity\(|PhoneAccountActivityV2|PhoneVerifyActivity|CommonLoginActivity' "$SRC" | grep -Ei 'PhoneAccount|PhoneVerify|CommonLogin|phone|mobile|login|auth|source|type|mode|scene|channel' > artifacts/phone-account-intent-hits.txt || true
+          echo '--- candidate files ---'
+          cat artifacts/phone-account-hit-files.txt || true
+          echo '--- Intent/extra candidates ---'
+          head -n 900 artifacts/phone-account-intent-hits.txt || true
+          echo '--- direct refs ---'
+          grep -Ei 'PhoneAccountActivityV2|PhoneVerifyActivity|CommonLoginActivity|PhoneLogin|phone.?number' artifacts/phone-account-all-hits.txt | head -n 1200 || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-phone-account-xref-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
