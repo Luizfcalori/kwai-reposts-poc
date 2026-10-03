@@ -1,0 +1,106 @@
+name: Kwai classes7 phone JADX fast
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-classes7-phone-jadx.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  classes7-phone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download exact bundle and classes7
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts apks /tmp/kwai /tmp/out
+          docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
+            -a 'com.kwai.kuaishou.video.live@13.8.30.646601' -d apk-pure \
+            -o 'acknowledge_dangers=true,arch=arm64-v8a' /output \
+            2>&1 | tee artifacts/download.txt
+          BUNDLE="$(find apks -maxdepth 1 -type f | head -n1)"
+          unzip -q "$BUNDLE" -d /tmp/kwai
+          unzip -p /tmp/kwai/com.kwai.kuaishou.video.live.apk classes7.dex > /tmp/classes7.dex
+          stat -c 'classes7_size=%s' /tmp/classes7.dex > artifacts/classes7.txt
+
+      - name: Decompile only classes7
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL 'https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip' -o /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+          set +e
+          timeout 360 /tmp/jadx/bin/jadx --no-res --show-bad-code -j 2 -d /tmp/out /tmp/classes7.dex > artifacts/jadx-console.txt 2>&1
+          rc=$?
+          set -e
+          echo "jadx_rc=$rc" > artifacts/result.txt
+          test -d /tmp/out/sources
+
+      - name: Extract exact login classes and callers
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=/tmp/out/sources
+          mkdir -p artifacts/sources
+          find "$SRC" -type f \( \
+            -name 'PhoneAccountActivityV2.java' -o \
+            -name 'PhoneVerifyActivity.java' -o \
+            -name 'LoginActivity.java' -o \
+            -name 'LoginPluginImpl.java' -o \
+            -name 'CommonLoginActivity.java' -o \
+            -name 'PhoneLoginViewModel.java' -o \
+            -name 'AccountPhoneLoginVerifyFragment.java' -o \
+            -name 'ForcePhoneRegisterActivity.java' \
+          \) -print | tee artifacts/found-classes.txt
+
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            rel="${f#$SRC/}"
+            cp "$f" "artifacts/sources/${rel//\//__}"
+          done < artifacts/found-classes.txt
+
+          PAT='PhoneAccountActivityV2|PhoneVerifyActivity|CommonLoginActivity|LoginPluginImpl|PhoneLoginViewModel|AccountPhoneLoginVerifyFragment|phoneLoginWithVerifyCode|phoneLogin|oldPhoneLogin|setTargetLoginActivity|getLoginActivityClass|getCommonLoginActivityClass|getBindPhoneActivity|startLoginActivity|startFissionLoginActivity|login_phone_new|login_phone|new Intent|putExtra|startActivity'
+          grep -RInEi "$PAT" "$SRC" > artifacts/hits.txt || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          src=Path('/tmp/out/sources')
+          rx=re.compile(r'PhoneAccountActivityV2|PhoneVerifyActivity|CommonLoginActivity|LoginPluginImpl|PhoneLoginViewModel|AccountPhoneLoginVerifyFragment|phoneLoginWithVerifyCode|phoneLogin|oldPhoneLogin|setTargetLoginActivity|getLoginActivityClass|getCommonLoginActivityClass|getBindPhoneActivity|startLoginActivity|startFissionLoginActivity|login_phone_new|login_phone|new Intent|putExtra|startActivity',re.I)
+          out=[]
+          for p in src.rglob('*.java'):
+              try: lines=p.read_text(errors='ignore').splitlines()
+              except: continue
+              idx=[i for i,l in enumerate(lines) if rx.search(l)]
+              if not idx: continue
+              out.append(f'===== {p.relative_to(src)} =====')
+              ranges=[]
+              for i in idx:
+                  a=max(0,i-35); b=min(len(lines),i+60)
+                  if ranges and a<=ranges[-1][1]+3: ranges[-1]=(ranges[-1][0],max(ranges[-1][1],b))
+                  else:ranges.append((a,b))
+              for a,b in ranges:
+                  out.extend(f'{j+1}: {lines[j]}' for j in range(a,b)); out.append('---')
+          Path('artifacts/context.txt').write_text('\n'.join(out),encoding='utf-8')
+          PY
+
+          echo '--- found exact classes ---'
+          cat artifacts/found-classes.txt || true
+          echo '--- top hits ---'
+          head -n 1800 artifacts/hits.txt || true
+          echo '--- focused context ---'
+          head -n 2600 artifacts/context.txt || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-classes7-phone-jadx-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
