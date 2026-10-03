@@ -1,0 +1,85 @@
+name: Kwai Aptoide basis discovery
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-aptoide-basis-discovery.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Inspect Aptoide dynamic split metadata and CDN candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          BASE_MD5='c9dfcd8ce1e6498ace9c59db173a0805'
+          API="https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${BASE_MD5}/language=pt_PT"
+          curl -fLsS --retry 4 --retry-delay 2 "$API" -o artifacts/dynamic.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.load(open('artifacts/dynamic.json',encoding='utf-8'))
+          rows=[]
+          def walk(x,path='root'):
+              if isinstance(x,dict):
+                  low=' '.join(str(v) for v in x.values() if isinstance(v,(str,int,float,bool))).lower()
+                  if any(k in low for k in ('basis','foundation','login_sdk','dfm_ug')):
+                      rows.append((path,x))
+                  for k,v in x.items(): walk(v,f'{path}.{k}')
+              elif isinstance(x,list):
+                  for i,v in enumerate(x): walk(v,f'{path}[{i}]')
+          walk(d)
+          out=[]
+          for p,x in rows:
+              out.append(p+'\n'+json.dumps(x,ensure_ascii=False,indent=2,sort_keys=True))
+          Path('artifacts/basis-hits.txt').write_text('\n\n'.join(out)+'\n',encoding='utf-8')
+          # Compact top-level list inventory.
+          lst=d.get('list') if isinstance(d,dict) else None
+          inv=[]
+          if isinstance(lst,list):
+              for i,x in enumerate(lst):
+                  if isinstance(x,dict):
+                      inv.append(f"{i}\ttype={x.get('type')}\tname={x.get('name')}\tmd5={x.get('md5sum')}\tpath={x.get('path')}")
+          Path('artifacts/list-inventory.txt').write_text('\n'.join(inv)+'\n',encoding='utf-8')
+          print('\n'.join(inv))
+          print('basis_hits=',len(rows))
+          PY
+
+          PREFIX='https://pool.apk.aptoide.com/appupdater/com-kwai-video-646601-76779210'
+          : > artifacts/cdn-probe.txt
+          probe() {
+            local md5="$1" slug="$2"
+            local url="${PREFIX}-${md5}-${slug}.apk"
+            local result
+            result="$(curl -LsS --max-time 20 --retry 1 -r 0-0 -o /tmp/probe.bin -w '%{http_code}\t%{size_download}' "$url" || true)"
+            printf '%s\t%s\t%s\n' "$result" "$slug" "$url" | tee -a artifacts/cdn-probe.txt
+          }
+
+          # Exact hashes published for the official 13.8.30.646601 APKM.
+          for slug in basis split-basis split_basis; do probe 28ec171983ea9076ac2bddfa13a776f1 "$slug"; done
+          for slug in basis-config-arm64-v8a basis-config-arm64_v8a basis.config.arm64-v8a basis.config.arm64_v8a split-basis-config-arm64-v8a; do probe e6c794dce805716bf2e5839dfea0b3ae "$slug"; done
+          for slug in basis-extension basis_extension split-basis-extension split_basis_extension; do probe 89384541fdf5808f41f1d2355b7680dc "$slug"; done
+          for slug in basis-extension-config-arm64-v8a basis-extension-config-arm64_v8a basis_extension-config-arm64-v8a basis_extension.config.arm64_v8a split-basis-extension-config-arm64-v8a; do probe ab15fa8bb28b37e9ec589834c2c86673 "$slug"; done
+          for slug in basis-config-xxhdpi basis.config.xxhdpi split-basis-config-xxhdpi; do probe 1e94daa27a62ebfbdc06d7cb310f61ec "$slug"; done
+
+          echo '--- basis/foundation hits ---'
+          cat artifacts/basis-hits.txt || true
+          echo '--- CDN probes ---'
+          cat artifacts/cdn-probe.txt
+
+      - name: Upload discovery evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-aptoide-basis-discovery-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
