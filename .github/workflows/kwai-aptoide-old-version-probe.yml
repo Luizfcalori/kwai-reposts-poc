@@ -1,0 +1,90 @@
+name: Kwai Aptoide old version probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-aptoide-old-version-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve Kwai 5.7.10.511304 through Aptoide API
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          BASE='https://ws75.aptoide.com/api/7'
+          PKG='com.kwai.video'
+          TARGET='511304'
+
+          urls=(
+            "$BASE/app/get/package_name=$PKG/vercode=$TARGET/nodes=meta/aab=1/language=pt_PT/country=br"
+            "$BASE/app/get/package_name=$PKG/version_code=$TARGET/nodes=meta/aab=1/language=pt_PT/country=br"
+            "$BASE/app/get/package_name=$PKG/apk_version_code=$TARGET/nodes=meta/aab=1/language=pt_PT/country=br"
+            "$BASE/app/get/package_name=$PKG/nodes=versions/limit=100/language=pt_PT/country=br"
+            "$BASE/app/get/package_name=$PKG/nodes=versions/limit=500/language=pt_PT/country=br"
+          )
+
+          : > artifacts/candidates.txt
+          for i in "${!urls[@]}"; do
+            url="${urls[$i]}"
+            out="$RUNNER_TEMP/q${i}.json"
+            code="$(curl -LsS --retry 2 --retry-delay 1 -o "$out" -w '%{http_code}' "$url" || true)"
+            echo "query=$i http=$code bytes=$(wc -c < "$out" 2>/dev/null || echo 0)" | tee -a artifacts/candidates.txt
+            python3 - "$out" "$i" "$TARGET" >> artifacts/candidates.txt <<'PY'
+          import json,sys
+          p,idx,target=sys.argv[1:]
+          try: d=json.load(open(p,encoding='utf-8'))
+          except Exception as e:
+              print(f'query={idx} parse_error={e}'); raise SystemExit
+          print(f'query={idx} info={d.get("info",{}).get("status")}')
+          nodes=d.get('nodes') or {}
+          meta=((nodes.get('meta') or {}).get('data') or {})
+          f=meta.get('file') or {}
+          if meta:
+              print(f'query={idx} meta_ver={f.get("vername")} meta_code={f.get("vercode")} size={f.get("filesize") or f.get("size") or meta.get("size")} md5={f.get("md5sum")} path={f.get("path") or f.get("path_alt")}')
+          def walk(o,path='root'):
+              if isinstance(o,dict):
+                  # Capture any object that looks like an APK/version record.
+                  ver=o.get('vercode') or o.get('version_code') or o.get('apk_version_code')
+                  if str(ver)==target:
+                      print('TARGET_OBJECT_PATH='+path)
+                      print('TARGET_OBJECT='+json.dumps(o,ensure_ascii=False,separators=(',',':')))
+                  for k,v in o.items(): walk(v,path+'.'+str(k))
+              elif isinstance(o,list):
+                  for n,v in enumerate(o): walk(v,path+f'[{n}]')
+          walk(d)
+          PY
+            cp "$out" "artifacts/q${i}.json"
+          done
+
+          if grep -q 'TARGET_OBJECT=' artifacts/candidates.txt; then
+            echo 'TARGET_VERSION_FOUND=true' | tee artifacts/result.txt
+          else
+            echo 'TARGET_VERSION_FOUND=false' | tee artifacts/result.txt
+          fi
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Aptoide old-version probe'
+            cat artifacts/result.txt 2>/dev/null || true
+            grep -E '^(query=|TARGET_OBJECT_PATH=)' artifacts/candidates.txt 2>/dev/null | head -n 120 || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-aptoide-old-version-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
