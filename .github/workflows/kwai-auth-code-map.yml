@@ -1,0 +1,111 @@
+name: Kwai auth code map
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-auth-code-map.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  code-map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download current Kwai and JADX
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai /tmp/jadx
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          f=(((d.get('nodes') or {}).get('meta') or {}).get('data') or {}).get('file') or {}
+          pathlib.Path('/tmp/base-url').write_text(f.get('path') or f.get('path_alt') or '')
+          pathlib.Path('artifacts/version.txt').write_text(f"version={f.get('vername')}\nversionCode={f.get('vercode')}\n")
+          PY
+          curl -fL "$(cat /tmp/base-url)" -o /tmp/kwai/base.apk
+
+          curl -LsS https://api.github.com/repos/skylot/jadx/releases/latest -o /tmp/jadx-release.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/jadx-release.json',encoding='utf-8'))
+          assets=d.get('assets') or []
+          a=next((x for x in assets if (x.get('name') or '').endswith('.zip') and 'jadx' in (x.get('name') or '').lower() and 'gui' not in (x.get('name') or '').lower()),None)
+          if not a:
+              a=next((x for x in assets if (x.get('name') or '').endswith('.zip')),None)
+          if not a: raise SystemExit('jadx zip asset not found')
+          pathlib.Path('/tmp/jadx-url').write_text(a['browser_download_url'])
+          pathlib.Path('artifacts/jadx-version.txt').write_text(str(d.get('tag_name'))+'\n'+a['name']+'\n')
+          PY
+          curl -fL "$(cat /tmp/jadx-url)" -o /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+
+      - name: Decompile and trace auth/Tiny paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/src artifacts/hits
+          JADX="$(find /tmp/jadx -type f -path '*/bin/jadx' | head -n1)"
+          test -n "$JADX"
+          chmod +x "$JADX"
+          "$JADX" --no-res --threads-count 2 -d /tmp/src /tmp/kwai/base.apk > artifacts/jadx-console.txt 2>&1 || true
+
+          for TERM in \
+            'PHONE_NUMBER_LOGIN_PAGE' \
+            'CLICK_PHONE_LOGIN' \
+            'PHONE_LOGIN_NEW' \
+            'INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS' \
+            'tiny_google_login_platform_item' \
+            'TinyLoginActivity' \
+            'TinyNativeHomeActivity' \
+            'Resource downloading' \
+            "You'll have access to all the features"; do
+            SAFE="$(printf '%s' "$TERM" | tr -cs 'A-Za-z0-9' '_' | sed 's/_$//')"
+            grep -RFn -m 100 --include='*.java' "$TERM" /tmp/src/sources > "artifacts/hits/${SAFE}.txt" || true
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          root=Path('/tmp/src/sources')
+          out=[]
+          terms=['PHONE_NUMBER_LOGIN_PAGE','CLICK_PHONE_LOGIN','PHONE_LOGIN_NEW','INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS','TinyLoginActivity','TinyNativeHomeActivity']
+          files=set()
+          for term in terms:
+              for p in root.rglob('*.java'):
+                  try: txt=p.read_text(errors='ignore')
+                  except: continue
+                  if term in txt: files.add(p)
+          for p in sorted(files):
+              txt=p.read_text(errors='ignore').splitlines()
+              out.append(f'===== {p.relative_to(root)} =====')
+              hit_lines=[]
+              for i,line in enumerate(txt):
+                  if any(t in line for t in terms): hit_lines.append(i)
+              spans=[]
+              for i in hit_lines:
+                  a=max(0,i-30); b=min(len(txt),i+31)
+                  if spans and a <= spans[-1][1]: spans[-1]=(spans[-1][0],max(spans[-1][1],b))
+                  else: spans.append((a,b))
+              for a,b in spans:
+                  for j in range(a,b): out.append(f'{j+1:05d}: {txt[j]}')
+                  out.append('---')
+          Path('artifacts/auth-context.txt').write_text('\n'.join(out),encoding='utf-8')
+          PY
+
+          echo '=== PHONE LOGIN CONTEXT ==='
+          grep -E '=====|PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|PHONE_LOGIN_NEW|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|Intent|Router|route|navigate|startActivity|Activity' artifacts/auth-context.txt | head -n 1000 || true
+
+      - name: Upload code map
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-auth-code-map-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
