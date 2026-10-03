@@ -1,0 +1,181 @@
+name: Kwai full community phone login proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-full-community-phone-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  full-community:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download full official Kwai community XAPK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts apks /tmp/kwai-full
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
+            -a com.kwai.kuaishou.video.live -d apk-pure \
+            -o 'acknowledge_dangers=true,arch=arm64-v8a' /output \
+            2>&1 | tee artifacts/download.txt
+
+          find apks -maxdepth 1 -type f -printf '%f\t%s bytes\n' | tee artifacts/downloaded-files.txt
+          BUNDLE="$(find apks -maxdepth 1 -type f | head -n1)"
+          test -n "$BUNDLE"
+          case "$BUNDLE" in
+            *.xapk|*.zip|*.apkm) unzip -q "$BUNDLE" -d /tmp/kwai-full ;;
+            *.apk) cp "$BUNDLE" /tmp/kwai-full/base.apk ;;
+            *) echo "unsupported package $BUNDLE"; exit 2 ;;
+          esac
+          find /tmp/kwai-full -type f -name '*.apk' -printf '%f\t%s bytes\n' | sort | tee artifacts/apk-files.txt
+
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          : > artifacts/certificates.txt
+          : > artifacts/packages.txt
+          while IFS= read -r apk; do
+            "$BT/apksigner" verify --print-certs "$apk" > /tmp/cert.txt 2>&1
+            CERT="$(awk -F': ' '/certificate SHA-256 digest:/{print tolower($NF); exit}' /tmp/cert.txt | tr -d '[:space:]')"
+            echo "$(basename "$apk") $CERT" | tee -a artifacts/certificates.txt
+            test "$CERT" = '588774ea798843484c7100da2450005090522fda0dcb64be01c04079349c0acc'
+            "$BT/aapt" dump badging "$apk" | head -1 | tee -a artifacts/packages.txt || true
+          done < <(find /tmp/kwai-full -type f -name '*.apk' | sort)
+
+          cat > /tmp/probe-full.py <<'PY'
+          import pathlib,re,subprocess,time,xml.etree.ElementTree as ET
+          PKG='com.kwai.kuaishou.video.live'
+          A=pathlib.Path('artifacts/ui'); A.mkdir(parents=True,exist_ok=True)
+          def adb(*x): return subprocess.run(['adb',*x],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+          def point(v):
+              m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',v or '')
+              if not m:return None
+              a,b,c,d=map(int,m.groups()); return ((a+c)//2,(b+d)//2)
+          def dump(tag):
+              adb('shell','uiautomator','dump','/sdcard/u.xml')
+              adb('pull','/sdcard/u.xml',str(A/f'{tag}.xml'))
+              with open(A/f'{tag}.png','wb') as f: subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
+              root=None; texts=[]
+              try:
+                  root=ET.parse(A/f'{tag}.xml').getroot()
+                  for n in root.iter('node'):
+                      for k in ('text','content-desc','hint'):
+                          v=(n.attrib.get(k) or '').strip()
+                          if v and v not in texts:texts.append(v)
+              except Exception: pass
+              (A/f'{tag}.txt').write_text('\n'.join(texts),encoding='utf-8')
+              return root,texts
+          def tap(root,pats):
+              if root is None:return False
+              rr=[re.compile(p,re.I) for p in pats]
+              for n in root.iter('node'):
+                  s=' '.join(filter(None,[n.attrib.get('text',''),n.attrib.get('content-desc',''),n.attrib.get('hint','')])).strip()
+                  if s and any(r.search(s) for r in rr):
+                      p=point(n.attrib.get('bounds',''))
+                      if p:
+                          adb('shell','input','tap',str(p[0]),str(p[1])); time.sleep(3); return True
+              return False
+          def has(t,pats):
+              s='\n'.join(t); return any(re.search(p,s,re.I) for p in pats)
+          phone=[r'phone number',r'mobile number',r'n[uú]mero de telefone',r'n[uú]mero do celular',r'country code',r'get code',r'send code',r'verification code',r'c[oó]digo de verifica',r'sms']
+          login=[r'log in',r'login',r'sign in',r'entrar',r'cadastre',r'sign up']
+          # Allow first-run screens to settle and dismiss safe OS/app prompts only.
+          time.sleep(12)
+          root,texts=dump('00-launch')
+          for i in range(1,16):
+              if has(texts,phone): break
+              # notification / consent / onboarding controls
+              if tap(root,[r'^Allow$',r'^Permitir$',r'^Not now$',r'Agora n[aã]o',r'^Skip$',r'^Pular$',r'^Agree$',r'^Aceitar$',r'^Continue$',r'^Continuar$',r'^Start now$',r'^Começar agora$']):
+                  root,texts=dump(f'01-step-{i:02d}'); continue
+              # preference onboarding: tap Like then swipe if counter appears
+              if re.search(r'\b\d+/\d+\b','\n'.join(texts)) or has(texts,[r'choose like or dislike',r'swipe up']):
+                  tap(root,[r'^Like$',r'Gostei',r'like'])
+                  adb('shell','input','swipe','540','1950','540','400','1000'); time.sleep(3)
+                  root,texts=dump(f'02-onboarding-{i:02d}'); continue
+              # Try profile/me from normal app surface.
+              if tap(root,[r'^Profile$',r'^Perfil$',r'^Me$',r'^Eu$',r'^Account$',r'^Conta$']):
+                  root,texts=dump(f'03-profile-{i:02d}'); continue
+              # Common bottom-right profile coordinate.
+              adb('shell','input','tap','1000','2290'); time.sleep(3)
+              root,texts=dump(f'04-bottom-profile-{i:02d}')
+              if has(texts,phone): break
+              if tap(root,[r'^Log in$',r'^Login$',r'^Sign in$',r'^Entrar$',r'^Fazer login$',r'Sign up or log in',r'Cadastre-se ou entre']):
+                  root,texts=dump(f'05-login-{i:02d}')
+              if has(texts,phone): break
+              if tap(root,[r'phone',r'telefone',r'celular',r'mobile']):
+                  root,texts=dump(f'06-phone-{i:02d}')
+              if has(texts,phone): break
+          state='phone_login' if has(texts,phone) else ('login_screen' if has(texts,login+[r'google',r'facebook']) else 'app_open')
+          pathlib.Path('artifacts/result.txt').write_text('state='+state+'\nphone_route_detected='+str(state=='phone_login').lower()+'\nfinal_texts='+' | '.join(texts[:30])+'\n')
+          print('FINAL',state)
+          PY
+
+          cat > /tmp/run-full-community.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != 1 ]; do sleep 2; done
+          {
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo '--- route ---'; adb shell ip route || true
+            echo '--- ping ---'; adb shell ping -c 1 -W 3 www.google.com || true
+          } | tee artifacts/network.txt
+
+          mapfile -d '' ALL < <(find /tmp/kwai-full -type f -name '*.apk' -print0)
+          test "${#ALL[@]}" -gt 0
+          printf '%s\n' "${ALL[@]}" | sed 's#^/tmp/kwai-full/##' | tee artifacts/install-apks.txt
+          adb install-multiple -r "${ALL[@]}" 2>&1 | tee artifacts/install.txt
+          adb shell pm grant com.kwai.kuaishou.video.live android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+          adb shell appops set com.kwai.kuaishou.video.live POST_NOTIFICATION allow 2>/dev/null || true
+          adb shell dumpsys package com.kwai.kuaishou.video.live | grep -E 'versionName=|versionCode=|primaryCpuAbi=|splitNames=' | head -n40 | tee artifacts/installed-package.txt || true
+          adb shell monkey -p com.kwai.kuaishou.video.live -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
+          python3 /tmp/probe-full.py 2>&1 | tee artifacts/probe-console.txt
+          adb shell pidof com.kwai.kuaishou.video.live | tee artifacts/pid.txt || true
+          adb logcat -d -t 2500 > artifacts/logcat.txt || true
+          SH
+          chmod +x /tmp/run-full-community.sh
+
+      - name: Boot Android 14 and inspect phone login
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/run-full-community.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Full official Kwai community package phone route'
+            cat artifacts/downloaded-files.txt 2>/dev/null || true
+            echo
+            cat artifacts/installed-package.txt 2>/dev/null || true
+            echo
+            cat artifacts/result.txt 2>/dev/null || true
+            echo
+            echo 'No phone number, OTP, password, account login, upload, or publication attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-full-community-phone-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
