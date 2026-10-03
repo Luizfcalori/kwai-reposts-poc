@@ -1,0 +1,101 @@
+name: Kwai APKMirror session probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-apkmirror-session-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Resolve fresh APKMirror bundle URL with session
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36'
+          BASE='https://www.apkmirror.com'
+          PAGE='https://www.apkmirror.com/apk/joyo-technology-pte-ltd-2/kwai-short-video-maker-community/kwai-video-drama-13-8-30-646601-release/kwai-video-drama-13-8-30-646601-android-apk-download/'
+          JAR="$RUNNER_TEMP/apkmirror.cookies"
+
+          curl -fsSL --retry 3 --retry-delay 2 -A "$UA" -c "$JAR" -b "$JAR" "$PAGE" -o "$RUNNER_TEMP/page.html"
+          python3 - "$RUNNER_TEMP/page.html" > "$RUNNER_TEMP/intermediate.txt" <<'PY'
+          import html,re,sys
+          s=open(sys.argv[1],encoding='utf-8',errors='ignore').read()
+          s=html.unescape(s)
+          candidates=re.findall(r'href=["\']([^"\']*?/download/\?key=[^"\']+)["\']',s,re.I)
+          if not candidates:
+              candidates=re.findall(r'href=["\']([^"\']*?download[^"\']*?key=[^"\']+)["\']',s,re.I)
+          if not candidates:
+              raise SystemExit('fresh intermediate APKMirror link not found')
+          print(candidates[0])
+          PY
+          INTERMEDIATE="$(cat "$RUNNER_TEMP/intermediate.txt")"
+          case "$INTERMEDIATE" in
+            http*) ;;
+            /*) INTERMEDIATE="$BASE$INTERMEDIATE" ;;
+            *) INTERMEDIATE="${PAGE}${INTERMEDIATE}" ;;
+          esac
+          echo "intermediate_resolved=true" | tee artifacts/resolution.txt
+
+          curl -fsSL --retry 3 --retry-delay 2 -A "$UA" -e "$PAGE" -c "$JAR" -b "$JAR" "$INTERMEDIATE" -o "$RUNNER_TEMP/intermediate.html"
+          # APKMirror intentionally delays free downloads on this page.
+          sleep 17
+          python3 - "$RUNNER_TEMP/intermediate.html" > "$RUNNER_TEMP/final.txt" <<'PY'
+          import html,re,sys
+          s=html.unescape(open(sys.argv[1],encoding='utf-8',errors='ignore').read())
+          patterns=[
+              r'href=["\']([^"\']*?/wp-content/themes/APKMirror/download\.php\?[^"\']+)["\']',
+              r'href=["\'](https?://downloadr[^"\']+)["\']',
+          ]
+          for p in patterns:
+              m=re.search(p,s,re.I)
+              if m:
+                  print(m.group(1)); break
+          else:
+              raise SystemExit('fresh final APKMirror link not found')
+          PY
+          FINAL="$(cat "$RUNNER_TEMP/final.txt")"
+          case "$FINAL" in
+            http*) ;;
+            /*) FINAL="$BASE$FINAL" ;;
+          esac
+          echo "final_resolved=true" | tee -a artifacts/resolution.txt
+
+          curl -fL --retry 3 --retry-delay 2 -A "$UA" -e "$INTERMEDIATE" -c "$JAR" -b "$JAR" "$FINAL" -o "$RUNNER_TEMP/kwai.apkm"
+          file "$RUNNER_TEMP/kwai.apkm" | tee artifacts/file-type.txt
+          stat -c '%s bytes' "$RUNNER_TEMP/kwai.apkm" | tee artifacts/size.txt
+          sha256sum "$RUNNER_TEMP/kwai.apkm" | tee artifacts/sha256.txt
+          ACTUAL="$(sha256sum "$RUNNER_TEMP/kwai.apkm" | awk '{print $1}')"
+          EXPECTED='536ae315a4d5d5742ba5d2073c4058a57e6f3abc89150fd4b3af23ab4159492a'
+          test "$ACTUAL" = "$EXPECTED"
+          unzip -l "$RUNNER_TEMP/kwai.apkm" | tee artifacts/bundle-list.txt
+          unzip -l "$RUNNER_TEMP/kwai.apkm" | grep -Eq 'basis(_extension)?|basis\.config'
+          echo 'PASS: full verified Kwai APKMirror bundle downloaded in a fresh session.' | tee artifacts/result.txt
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## APKMirror fresh-session probe'
+            cat artifacts/resolution.txt 2>/dev/null || true
+            cat artifacts/size.txt 2>/dev/null || true
+            cat artifacts/sha256.txt 2>/dev/null || true
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: inspect download-resolution stage.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload safe diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-apkmirror-session-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
