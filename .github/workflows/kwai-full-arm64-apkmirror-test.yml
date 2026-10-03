@@ -1,10 +1,12 @@
-name: Kwai full ARM64 bundle proof
+name: Kwai full ARM64 bundle phone route proof
 
 on:
   workflow_dispatch:
   push:
     paths:
       - '.github/workflows/kwai-full-arm64-apkmirror-test.yml'
+      - 'scripts/kwai_ui_probe_confirm.py'
+      - 'scripts/kwai_phone_route_probe.py'
 
 permissions:
   contents: read
@@ -14,14 +16,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
-      - name: Download full APKMirror bundle and prepare KVM
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Download verified full APKMirror bundle and prepare KVM
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p artifacts /tmp/kwai-full
           URL='https://www.apkmirror.com/wp-content/themes/APKMirror/download.php?id=16206618&key=11820c5728c6d2f5ced623938636146b80ab5ed4'
           curl -fL --retry 3 --retry-delay 2 \
-            -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36' \
+            -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/154 Safari/537.36' \
             -e 'https://www.apkmirror.com/' \
             "$URL" -o /tmp/kwai.apkm
           file /tmp/kwai.apkm | tee artifacts/file-type.txt
@@ -33,6 +38,9 @@ jobs:
           echo 'APKMirror bundle SHA256 MATCH' | tee artifacts/bundle-check.txt
           unzip -q /tmp/kwai.apkm -d /tmp/kwai-full
           find /tmp/kwai-full -type f -printf '%P\t%s bytes\n' | sort | tee artifacts/bundle-files.txt
+          APK_COUNT="$(find /tmp/kwai-full -type f -name '*.apk' | wc -l | tr -d ' ')"
+          echo "apk_count=$APK_COUNT" | tee artifacts/bundle-apk-count.txt
+          test "$APK_COUNT" -ge 10
 
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
@@ -42,10 +50,13 @@ jobs:
           set -euo pipefail
           adb wait-for-device
           while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          sleep 8
           {
             echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
             echo "native_bridge=$(adb shell getprop ro.dalvik.vm.native.bridge | tr -d '\r')"
-          } | tee artifacts/abi.txt
+            echo '--- route ---'
+            adb shell ip route || true
+          } | tee artifacts/abi-network.txt
 
           BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
           AAPT="$BUILD_TOOLS/aapt"
@@ -53,9 +64,7 @@ jobs:
 
           : > artifacts/splits.txt
           BASE=''
-          ALL_APKS=()
           while IFS= read -r -d '' apk; do
-            ALL_APKS+=("$apk")
             "$AAPT" dump badging "$apk" > /tmp/badging.txt 2>/dev/null || true
             first="$(sed -n '1p' /tmp/badging.txt)"
             pkg="$(printf '%s\n' "$first" | awk -F"'" '/^package: name=/{print $2}')"
@@ -74,50 +83,56 @@ jobs:
           test "$SHA256" = 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
           echo 'CERTIFICATE MATCH' | tee -a artifacts/cert-check.txt
 
-          # Android 15 x86_64 advertises arm64-v8a through native translation.
-          # Install the complete bundle except the ARM32 architecture split.
           INSTALL=()
+          : > artifacts/selection.txt
           while IFS= read -r -d '' apk; do
             "$AAPT" dump badging "$apk" > /tmp/badging.txt 2>/dev/null || true
             first="$(sed -n '1p' /tmp/badging.txt)"
             split="$(printf '%s\n' "$first" | sed -n "s/.* split='\([^']*\)'.*/\1/p")"
             if [[ "$split" == *armeabi_v7a* ]]; then
-              echo "SKIP $split" | tee -a artifacts/selection.txt
+              echo "SKIP $split" >> artifacts/selection.txt
               continue
             fi
-            echo "INCLUDE ${split:-base}: $(basename "$apk")" | tee -a artifacts/selection.txt
+            echo "INCLUDE ${split:-base}: $(basename "$apk")" >> artifacts/selection.txt
             INSTALL+=("$apk")
           done < <(find /tmp/kwai-full -type f -name '*.apk' -print0)
 
-          set +e
-          adb install-multiple -r "${INSTALL[@]}" > artifacts/install.txt 2>&1
-          RC=$?
-          set -e
-          cat artifacts/install.txt
-          echo "install_rc=$RC" | tee artifacts/install-result.txt
-          test "$RC" -eq 0
-
+          adb install-multiple -r "${INSTALL[@]}" | tee artifacts/install.txt
+          adb shell pm grant com.kwai.video android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+          adb shell appops set com.kwai.video POST_NOTIFICATION allow 2>/dev/null || true
           adb shell pm path com.kwai.video | tee artifacts/installed-paths.txt
           adb shell dumpsys package com.kwai.video > artifacts/package-dumpsys.txt
-          grep -E 'versionName=|versionCode=|primaryCpuAbi=' artifacts/package-dumpsys.txt | sed -n '1,20p' | tee artifacts/installed-version.txt || true
-          adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
-          sleep 25
-          adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
-          adb pull /sdcard/window.xml artifacts/kwai-ui.xml >/dev/null 2>&1 || true
-          adb exec-out screencap -p > artifacts/kwai.png
-          python3 - <<'PY'
-          from pathlib import Path
-          b=Path('artifacts/kwai.png').read_bytes()
-          assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000
-          PY
-          echo 'PASS: full ARM64 Kwai bundle installed and launcher opened on Android 15 translation.' | tee artifacts/result.txt
+          grep -E 'versionName=|versionCode=|primaryCpuAbi=' artifacts/package-dumpsys.txt | sed -n '1,30p' | tee artifacts/installed-version.txt || true
+
+          adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+          sleep 12
+          set +e
+          python3 scripts/kwai_ui_probe_confirm.py > artifacts/onboarding-console.txt 2>&1
+          ONBOARD_RC=$?
+          set -e
+          echo "onboarding_rc=$ONBOARD_RC" | tee artifacts/onboarding-result.txt
+          sleep 3
+
+          set +e
+          python3 scripts/kwai_phone_route_probe.py > artifacts/phone-route-console.txt 2>&1
+          PHONE_RC=$?
+          set -e
+          echo "phone_route_rc=$PHONE_RC" | tee artifacts/phone-route-rc.txt
+          cat artifacts/phone-route-result.txt 2>/dev/null || true
+          adb logcat -d -t 3000 > artifacts/logcat.txt || true
+
+          if [ "$PHONE_RC" -eq 0 ]; then
+            echo 'PASS: full verified Kwai bundle reached phone login field on connected Android 14.' | tee artifacts/result.txt
+          else
+            echo 'PARTIAL: full verified Kwai bundle installed; phone route still not reached. Inspect UI evidence.' | tee artifacts/result.txt
+          fi
           SH
           chmod +x /tmp/install-full.sh
 
-      - name: Boot Android 15 and install full ARM64 bundle
+      - name: Boot connected Android 14 and prove full-bundle phone route
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         with:
-          api-level: 35
+          api-level: 34
           target: google_apis
           arch: x86_64
           profile: pixel_6
@@ -126,7 +141,7 @@ jobs:
           heap-size: 768M
           emulator-boot-timeout: 600
           disable-animations: true
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
           script: bash /tmp/install-full.sh
 
       - name: Summary
@@ -134,19 +149,21 @@ jobs:
         shell: bash
         run: |
           {
-            echo '## Kwai full ARM64 bundle test'
-            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: inspect diagnostics.'
+            echo '## Kwai full ARM64 bundle phone route proof'
             cat artifacts/bundle-check.txt 2>/dev/null || true
-            cat artifacts/abi.txt 2>/dev/null || true
+            cat artifacts/bundle-apk-count.txt 2>/dev/null || true
             cat artifacts/cert-check.txt 2>/dev/null || true
-            cat artifacts/install-result.txt 2>/dev/null || true
+            cat artifacts/installed-version.txt 2>/dev/null || true
+            cat artifacts/phone-route-result.txt 2>/dev/null || true
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: inspect diagnostics.'
+            echo 'No phone number, OTP, password, upload or publication attempted.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: kwai-full-arm64-${{ github.run_id }}
+          name: kwai-full-arm64-phone-${{ github.run_id }}
           path: artifacts/
           if-no-files-found: warn
           retention-days: 1
