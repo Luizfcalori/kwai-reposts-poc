@@ -1,0 +1,172 @@
+name: Kwai API29 phone login proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-api29-phone-login-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  phone-login-api29:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Prepare verified legacy Kwai and KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/api29
+          URL='https://pool.apk.aptoide.com/appupdater/com-kwai-video-511304-72159650-7b16f3bea9483d98a12611334e22b543.apk'
+          curl -fL --retry 4 --retry-delay 2 "$URL" -o /tmp/kwai.apk
+          test "$(md5sum /tmp/kwai.apk | awk '{print $1}')" = '7b16f3bea9483d98a12611334e22b543'
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/probe_api29.py <<'PY'
+          import pathlib,re,subprocess,time,xml.etree.ElementTree as ET
+          ART=pathlib.Path('artifacts/api29')
+          PKG='com.kwai.video'
+
+          def adb(*args):
+              return subprocess.run(['adb',*args],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+
+          def bounds_center(v):
+              m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',v or '')
+              if not m:return None
+              x1,y1,x2,y2=map(int,m.groups()); return ((x1+x2)//2,(y1+y2)//2)
+
+          def dump(tag):
+              remote='/sdcard/kwai29.xml'
+              adb('shell','uiautomator','dump',remote)
+              xp=ART/f'{tag}.xml'; adb('pull',remote,str(xp))
+              with open(ART/f'{tag}.png','wb') as f:
+                  subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
+              root=None; texts=[]
+              try:
+                  root=ET.parse(xp).getroot()
+                  for n in root.iter('node'):
+                      for k in ('text','content-desc','hint'):
+                          v=(n.attrib.get(k) or '').strip()
+                          if v and v not in texts:texts.append(v)
+              except Exception: pass
+              (ART/f'{tag}.txt').write_text('\n'.join(texts),encoding='utf-8')
+              return root,texts
+
+          def tap(root,patterns):
+              if root is None:return False
+              regs=[re.compile(p,re.I) for p in patterns]
+              for n in root.iter('node'):
+                  label=' '.join(filter(None,[n.attrib.get('text',''),n.attrib.get('content-desc',''),n.attrib.get('hint','')])).strip()
+                  if label and any(r.search(label) for r in regs):
+                      p=bounds_center(n.attrib.get('bounds',''))
+                      if p:
+                          adb('shell','input','tap',str(p[0]),str(p[1])); time.sleep(4); return True
+              return False
+
+          def phone_visible(texts):
+              s='\n'.join(texts)
+              pats=[r'phone number',r'mobile number',r'n[uú]mero de telefone',r'n[uú]mero do celular',r'country code',r'c[oó]digo do pa[ií]s',r'get code',r'send code',r'verification code',r'c[oó]digo de verifica',r'sms code']
+              return any(re.search(p,s,re.I) for p in pats)
+
+          def crash_visible(texts):
+              return any(re.search(r'keeps stopping|has stopped|isn.?t responding',t,re.I) for t in texts)
+
+          adb('logcat','-c')
+          adb('shell','am','force-stop',PKG)
+          launch=adb('shell','monkey','-p',PKG,'-c','android.intent.category.LAUNCHER','1').stdout
+          (ART/'launch.txt').write_text(launch,encoding='utf-8')
+          time.sleep(15)
+          root,texts=dump('01-launch')
+          route='launch'
+
+          if not crash_visible(texts) and not phone_visible(texts):
+              if tap(root,[r'^Profile$',r'^Me$',r'^Eu$',r'^Perfil$',r'^Account$',r'^Conta$']):
+                  route='profile-semantic'; root,texts=dump('02-profile')
+              else:
+                  adb('shell','input','tap','995','2290'); time.sleep(5)
+                  route='profile-coordinate'; root,texts=dump('02-profile')
+
+          if not crash_visible(texts) and not phone_visible(texts):
+              if tap(root,[r'^Log in$',r'^Login$',r'^Sign in$',r'^Entrar$',r'^Fazer login$',r'Sign up or log in',r'Cadastre-se ou entre']):
+                  route+='>login'; root,texts=dump('03-login')
+
+          if not crash_visible(texts) and not phone_visible(texts):
+              if tap(root,[r'phone number',r'mobile number',r'continue with phone',r'log in with phone',r'sign in with phone',r'usar telefone',r'entrar com telefone',r'^Phone$']):
+                  route+='>phone'; root,texts=dump('04-phone')
+
+          if not crash_visible(texts) and not phone_visible(texts):
+              # Alternate auth entry points often force the same login sheet.
+              if tap(root,[r'^Inbox$',r'^Messages$',r'^Caixa de entrada$',r'^Mensagens$']):
+                  route+='>inbox'; root,texts=dump('05-inbox')
+
+          state='phone_login' if phone_visible(texts) else ('crash' if crash_visible(texts) else 'other')
+          top=adb('shell','dumpsys','activity','activities').stdout
+          log=adb('logcat','-d','-t','2500').stdout
+          (ART/'final-activities.txt').write_text(top,encoding='utf-8')
+          (ART/'logcat.txt').write_text(log,encoding='utf-8')
+          result={
+              'state':state,
+              'phone_route_detected':phone_visible(texts),
+              'route':route,
+              'pid':adb('shell','pidof',PKG).stdout.strip(),
+              'final_texts':' | '.join(texts[:40]),
+          }
+          pathlib.Path('artifacts/api29-result.txt').write_text('\n'.join(f'{k}={v}' for k,v in result.items())+'\n',encoding='utf-8')
+          print(result)
+          PY
+
+          cat > /tmp/run-api29.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          BUILD_TOOLS="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+          CERT="$($BUILD_TOOLS/apksigner verify --print-certs /tmp/kwai.apk 2>&1)"
+          printf '%s\n' "$CERT" > artifacts/api29-cert.txt
+          echo "$CERT" | grep -q 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+          echo 'OFFICIAL_CERTIFICATE_MATCH=true' | tee artifacts/api29-cert-check.txt
+          adb install -r /tmp/kwai.apk 2>&1 | tee artifacts/api29-install.txt
+          adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=|primaryCpuAbi=|secondaryCpuAbi=' | head -n 20 | tee artifacts/api29-package.txt || true
+          python3 /tmp/probe_api29.py 2>&1 | tee artifacts/api29-console.txt
+          SH
+          chmod +x /tmp/run-api29.sh
+
+      - name: Boot Android 10 and probe phone login
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 29
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/run-api29.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai phone login on Android 10 / API 29'
+            cat artifacts/api29-cert-check.txt 2>/dev/null || true
+            cat artifacts/api29-package.txt 2>/dev/null || true
+            cat artifacts/api29-result.txt 2>/dev/null || echo 'No result produced.'
+            echo
+            echo 'No phone number, OTP, password, upload, or publication was attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-api29-phone-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
