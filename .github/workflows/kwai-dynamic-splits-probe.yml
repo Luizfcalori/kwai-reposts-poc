@@ -1,0 +1,61 @@
+name: Kwai dynamic splits probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-dynamic-splits-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-splits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect current Kwai bundle metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o artifacts/meta.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('artifacts/meta.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}
+          md5=f.get('md5sum')
+          if not md5: raise SystemExit('missing base md5')
+          pathlib.Path('/tmp/base-md5').write_text(md5)
+          print('version=',f.get('vername'))
+          print('vercode=',f.get('vercode'))
+          print('base_md5=',md5)
+          print('static_splits:')
+          for s in (m.get('aab') or {}).get('splits') or []:
+              print(' -',s.get('name'),'type=',s.get('type'),'size=',s.get('filesize'))
+          PY
+          MD5="$(cat /tmp/base-md5)"
+          curl -LsS --retry 4 --retry-delay 2 "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${MD5}/language=pt_PT" -o artifacts/dynamic.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('artifacts/dynamic.json',encoding='utf-8'))
+          items=d.get('list') or []
+          print('dynamic_count=',len(items))
+          for i,x in enumerate(items,1):
+              print(f'[{i}] name={x.get("name")} type={x.get("type")} md5={x.get("md5sum")} size={x.get("filesize")}')
+              print('    path=',x.get('path'))
+              cfg=x.get('configSplits') or x.get('config_splits') or []
+              if cfg:
+                  print('    config_count=',len(cfg))
+                  for c in cfg:
+                      print('      -',c.get('name'),'type=',c.get('type'),'md5=',c.get('md5sum'),'path=',c.get('path'))
+          PY
+
+      - name: Upload metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-dynamic-splits-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 1
