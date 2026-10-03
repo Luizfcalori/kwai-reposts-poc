@@ -1,0 +1,112 @@
+name: Kwai APKPure phone caller JADX
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-apkpure-phone-caller-jadx.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  phone-caller-jadx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Download exact official bundle and extract auth DEX
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts apks /tmp/kwai /tmp/dex /tmp/jadx-out
+          docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
+            -a 'com.kwai.kuaishou.video.live@13.8.30.646601' -d apk-pure \
+            -o 'acknowledge_dangers=true,arch=arm64-v8a' /output \
+            2>&1 | tee artifacts/download.txt
+          BUNDLE="$(find apks -maxdepth 1 -type f | head -n1)"
+          unzip -q "$BUNDLE" -d /tmp/kwai
+          BASE=/tmp/kwai/com.kwai.kuaishou.video.live.apk
+          test -f "$BASE"
+          for n in 3 5 6 7 9; do unzip -p "$BASE" "classes${n}.dex" > "/tmp/dex/classes${n}.dex"; done
+          ls -lh /tmp/dex | tee artifacts/dex-inventory.txt
+
+      - name: Decompile targeted auth DEX files
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL 'https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip' -o /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+          set +e
+          timeout 720 /tmp/jadx/bin/jadx --no-res --show-bad-code --deobf -j 2 \
+            -d /tmp/jadx-out /tmp/dex/classes3.dex /tmp/dex/classes5.dex /tmp/dex/classes6.dex /tmp/dex/classes7.dex /tmp/dex/classes9.dex \
+            > artifacts/jadx-console.txt 2>&1
+          echo "jadx_rc=$?" > artifacts/result.txt
+          set -e
+          test -d /tmp/jadx-out/sources
+
+      - name: Extract phone login callers and navigation
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=/tmp/jadx-out/sources
+          mkdir -p artifacts/sources
+          PAT='PhoneAccountActivityV2|PhoneAccountActivity|PhoneVerifyActivity|CommonLoginActivity|LoginPluginImpl|LoginPlugin|PhoneLoginViewModel|AccountPhoneLoginVerifyFragment|AccountLoginOrSignUpPhoneFragment|phoneLoginWithVerifyCode|phoneLogin|oldPhoneLogin|setTargetLoginActivity|getLoginActivityClass|getCommonLoginActivityClass|getBindPhoneActivity|startLoginActivity|startFissionLoginActivity|login_phone_new|login_phone'
+
+          grep -RInEi "$PAT" "$SRC" > artifacts/all-phone-caller-hits.txt || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,shutil
+          src=Path('/tmp/jadx-out/sources'); out=Path('artifacts/sources')
+          names={
+            'PhoneAccountActivityV2.java','PhoneVerifyActivity.java','LoginActivity.java','CommonLoginActivity.java',
+            'LoginPluginImpl.java','LoginPlugin.java','PhoneLoginViewModel.java','AccountPhoneLoginVerifyFragment.java',
+            'AccountLoginOrSignUpPhoneFragment.java','SplashLoginActivity.java','ForcePhoneRegisterActivity.java'
+          }
+          copied=[]
+          for p in src.rglob('*.java'):
+              if p.name in names:
+                  rel='__'.join(p.relative_to(src).parts)
+                  shutil.copyfile(p,out/rel); copied.append(str(p))
+          Path('artifacts/copied-sources.txt').write_text('\n'.join(copied)+'\n',encoding='utf-8')
+
+          rx=re.compile(r'PhoneAccountActivityV2|PhoneAccountActivity|PhoneVerifyActivity|CommonLoginActivity|LoginPluginImpl|PhoneLoginViewModel|AccountPhoneLoginVerifyFragment|AccountLoginOrSignUpPhoneFragment|phoneLoginWithVerifyCode|phoneLogin|oldPhoneLogin|setTargetLoginActivity|getLoginActivityClass|getCommonLoginActivityClass|getBindPhoneActivity|startLoginActivity|startFissionLoginActivity|login_phone_new|login_phone',re.I)
+          report=[]
+          for p in src.rglob('*.java'):
+              try: lines=p.read_text(errors='ignore').splitlines()
+              except: continue
+              idx=[i for i,l in enumerate(lines) if rx.search(l)]
+              if not idx: continue
+              report.append(f'===== {p.relative_to(src)} =====')
+              ranges=[]
+              for i in idx:
+                  a=max(0,i-45); b=min(len(lines),i+80)
+                  if ranges and a <= ranges[-1][1]+5: ranges[-1]=(ranges[-1][0],max(ranges[-1][1],b))
+                  else: ranges.append((a,b))
+              for a,b in ranges:
+                  for j in range(a,b): report.append(f'{j+1}: {lines[j]}')
+                  report.append('---')
+          Path('artifacts/phone-caller-context.txt').write_text('\n'.join(report),encoding='utf-8')
+          PY
+
+          grep -RInE 'new Intent\(|setClass\(|setClassName\(|setComponent\(|putExtra\(|startActivity\(|startActivityForResult\(|startActivityForCallback\(' "$SRC" \
+            | grep -Ei 'login|phone|account|verify|source|scene|type|mode|target' \
+            > artifacts/intent-extra-hits.txt || true
+
+          echo '--- copied auth sources ---'
+          cat artifacts/copied-sources.txt || true
+          echo '--- direct phone/caller hits ---'
+          head -n 1800 artifacts/all-phone-caller-hits.txt || true
+          echo '--- intent/extra hits ---'
+          head -n 1600 artifacts/intent-extra-hits.txt || true
+          echo '--- focused context ---'
+          head -n 2200 artifacts/phone-caller-context.txt || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-apkpure-phone-caller-jadx-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
