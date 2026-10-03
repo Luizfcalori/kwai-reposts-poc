@@ -1,0 +1,152 @@
+name: Kwai API34 router phone proof v2
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-api34-router-phone-proof-v2.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  router-phone-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Prepare exact official Kwai
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/ui apks /tmp/kwai
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
+            -a 'com.kwai.kuaishou.video.live@13.8.30.646601' -d apk-pure \
+            -o 'acknowledge_dangers=true,arch=arm64-v8a' /output \
+            2>&1 | tee artifacts/download.txt
+          BUNDLE="$(find apks -maxdepth 1 -type f | head -n1)"
+          unzip -q "$BUNDLE" -d /tmp/kwai
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          BASE=/tmp/kwai/com.kwai.kuaishou.video.live.apk
+          "$BT/aapt" dump badging "$BASE" | head -n1 | tee artifacts/base-badging.txt
+          PKG="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" artifacts/base-badging.txt)"
+          test "$PKG" = 'com.kwai.kuaishou.video.live'
+          echo "$PKG" > /tmp/pkg
+          "$BT/aapt" dump xmltree "$BASE" AndroidManifest.xml > artifacts/manifest-tree.txt
+          grep -n -B 12 -A 35 'com.kscorp.oversea.platform.router.ui.UriRouterActivity' artifacts/manifest-tree.txt > artifacts/router-manifest.txt || true
+
+          cat > /tmp/probe.py <<'PY'
+          import pathlib,re,subprocess,time,xml.etree.ElementTree as ET
+          A=pathlib.Path('artifacts'); U=A/'ui'; U.mkdir(parents=True,exist_ok=True)
+          PKG=pathlib.Path('/tmp/pkg').read_text().strip()
+          ROUTE='kwai://loginchannel?login=phone'
+          ROUTER=f'{PKG}/com.kscorp.oversea.platform.router.ui.UriRouterActivity'
+          def adb(*a,timeout=45): return subprocess.run(['adb',*a],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=timeout)
+          def sh(*a): return adb('shell',*a)
+          def state(tag):
+              act=sh('dumpsys','activity','activities').stdout
+              (A/f'{tag}-activities.txt').write_text(act,encoding='utf-8')
+              (A/f'{tag}-window.txt').write_text(sh('dumpsys','window','windows').stdout,encoding='utf-8')
+              return act
+          def dump(tag):
+              sh('uiautomator','dump','/sdcard/u.xml')
+              adb('pull','/sdcard/u.xml',str(U/f'{tag}.xml'))
+              with open(U/f'{tag}.png','wb') as f: subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
+              root=ET.parse(U/f'{tag}.xml').getroot(); texts=[]
+              for n in root.iter('node'):
+                  for k in ('text','content-desc','hint'):
+                      v=(n.attrib.get(k) or '').strip()
+                      if v and v not in texts:texts.append(v)
+              (U/f'{tag}.txt').write_text('\n'.join(texts),encoding='utf-8')
+              return root,texts
+          def center(s):
+              m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',s or '')
+              if not m:return None
+              a,b,c,d=map(int,m.groups()); return (a+c)//2,(b+d)//2
+          def tap_phone(root):
+              pats=[r'^Phone$',r'^Telefone$',r'^Celular$',r'continue.*phone',r'usar.*telefone',r'phone login',r'login.*phone']
+              for n in root.iter('node'):
+                  s=' '.join(x for x in (n.attrib.get('text',''),n.attrib.get('content-desc',''),n.attrib.get('hint','')) if x)
+                  if s and any(re.search(p,s,re.I) for p in pats):
+                      p=center(n.attrib.get('bounds',''))
+                      if p:
+                          print('TAP_PHONE',s,p); sh('input','tap',str(p[0]),str(p[1])); time.sleep(4); return True
+              return False
+          def phone_screen(root,texts,activities):
+              if 'PhoneAccountActivityV2' in activities:return True
+              t='\n'.join(texts)
+              if any(re.search(p,t,re.I) for p in [r'phone number',r'mobile number',r'country code',r'n[uú]mero de telefone',r'digite.*telefone',r'\+55',r'get code',r'send code']):return True
+              for n in root.iter('node'):
+                  if n.attrib.get('class')=='android.widget.EditText':
+                      s=' '.join((n.attrib.get('text',''),n.attrib.get('hint',''),n.attrib.get('content-desc','')))
+                      if not re.search(r'email|password|senha',s,re.I):return True
+              return False
+
+          sh('am','force-stop','com.google.android.apps.nexuslauncher')
+          sh('am','force-stop','com.android.launcher3')
+          sh('am','force-stop',PKG)
+          time.sleep(1)
+          r=sh('am','start','-W','-n',ROUTER,'-a','android.intent.action.VIEW','-d',ROUTE)
+          (A/'route-start.txt').write_text(r.stdout,encoding='utf-8'); print(r.stdout)
+          time.sleep(8)
+          root,texts=dump('00-router')
+          activities=state('00-router')
+          ok=phone_screen(root,texts,activities)
+          if not ok and tap_phone(root):
+              root,texts=dump('01-after-phone-click')
+              activities=state('01-after-phone-click')
+              ok=phone_screen(root,texts,activities)
+          (A/'logcat.txt').write_text(sh('logcat','-d','-v','brief').stdout[-160000:],encoding='utf-8')
+          resumed=''
+          m=re.findall(r'mResumedActivity[^\n]*|topResumedActivity[^\n]*',activities)
+          if m: resumed=' | '.join(m[-5:])
+          (A/'result.txt').write_text(f'route={ROUTE}\nrouter={ROUTER}\nstatus={"phone_field_visible" if ok else "phone_field_not_reached"}\nresumed={resumed}\nfinal_texts={" | ".join(texts[:80])}\n',encoding='utf-8')
+          print('RESULT', 'phone_field_visible' if ok else 'phone_field_not_reached', resumed)
+          raise SystemExit(0 if ok else 7)
+          PY
+
+          cat > /tmp/run.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != '1' ]; do sleep 2; done
+          mapfile -d '' APKS < <(find /tmp/kwai -type f -name '*.apk' -print0)
+          adb install-multiple -r "${APKS[@]}" | tee artifacts/install.txt
+          PKG="$(cat /tmp/pkg)"
+          adb shell pm clear "$PKG" >/dev/null || true
+          adb logcat -c
+          python3 /tmp/probe.py 2>&1 | tee artifacts/probe-console.txt
+          SH
+          chmod +x /tmp/run.sh
+
+      - name: Boot API34 and route into phone login
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/run.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          cat artifacts/result.txt 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          echo 'No phone number, OTP, password, credential, upload, or publication attempted.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-api34-router-phone-proof-v2-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
