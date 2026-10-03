@@ -115,32 +115,37 @@ jobs:
               return any(re.search(p,s,re.I) for p in pats)
           def hide_overlay(root,texts,tag):
               if tap(root,[r'^Hide$',r'^Ocultar$',r'^Close$',r'^Fechar$']):
-                  return dump(tag)
-              return root,texts
+                  return dump(tag), True
+              return (root,texts), False
+          def open_profile(root,texts,tag):
+              if not tap(root,[r'^Profile$',r'^Me$',r'^Eu$',r'^Perfil$',r'^Account$',r'^Conta$']):
+                  adb('shell','input','tap','1000','2290'); time.sleep(5)
+              return dump(tag)
 
           phone=[r'phone number',r'mobile number',r'n[uú]mero de telefone',r'n[uú]mero do celular',r'country code',r'c[oó]digo do pa[ií]s',r'get code',r'send code',r'verification code',r'c[oó]digo de verifica',r'sms code']
           crash=[r'keeps stopping',r'has stopped',r'isn.?t responding']
           root,texts=dump('01-launch')
-          root,texts=hide_overlay(root,texts,'01b-after-hide')
+          (root,texts),_=hide_overlay(root,texts,'01b-after-hide')
           if has(texts,crash):
               state='crash'
           else:
               tap(root,[r'^Skip$',r'^Pular$',r'Not now',r'Agora n[aã]o'])
               root,texts=dump('02-after-skip')
-              root,texts=hide_overlay(root,texts,'02b-after-hide')
+              (root,texts),_=hide_overlay(root,texts,'02b-after-hide')
               if not has(texts,phone):
-                  if not tap(root,[r'^Profile$',r'^Me$',r'^Eu$',r'^Perfil$',r'^Account$',r'^Conta$']):
-                      adb('shell','input','tap','1000','2290'); time.sleep(5)
-                  root,texts=dump('03-profile')
-                  root,texts=hide_overlay(root,texts,'03b-after-hide')
+                  root,texts=open_profile(root,texts,'03-profile')
+                  (root,texts),hidden=hide_overlay(root,texts,'03b-after-hide')
+                  if hidden and not has(texts,phone):
+                      root,texts=open_profile(root,texts,'03c-profile-retry')
+                      (root,texts),_=hide_overlay(root,texts,'03d-after-second-hide')
               if not has(texts,phone):
                   tap(root,[r'^Log in$',r'^Login$',r'^Sign in$',r'^Entrar$',r'^Fazer login$',r'Sign up or log in',r'Cadastre-se ou entre'])
                   root,texts=dump('04-login')
-                  root,texts=hide_overlay(root,texts,'04b-after-hide')
+                  (root,texts),_=hide_overlay(root,texts,'04b-after-hide')
               if not has(texts,phone):
                   tap(root,[r'phone number',r'mobile number',r'continue with phone',r'log in with phone',r'sign in with phone',r'usar telefone',r'entrar com telefone',r'^Phone$',r'^Telefone$'])
                   root,texts=dump('05-phone')
-                  root,texts=hide_overlay(root,texts,'05b-after-hide')
+                  (root,texts),_=hide_overlay(root,texts,'05b-after-hide')
               state='phone_login' if has(texts,phone) else ('login_screen' if has(texts,[r'login',r'log in',r'sign in',r'entrar',r'google']) else 'app_open')
           pathlib.Path('artifacts/result.txt').write_text(f'state={state}\nphone_route_detected={str(state=="phone_login").lower()}\n')
           print('state=',state)
