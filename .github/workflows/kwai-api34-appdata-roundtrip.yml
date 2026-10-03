@@ -50,68 +50,102 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
           cat > /tmp/roundtrip.sh <<'SH'
-          set -euo pipefail
-          adb wait-for-device
-          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != '1' ]; do sleep 2; done
+          set -uo pipefail
+          mkdir -p artifacts
+          : > artifacts/result.txt
+          STAGE=init
+          finish() {
+            rc=$?
+            echo "final_stage=$STAGE" >> artifacts/result.txt
+            echo "exit_code=$rc" >> artifacts/result.txt
+          }
+          trap finish EXIT
+          stage() { STAGE="$1"; echo "stage=$1" >> artifacts/result.txt; }
+          fail() { echo "failure=$1" >> artifacts/result.txt; exit "${2:-1}"; }
 
+          stage=boot_check
+          adb wait-for-device || fail adb_wait 11
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != '1' ]; do sleep 2; done
+          echo "build_type=$(adb shell getprop ro.build.type | tr -d '\r')" >> artifacts/result.txt
+          echo "debuggable=$(adb shell getprop ro.debuggable | tr -d '\r')" >> artifacts/result.txt
+
+          stage install
           APKS=(/tmp/kwai/base.apk /tmp/kwai/config.arm64_v8a.apk /tmp/kwai/config.density.apk)
           [ -f /tmp/kwai/feature.apk ] && APKS+=(/tmp/kwai/feature.apk)
-          adb install-multiple -r "${APKS[@]}" >/dev/null
+          adb install-multiple -r "${APKS[@]}" >/dev/null || fail install_failed 12
 
-          adb shell am start -n com.kwai.video/com.yxcorp.gifshow.tiny.TinyLaunchActivity >/dev/null
+          stage launch
+          adb shell am start -n com.kwai.video/com.yxcorp.gifshow.tiny.TinyLaunchActivity >/dev/null || fail launch_failed 13
           sleep 5
-          adb shell am force-stop com.kwai.video
+          adb shell am force-stop com.kwai.video || true
+          PKGLINE="$(adb shell cmd package list packages -U com.kwai.video | tr -d '\r')"
+          echo "package_uid_line=$PKGLINE" >> artifacts/result.txt
 
-          UIDNUM="$(adb shell dumpsys package com.kwai.video | sed -n 's/.*userId=\([0-9]*\).*/\1/p' | head -1 | tr -d '\r')"
-          test -n "$UIDNUM"
-
+          stage root_probe
           ROOT_OUT="$(adb root 2>&1 || true)"
+          echo "adb_root_output=$ROOT_OUT" >> artifacts/result.txt
           sleep 2
-          adb wait-for-device
-          ROOT_ID="$(adb shell id | tr -d '\r')"
-          echo "$ROOT_ID" | grep -q 'uid=0(root)'
-
-          DATA=/data/user/0/com.kwai.video
-          adb shell test -d "$DATA"
-          MARKER="kwai-roundtrip-${GITHUB_RUN_ID}"
-          adb shell sh -c "printf '%s' '$MARKER' > '$DATA/files/.cloud-session-roundtrip'"
-          adb shell chown "$UIDNUM:$UIDNUM" "$DATA/files/.cloud-session-roundtrip"
-
-          adb shell tar -cpf /data/local/tmp/kwai-appdata.tar -C "$DATA" .
-          ARCHIVE_BYTES="$(adb shell stat -c %s /data/local/tmp/kwai-appdata.tar | tr -d '\r')"
-          test "$ARCHIVE_BYTES" -gt 0
-
-          adb shell pm clear com.kwai.video >/dev/null
-          if adb shell sh -c "test -f '$DATA/files/.cloud-session-roundtrip'"; then
-            echo 'marker unexpectedly survived pm clear' >&2
-            exit 20
+          adb wait-for-device || true
+          ROOT_ID="$(adb shell id 2>&1 | tr -d '\r')"
+          echo "root_identity=$ROOT_ID" >> artifacts/result.txt
+          if ! echo "$ROOT_ID" | grep -q 'uid=0(root)'; then
+            echo 'root_supported=false' >> artifacts/result.txt
+            fail root_unavailable 30
           fi
+          echo 'root_supported=true' >> artifacts/result.txt
 
-          adb shell mkdir -p "$DATA"
-          adb shell tar -xpf /data/local/tmp/kwai-appdata.tar -C "$DATA"
-          adb shell chown -R "$UIDNUM:$UIDNUM" "$DATA"
+          stage data_dir
+          DATA=/data/user/0/com.kwai.video
+          if ! adb shell test -d "$DATA"; then
+            DATA=/data/data/com.kwai.video
+          fi
+          echo "data_dir=$DATA" >> artifacts/result.txt
+          adb shell test -d "$DATA" || fail data_dir_missing 31
+          UIDNUM="$(adb shell stat -c %u "$DATA" 2>/dev/null | tr -d '\r')"
+          if ! echo "$UIDNUM" | grep -Eq '^[0-9]+$'; then
+            UIDNUM="$(echo "$PKGLINE" | sed -n 's/.* uid:\([0-9][0-9]*\).*/\1/p')"
+          fi
+          echo "app_uid=$UIDNUM" >> artifacts/result.txt
+          echo "$UIDNUM" | grep -Eq '^[0-9]+$' || fail uid_not_found 32
+
+          stage marker
+          adb shell mkdir -p "$DATA/files" || fail mkdir_files 33
+          MARKER="kwai-roundtrip-${GITHUB_RUN_ID}"
+          adb shell sh -c "printf '%s' '$MARKER' > '$DATA/files/.cloud-session-roundtrip'" || fail marker_write 34
+          adb shell chown "$UIDNUM:$UIDNUM" "$DATA/files/.cloud-session-roundtrip" || fail marker_chown 35
+
+          stage archive
+          adb shell tar -cpf /data/local/tmp/kwai-appdata.tar -C "$DATA" . || fail archive_create 36
+          ARCHIVE_BYTES="$(adb shell stat -c %s /data/local/tmp/kwai-appdata.tar 2>/dev/null | tr -d '\r')"
+          echo "archive_bytes=$ARCHIVE_BYTES" >> artifacts/result.txt
+          echo "$ARCHIVE_BYTES" | grep -Eq '^[1-9][0-9]*$' || fail archive_empty 37
+
+          stage clear
+          adb shell pm clear com.kwai.video >/dev/null || fail pm_clear 38
+          if adb shell test -f "$DATA/files/.cloud-session-roundtrip"; then
+            fail marker_survived_clear 39
+          fi
+          echo 'marker_removed_by_clear=true' >> artifacts/result.txt
+
+          stage restore
+          adb shell mkdir -p "$DATA" || fail restore_mkdir 40
+          adb shell tar -xpf /data/local/tmp/kwai-appdata.tar -C "$DATA" || fail restore_extract 41
+          adb shell chown -R "$UIDNUM:$UIDNUM" "$DATA" || fail restore_chown 42
           adb shell restorecon -RF "$DATA" >/dev/null 2>&1 || true
+          RESTORED="$(adb shell cat "$DATA/files/.cloud-session-roundtrip" 2>/dev/null | tr -d '\r')"
+          [ "$RESTORED" = "$MARKER" ] || fail marker_not_restored 43
+          echo 'marker_restored=true' >> artifacts/result.txt
 
-          RESTORED="$(adb shell cat "$DATA/files/.cloud-session-roundtrip" | tr -d '\r')"
-          test "$RESTORED" = "$MARKER"
-
-          adb shell am start -n com.kwai.video/com.yxcorp.gifshow.tiny.TinyLaunchActivity >/dev/null
+          stage relaunch
+          adb shell am start -n com.kwai.video/com.yxcorp.gifshow.tiny.TinyLaunchActivity >/dev/null || fail relaunch_failed 44
           sleep 5
           PID="$(adb shell pidof com.kwai.video | tr -d '\r')"
-          test -n "$PID"
-
-          {
-            echo 'root_supported=true'
-            echo "root_identity=$ROOT_ID"
-            echo "app_uid=$UIDNUM"
-            echo "archive_bytes=$ARCHIVE_BYTES"
-            echo 'marker_removed_by_clear=true'
-            echo 'marker_restored=true'
-            echo 'app_relaunch_after_restore=true'
-            echo 'roundtrip_success=true'
-          } | tee artifacts/result.txt
-
-          adb shell rm -f /data/local/tmp/kwai-appdata.tar
+          [ -n "$PID" ] || fail relaunch_no_pid 45
+          echo 'app_relaunch_after_restore=true' >> artifacts/result.txt
+          echo 'roundtrip_success=true' >> artifacts/result.txt
+          STAGE=complete
+          adb shell rm -f /data/local/tmp/kwai-appdata.tar || true
+          exit 0
           SH
           chmod +x /tmp/roundtrip.sh
 
