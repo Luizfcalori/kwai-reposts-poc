@@ -1,4 +1,4 @@
-name: Kwai Android 15 ARM translation proof
+name: Kwai Android 15 ARM64 translation proof
 
 on:
   workflow_dispatch:
@@ -14,25 +14,132 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Download and verify Kwai bundle
+      - name: Download current verified ARM64 Kwai bundle
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifacts /tmp/kwai-xapk
-          curl -fL --retry 4 --retry-delay 3 -A 'Mozilla/5.0' \
-            'https://d.apkpure.net/b/XAPK/com.kwai.video?version=latest' \
-            -o /tmp/kwai.xapk
-          sha256sum /tmp/kwai.xapk | tee artifacts/xapk-sha256.txt
-          unzip -q /tmp/kwai.xapk -d /tmp/kwai-xapk
-          find /tmp/kwai-xapk -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort | tee artifacts/xapk-files.txt
+          mkdir -p artifacts /tmp/kwai
+
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/kwai.json
+
+          python3 - <<'PY'
+          import json, pathlib, shlex
+          data=json.load(open('/tmp/kwai.json',encoding='utf-8'))
+          meta=((data.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=meta.get('file') or {}
+          aab=meta.get('aab') or {}
+          splits=aab.get('splits') or []
+          abi=next((s for s in splits if s.get('type')=='ABI' and 'arm64' in (s.get('name') or '').lower()),None)
+          density=next((s for s in splits if s.get('type')=='DENSITY' and 'mdpi' in (s.get('name') or '').lower()),None)
+          if density is None:
+              density=next((s for s in splits if s.get('type')=='DENSITY'),None)
+          vals={
+              'BASE_URL':f.get('path') or f.get('path_alt'),
+              'BASE_MD5':f.get('md5sum'),
+              'VERSION':f.get('vername'),
+              'VERCODE':f.get('vercode'),
+              'ABI_URL':(abi or {}).get('path'),
+              'ABI_MD5':(abi or {}).get('md5sum'),
+              'DENSITY_URL':(density or {}).get('path'),
+              'DENSITY_MD5':(density or {}).get('md5sum'),
+          }
+          if not vals['BASE_URL'] or not vals['ABI_URL'] or not vals['DENSITY_URL']:
+              raise SystemExit('Aptoide did not return required ARM64 bundle paths')
+          pathlib.Path('artifacts/source.txt').write_text('\n'.join(f'{k}={v}' for k,v in vals.items())+'\n')
+          pathlib.Path('/tmp/kwai.env').write_text('\n'.join(f'{k}={shlex.quote(str(v))}' for k,v in vals.items())+'\n')
+          print(vals)
+          PY
+
+          source /tmp/kwai.env
+          curl -fL --retry 4 --retry-delay 2 "$BASE_URL" -o /tmp/kwai/base.apk
+          curl -fL --retry 4 --retry-delay 2 "$ABI_URL" -o /tmp/kwai/config.arm64_v8a.apk
+          curl -fL --retry 4 --retry-delay 2 "$DENSITY_URL" -o /tmp/kwai/config.mdpi.apk
+
+          DYN="https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${BASE_MD5}/language=pt_PT"
+          curl -LsS --retry 4 --retry-delay 2 "$DYN" -o /tmp/dynamic.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/dynamic.json',encoding='utf-8'))
+          feat=next((x for x in (d.get('list') or []) if x.get('type')=='FEATURE' and x.get('path')),None)
+          if feat:
+              pathlib.Path('/tmp/feature-url.txt').write_text(feat['path'])
+              pathlib.Path('artifacts/feature.txt').write_text(f"name={feat.get('name')}\nmd5={feat.get('md5sum')}\npath={feat.get('path')}\n")
+          PY
+          if [ -s /tmp/feature-url.txt ]; then
+            curl -fL --retry 4 --retry-delay 2 "$(cat /tmp/feature-url.txt)" -o /tmp/kwai/feature.apk
+          fi
+
+          md5sum /tmp/kwai/*.apk | tee artifacts/download-md5.txt
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/ui_probe.py <<'PY'
+          import pathlib,re,subprocess,time,xml.etree.ElementTree as ET
+          ART=pathlib.Path('artifacts')
+          def adb(*a):
+              return subprocess.run(['adb',*a],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+          def center(v):
+              m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',v or '')
+              if not m:return None
+              x1,y1,x2,y2=map(int,m.groups()); return ((x1+x2)//2,(y1+y2)//2)
+          def dump(tag):
+              adb('shell','uiautomator','dump','/sdcard/u.xml')
+              adb('pull','/sdcard/u.xml',str(ART/f'{tag}.xml'))
+              with open(ART/f'{tag}.png','wb') as f:
+                  subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
+              texts=[]; root=None
+              try:
+                  root=ET.parse(ART/f'{tag}.xml').getroot()
+                  for n in root.iter('node'):
+                      for k in ('text','content-desc','hint'):
+                          v=(n.attrib.get(k) or '').strip()
+                          if v and v not in texts:texts.append(v)
+              except Exception: pass
+              (ART/f'{tag}-texts.txt').write_text('\n'.join(texts),encoding='utf-8')
+              return root,texts
+          def tap(root,patterns):
+              if root is None:return False
+              regs=[re.compile(p,re.I) for p in patterns]
+              for n in root.iter('node'):
+                  label=' '.join(filter(None,[n.attrib.get('text',''),n.attrib.get('content-desc',''),n.attrib.get('hint','')])).strip()
+                  if label and any(r.search(label) for r in regs):
+                      p=center(n.attrib.get('bounds',''))
+                      if p:
+                          adb('shell','input','tap',str(p[0]),str(p[1])); time.sleep(4); return True
+              return False
+          def has(texts,pats):
+              s='\n'.join(texts)
+              return any(re.search(p,s,re.I) for p in pats)
+
+          phone=[r'phone number',r'mobile number',r'n[uú]mero de telefone',r'n[uú]mero do celular',r'country code',r'c[oó]digo do pa[ií]s',r'get code',r'send code',r'verification code',r'c[oó]digo de verifica',r'sms code']
+          crash=[r'keeps stopping',r'has stopped',r'isn.?t responding']
+          root,texts=dump('01-launch')
+          if has(texts,crash):
+              state='crash'
+          else:
+              tap(root,[r'^Skip$',r'^Pular$',r'Not now',r'Agora n[aã]o'])
+              root,texts=dump('02-after-skip')
+              if not has(texts,phone):
+                  if not tap(root,[r'^Profile$',r'^Me$',r'^Eu$',r'^Perfil$',r'^Account$',r'^Conta$']):
+                      adb('shell','input','tap','1000','2290'); time.sleep(5)
+                  root,texts=dump('03-profile')
+              if not has(texts,phone):
+                  tap(root,[r'^Log in$',r'^Login$',r'^Sign in$',r'^Entrar$',r'^Fazer login$',r'Sign up or log in',r'Cadastre-se ou entre'])
+                  root,texts=dump('04-login')
+              if not has(texts,phone):
+                  tap(root,[r'phone number',r'mobile number',r'continue with phone',r'log in with phone',r'sign in with phone',r'usar telefone',r'entrar com telefone',r'^Phone$',r'^Telefone$'])
+                  root,texts=dump('05-phone')
+              state='phone_login' if has(texts,phone) else ('login_screen' if has(texts,[r'login',r'log in',r'sign in',r'entrar',r'google']) else 'app_open')
+          pathlib.Path('artifacts/result.txt').write_text(f'state={state}\nphone_route_detected={str(state=="phone_login").lower()}\n')
+          print('state=',state)
+          PY
+
           cat > /tmp/test-api35.sh <<'SH'
           set -euo pipefail
           adb wait-for-device
           while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
-
           {
             echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
             echo "abilist32=$(adb shell getprop ro.product.cpu.abilist32 | tr -d '\r')"
@@ -40,15 +147,15 @@ jobs:
             echo "native_bridge=$(adb shell getprop ro.dalvik.vm.native.bridge | tr -d '\r')"
             echo "native_bridge_exec=$(adb shell getprop ro.enable.native.bridge.exec | tr -d '\r')"
           } | tee artifacts/abi.txt
+          grep -q 'arm64-v8a' artifacts/abi.txt
 
           BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
           AAPT="$BUILD_TOOLS/aapt"
           APKSIGNER="$BUILD_TOOLS/apksigner"
-          BASE='/tmp/kwai-xapk/com.kwai.video.apk'
-          "$AAPT" dump badging "$BASE" > artifacts/base-badging.txt
+          "$AAPT" dump badging /tmp/kwai/base.apk > artifacts/base-badging.txt
           PACKAGE="$(awk -F"'" '/^package: name=/{print $2; exit}' artifacts/base-badging.txt)"
           test "$PACKAGE" = 'com.kwai.video'
-          "$APKSIGNER" verify --print-certs "$BASE" > artifacts/base-cert.txt 2>&1
+          "$APKSIGNER" verify --print-certs /tmp/kwai/base.apk > artifacts/base-cert.txt 2>&1
           SHA1="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-1 digest:/{print tolower($NF); exit}' artifacts/base-cert.txt)"
           SHA256="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-256 digest:/{print tolower($NF); exit}' artifacts/base-cert.txt)"
           echo "sha1=$SHA1" | tee artifacts/cert-check.txt
@@ -57,12 +164,9 @@ jobs:
           test "$SHA256" = 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
           echo 'CERTIFICATE MATCH' | tee -a artifacts/cert-check.txt
 
-          APKS=(
-            /tmp/kwai-xapk/com.kwai.video.apk
-            /tmp/kwai-xapk/config.armeabi_v7a.apk
-            /tmp/kwai-xapk/config.mdpi.apk
-            /tmp/kwai-xapk/dfm_ug.apk
-          )
+          APKS=(/tmp/kwai/base.apk /tmp/kwai/config.arm64_v8a.apk /tmp/kwai/config.mdpi.apk)
+          [ -f /tmp/kwai/feature.apk ] && APKS+=(/tmp/kwai/feature.apk)
+          printf '%s\n' "${APKS[@]}" | tee artifacts/apks-to-install.txt
           set +e
           adb install-multiple -r "${APKS[@]}" > artifacts/install.txt 2>&1
           RC=$?
@@ -71,22 +175,16 @@ jobs:
           echo "install_rc=$RC" | tee artifacts/install-result.txt
           test "$RC" -eq 0
 
-          adb shell pm path com.kwai.video | tee artifacts/installed-paths.txt
+          adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=|primaryCpuAbi=' | head -n 20 | tee artifacts/installed-version.txt || true
           adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
-          sleep 25
-          adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
-          adb pull /sdcard/window.xml artifacts/kwai-ui.xml >/dev/null 2>&1 || true
-          adb exec-out screencap -p > artifacts/kwai.png
-          python3 - <<'PY'
-          from pathlib import Path
-          b=Path('artifacts/kwai.png').read_bytes()
-          assert b[:8] == bytes([137,80,78,71,13,10,26,10]) and len(b)>1000
-          PY
-          echo 'PASS: Android 15 accepted ARMv7 Kwai bundle and launcher opened.' | tee artifacts/result.txt
+          sleep 20
+          python3 /tmp/ui_probe.py 2>&1 | tee artifacts/ui-probe-console.txt
+          adb shell pidof com.kwai.video | tee artifacts/pid.txt || true
+          adb logcat -d -t 1500 > artifacts/logcat.txt || true
           SH
           chmod +x /tmp/test-api35.sh
 
-      - name: Boot Android 15 and try ARM-translated Kwai
+      - name: Boot Android 15 and test ARM64-translated Kwai
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         with:
           api-level: 35
@@ -95,10 +193,10 @@ jobs:
           profile: pixel_6
           cores: 2
           ram-size: 3072M
-          heap-size: 512M
+          heap-size: 768M
           emulator-boot-timeout: 600
           disable-animations: true
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
           script: bash /tmp/test-api35.sh
 
       - name: Summary
@@ -106,19 +204,23 @@ jobs:
         shell: bash
         run: |
           {
-            echo '## Android 15 ARM translation test'
-            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: inspect diagnostics.'
+            echo '## Android 15 ARM64 translation test'
+            cat artifacts/result.txt 2>/dev/null || echo 'FAIL: install/launch did not finish.'
             echo
+            cat artifacts/source.txt 2>/dev/null || true
             cat artifacts/abi.txt 2>/dev/null || true
             cat artifacts/cert-check.txt 2>/dev/null || true
             cat artifacts/install-result.txt 2>/dev/null || true
+            cat artifacts/installed-version.txt 2>/dev/null || true
+            echo
+            echo 'No phone number, SMS code, Kwai account login, or publication attempted.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: kwai-api35-${{ github.run_id }}
+          name: kwai-api35-arm64-${{ github.run_id }}
           path: artifacts/
           if-no-files-found: error
           retention-days: 1
