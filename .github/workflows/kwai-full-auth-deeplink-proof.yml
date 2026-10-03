@@ -1,0 +1,118 @@
+name: Kwai full auth deeplink proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-full-auth-deeplink-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  full-auth-deeplink:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Prepare current verified bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib,shlex
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}; sp=(m.get('aab') or {}).get('splits') or []
+          abi=next(s for s in sp if s.get('type')=='ABI' and 'arm64' in (s.get('name') or '').lower())
+          den=next((s for s in sp if s.get('type')=='DENSITY' and 'mdpi' in (s.get('name') or '').lower()), next(s for s in sp if s.get('type')=='DENSITY'))
+          vals={'BASE':f.get('path') or f.get('path_alt'),'MD5':f.get('md5sum'),'ABI':abi.get('path'),'DEN':den.get('path'),'VER':f.get('vername')}
+          pathlib.Path('/tmp/e').write_text('\n'.join(f'{k}={shlex.quote(str(v))}' for k,v in vals.items())+'\n')
+          pathlib.Path('artifacts/source.txt').write_text('\n'.join(f'{k}={v}' for k,v in vals.items())+'\n')
+          PY
+          source /tmp/e
+          curl -fL "$BASE" -o /tmp/kwai/base.apk
+          curl -fL "$ABI" -o /tmp/kwai/abi.apk
+          curl -fL "$DEN" -o /tmp/kwai/den.apk
+          curl -LsS "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${MD5}/language=pt_PT" -o /tmp/d.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/d.json',encoding='utf-8'))
+          x=next((x for x in d.get('list',[]) if x.get('type')=='FEATURE' and x.get('path')),None)
+          if x: pathlib.Path('/tmp/feature-url').write_text(x['path'])
+          PY
+          if [ -s /tmp/feature-url ]; then curl -fL "$(cat /tmp/feature-url)" -o /tmp/kwai/feature.apk; fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/test.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != 1 ]; do sleep 2; done
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BT/apksigner" verify --print-certs /tmp/kwai/base.apk > artifacts/cert.txt 2>&1
+          grep -qi 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047' artifacts/cert.txt
+          APKS=(/tmp/kwai/base.apk /tmp/kwai/abi.apk /tmp/kwai/den.apk)
+          [ -f /tmp/kwai/feature.apk ] && APKS+=(/tmp/kwai/feature.apk)
+          adb install-multiple -r "${APKS[@]}" | tee artifacts/install.txt
+          adb shell pm grant com.kwai.video android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+          mkdir -p artifacts/ui
+
+          capture() {
+            tag="$1"
+            adb shell uiautomator dump /sdcard/u.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/u.xml "artifacts/ui/${tag}.xml" >/dev/null 2>&1 || true
+            adb exec-out screencap -p > "artifacts/ui/${tag}.png"
+            python3 - "$tag" <<'PY'
+          import sys,xml.etree.ElementTree as ET,pathlib
+          tag=sys.argv[1]; p=pathlib.Path('artifacts/ui')/f'{tag}.xml'; vals=[]
+          try:
+            r=ET.parse(p).getroot()
+            for n in r.iter('node'):
+              t=' | '.join(x for x in [n.attrib.get('text','').strip(),n.attrib.get('content-desc','').strip(),n.attrib.get('resource-id','').strip(),n.attrib.get('class','').strip()] if x)
+              if t and t not in vals: vals.append(t)
+          except Exception as e: vals.append('PARSE_ERROR '+repr(e))
+          (pathlib.Path('artifacts/ui')/f'{tag}.txt').write_text('\n'.join(vals),encoding='utf-8')
+          PY
+          }
+
+          for item in 'ikwai://authorization' 'kwai://authorization'; do
+            tag="$(echo "$item" | tr -cs 'A-Za-z0-9' '_')"
+            adb shell am force-stop com.kwai.video || true
+            adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$item" com.kwai.video > "artifacts/${tag}-am.txt" 2>&1 || true
+            sleep 8
+            capture "$tag"
+            adb shell dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity|com.kwai.video' | tail -n 30 > "artifacts/${tag}-activity.txt" || true
+          done
+
+          cat artifacts/ui/*.txt
+          adb logcat -d -t 2000 > artifacts/logcat.txt || true
+          SH
+          chmod +x /tmp/test.sh
+
+      - name: Boot Android 14 and test official auth deeplinks
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/test.sh
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-full-auth-deeplink-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
