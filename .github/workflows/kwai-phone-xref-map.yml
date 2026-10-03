@@ -1,0 +1,139 @@
+name: Kwai phone login xref map
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-phone-xref-map.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  xref-map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Download current Kwai and trace phone-login string references
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai/apks /tmp/kwai/dex
+
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
+
+          python3 - <<'PY'
+          import json,pathlib,re
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}
+          splits=(m.get('aab') or {}).get('splits') or []
+          pathlib.Path('artifacts/version.txt').write_text(
+              f"version={f.get('vername')}\nversionCode={f.get('vercode')}\n", encoding='utf-8')
+          with open('/tmp/urls.tsv','w',encoding='utf-8') as out:
+              base=f.get('path') or f.get('path_alt')
+              if base:
+                  out.write('base\tBASE\tbase\t'+base+'\n')
+              for i,s in enumerate(splits):
+                  if not isinstance(s,dict):
+                      continue
+                  url=s.get('path') or s.get('path_alt')
+                  if not isinstance(url,str) or not url.startswith('http'):
+                      continue
+                  name=str(s.get('name') or f'split{i}')
+                  typ=str(s.get('type') or 'SPLIT')
+                  safe=re.sub(r'[^A-Za-z0-9_.-]+','_',name)[:80]
+                  out.write(f'{i}\t{typ}\t{safe}\t{url}\n')
+          PY
+
+          while IFS=$'\t' read -r idx typ name url; do
+            out="/tmp/kwai/apks/${idx}-${typ}-${name}.apk"
+            echo "Downloading $idx type=$typ name=$name"
+            curl -fL --retry 3 --retry-delay 2 "$url" -o "$out" || rm -f "$out"
+          done < /tmp/urls.tsv
+
+          DEXDUMP="$(find "$ANDROID_HOME/build-tools" -type f -name dexdump | sort -V | tail -1)"
+          test -x "$DEXDUMP"
+          echo "dexdump=$DEXDUMP" > artifacts/tooling.txt
+
+          : > artifacts/phone-xrefs.txt
+          : > artifacts/phone-context.txt
+          : > artifacts/all-phone-markers.txt
+
+          MARKERS='PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|PHONE_LOGIN_NEW|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|INPUT_PHONE_NUMBER_LOGIN_OPTIMIZED_PAGE|PHONE_ONE_KEY_LOGIN_OPTIMIZED_PAGE|PURE_PHONE_QUICK_LOGIN|SIGNUP_PHONE|BIND_PHONE_SUCCESS_LOGIN_EXCEPTION|CHINA_MOBILE_QUICK_LOGIN_VALIDATION|IPHONE_QUICK_LOGIN|AUTHORIZED_IPHONE_QUICK_LOGIN'
+
+          for apk in /tmp/kwai/apks/*.apk; do
+            [ -f "$apk" ] || continue
+            apkbase="$(basename "$apk" .apk)"
+            work="/tmp/kwai/dex/$apkbase"
+            mkdir -p "$work"
+            unzip -qq "$apk" 'classes*.dex' -d "$work" 2>/dev/null || true
+            for dex in "$work"/classes*.dex; do
+              [ -f "$dex" ] || continue
+              dexbase="$(basename "$dex")"
+              dump="$work/${dexbase}.dump.txt"
+              echo "Dexdump $apkbase/$dexbase"
+              "$DEXDUMP" -d "$dex" > "$dump" 2>/dev/null || "$DEXDUMP" "$dex" > "$dump" 2>/dev/null || true
+
+              if grep -Eq "$MARKERS" "$dump"; then
+                {
+                  echo "===== $apkbase :: $dexbase ====="
+                  grep -En -B 80 -A 25 "$MARKERS" "$dump" || true
+                } >> artifacts/phone-context.txt
+              fi
+
+              # Keep string-only evidence too, in case dexdump formatting varies.
+              strings "$dex" | grep -E "$MARKERS" | sort -u | sed "s#^#${apkbase} :: ${dexbase} :: #" >> artifacts/all-phone-markers.txt || true
+            done
+          done
+
+          python3 - <<'PY'
+          import pathlib,re
+          src=pathlib.Path('artifacts/phone-context.txt')
+          text=src.read_text(encoding='utf-8',errors='replace') if src.exists() else ''
+          markers=re.compile(r'PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|PHONE_LOGIN_NEW|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|INPUT_PHONE_NUMBER_LOGIN_OPTIMIZED_PAGE|PHONE_ONE_KEY_LOGIN_OPTIMIZED_PAGE|PURE_PHONE_QUICK_LOGIN|SIGNUP_PHONE|BIND_PHONE_SUCCESS_LOGIN_EXCEPTION|CHINA_MOBILE_QUICK_LOGIN_VALIDATION|IPHONE_QUICK_LOGIN|AUTHORIZED_IPHONE_QUICK_LOGIN')
+          lines=text.splitlines()
+          out=[]
+          current_file=''
+          for i,line in enumerate(lines):
+              if line.startswith('===== '):
+                  current_file=line
+              if not markers.search(line):
+                  continue
+              start=max(0,i-80)
+              window=lines[start:i+1]
+              cls=''
+              method=''
+              for w in reversed(window):
+                  # Common dexdump class/method headers.
+                  if not method and re.search(r"name\s*:|'[A-Za-z0-9_$<>]+'|method",w,re.I):
+                      if any(k in w.lower() for k in ('name','method')):
+                          method=w.strip()
+                  if not cls and ('Class descriptor' in w or 'Class #' in w or 'class_idx' in w):
+                      cls=w.strip()
+                  if cls and method:
+                      break
+              out.append(current_file)
+              out.append('marker: '+line.strip())
+              if cls: out.append('class: '+cls)
+              if method: out.append('method: '+method)
+              out.append('---')
+          pathlib.Path('artifacts/phone-xrefs.txt').write_text('\n'.join(out)+('\n' if out else ''),encoding='utf-8')
+          PY
+
+          echo '--- phone markers found ---'
+          cat artifacts/all-phone-markers.txt || true
+          echo '--- extracted xrefs ---'
+          cat artifacts/phone-xrefs.txt || true
+          echo '--- focused dexdump context (first 1200 lines) ---'
+          head -n 1200 artifacts/phone-context.txt || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-phone-xref-map-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
