@@ -20,7 +20,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts /tmp/apks /tmp/jadx-out
-          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions,aab=1/language=pt_PT/country=br'
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
           curl -LsS "$API" -o /tmp/meta.json
           python3 - <<'PY'
           import json,pathlib
