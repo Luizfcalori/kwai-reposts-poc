@@ -1,0 +1,77 @@
+name: Kwai current split map
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-split-map.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  split-map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Map all bundle and dynamic splits
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o artifacts/meta.json
+          python3 - <<'PY'
+          import json, pathlib
+          d=json.load(open('artifacts/meta.json',encoding='utf-8'))
+          meta=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=meta.get('file') or {}
+          aab=meta.get('aab') or {}
+          out=[]
+          out.append(f"version={f.get('vername')}")
+          out.append(f"versionCode={f.get('vercode')}")
+          out.append(f"base_md5={f.get('md5sum')}")
+          out.append('')
+          out.append('=== AAB SPLITS ===')
+          for i,s in enumerate(aab.get('splits') or []):
+              out.append(f"[{i}] name={s.get('name')} type={s.get('type')} size={s.get('filesize') or s.get('size')} md5={s.get('md5sum')} path={s.get('path')}")
+              for k in sorted(s):
+                  if k not in {'name','type','filesize','size','md5sum','path'}:
+                      out.append(f"    {k}={s.get(k)}")
+          pathlib.Path('artifacts/aab-splits.txt').write_text('\n'.join(out)+'\n',encoding='utf-8')
+          pathlib.Path('/tmp/base-md5').write_text(str(f.get('md5sum') or ''))
+          PY
+
+          MD5="$(cat /tmp/base-md5)"
+          for LANG in pt_PT pt_BR en_US; do
+            curl -LsS --retry 4 --retry-delay 2 \
+              "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${MD5}/language=${LANG}" \
+              -o "artifacts/dynamic-${LANG}.json"
+            LANG="$LANG" python3 - <<'PY'
+          import json, os, pathlib
+          lang=os.environ['LANG']
+          p=pathlib.Path(f'artifacts/dynamic-{lang}.json')
+          d=json.load(open(p,encoding='utf-8'))
+          lines=[f'=== DYNAMIC SPLITS {lang} ===']
+          for i,x in enumerate(d.get('list') or []):
+              lines.append(f"[{i}] name={x.get('name')} type={x.get('type')} size={x.get('filesize') or x.get('size')} md5={x.get('md5sum')} path={x.get('path')}")
+              for k in sorted(x):
+                  if k not in {'name','type','filesize','size','md5sum','path'}:
+                      lines.append(f"    {k}={x.get(k)}")
+          pathlib.Path(f'artifacts/dynamic-{lang}.txt').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          PY
+          done
+
+          cat artifacts/aab-splits.txt
+          cat artifacts/dynamic-pt_PT.txt
+          cat artifacts/dynamic-pt_BR.txt
+          cat artifacts/dynamic-en_US.txt
+
+      - name: Upload split map
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-split-map-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
