@@ -1,0 +1,99 @@
+name: Kwai TinyLogin caller xref
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-tiny-login-xref.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  tiny-login-xref:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download current Kwai base
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai /tmp/jadx
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}
+          url=f.get('path') or f.get('path_alt') or ''
+          if not url: raise SystemExit('missing base url')
+          pathlib.Path('/tmp/base-url').write_text(url)
+          pathlib.Path('artifacts/version.txt').write_text(f"version={f.get('vername')}\nversionCode={f.get('vercode')}\n")
+          PY
+          curl -fL "$(cat /tmp/base-url)" -o /tmp/kwai/base.apk
+
+      - name: Install JADX and decompile
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="$(curl -LsS https://api.github.com/repos/skylot/jadx/releases/latest | jq -r '.assets[] | select(.name|test("jadx-[0-9].*\\.zip$")) | .browser_download_url' | head -1)"
+          curl -fL "$URL" -o /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx-bin
+          set +e
+          timeout 600 /tmp/jadx-bin/bin/jadx --show-bad-code -d /tmp/jadx /tmp/kwai/base.apk > artifacts/jadx-console.txt 2>&1
+          echo "jadx_rc=$?" > artifacts/result.txt
+          set -e
+
+      - name: Map TinyLoginActivity construction and mode flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=/tmp/jadx/sources
+          RES=/tmp/jadx/resources
+          test -d "$SRC"
+
+          PATTERN='TinyLoginActivity|TinyGoogleSSOActivity|tiny_google_login_platform_item|tiny_login_content_container|tiny_login_label|tiny_login_sub_label|Continue with Google|phone.?login|login.?phone|mobile.?login|login.?mobile|login.?type|login.?mode|auth.?type|platform.?item|force.?login|LOGIN_TYPE|LOGIN_MODE'
+          grep -RInEi "$PATTERN" "$SRC" "$RES" > artifacts/tiny-login-all-hits.txt || true
+
+          python3 - <<'PY'
+          import pathlib,re
+          roots=[pathlib.Path('/tmp/jadx/sources'), pathlib.Path('/tmp/jadx/resources')]
+          rx=re.compile(r'TinyLoginActivity|TinyGoogleSSOActivity|tiny_google_login_platform_item|tiny_login_content_container|Continue with Google|phone.?login|login.?phone|mobile.?login|login.?mobile|login.?type|login.?mode|auth.?type|force.?login|LOGIN_TYPE|LOGIN_MODE',re.I)
+          out=[]; files=[]
+          for root in roots:
+            if not root.exists(): continue
+            for p in root.rglob('*'):
+              if not p.is_file(): continue
+              try: text=p.read_text(errors='ignore')
+              except Exception: continue
+              if not rx.search(text): continue
+              files.append(str(p.relative_to(root)))
+              lines=text.splitlines()
+              for i,line in enumerate(lines):
+                if rx.search(line):
+                  a=max(0,i-60); b=min(len(lines),i+61)
+                  out.append(f'===== {root.name}/{p.relative_to(root)}:{i+1} =====')
+                  out.extend(f'{n+1:06d}: {lines[n]}' for n in range(a,b))
+          pathlib.Path('artifacts/tiny-login-context.txt').write_text('\n'.join(out),encoding='utf-8')
+          pathlib.Path('artifacts/tiny-login-hit-files.txt').write_text('\n'.join(sorted(set(files))),encoding='utf-8')
+          PY
+
+          # Extract likely Intent extra names and login-related string constants near TinyLogin code.
+          grep -RInE 'putExtra\(|get.*Extra\(|getIntent\(|TinyLoginActivity' "$SRC" | grep -Ei 'login|auth|phone|mobile|platform|tiny|source|type|mode|scene' > artifacts/tiny-login-intent-extra-hits.txt || true
+
+          echo '--- TinyLogin files ---'
+          cat artifacts/tiny-login-hit-files.txt || true
+          echo '--- Intent/extra candidates ---'
+          head -n 500 artifacts/tiny-login-intent-extra-hits.txt || true
+          echo '--- Direct TinyLogin refs ---'
+          grep -Ei 'TinyLoginActivity|TinyGoogleSSOActivity|tiny_google_login_platform_item|Continue with Google' artifacts/tiny-login-all-hits.txt | head -n 500 || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-tiny-login-xref-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
