@@ -57,8 +57,10 @@ jobs:
           src=Path('/tmp/jadx-out/sources')
           needles=[
             'PHONE_NUMBER_LOGIN_PAGE','PHONE_LOGIN_NEW','PURE_PHONE_QUICK_LOGIN','CLICK_PHONE_LOGIN',
-            'PhoneAccountActivityV2','ForcePhoneRegisterActivity','buildLoginIntent','inject_kwai_force_login',
-            'setUriRouterUrl','getUrlFromRouter','KwaiAuthActivity','UriRouterActivity'
+            'SIGNUP_PHONE','INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS','PHONE_ONE_KEY_LOGIN_OPTIMIZED_PAGE',
+            'PhoneAccountActivityV2','PhoneAccountActivity','PhoneVerifyActivity','ForcePhoneRegisterActivity',
+            'buildLoginIntent','inject_kwai_force_login','setUriRouterUrl','getUrlFromRouter',
+            'KwaiAuthActivity','UriRouterActivity'
           ]
           hits=[]
           files=[]
@@ -87,10 +89,9 @@ jobs:
               out.append('---')
           Path('artifacts/login-trace-excerpts.txt').write_text('\n'.join(out),encoding='utf-8')
 
-          # Extra search for URI literals near login-related code.
           uri=[]
           for p,found,s in files:
-            for m in re.finditer(r'"([^"\\]*(?:ikwai|kwai|login|phone)[^"\\]*)"',s,re.I):
+            for m in re.finditer(r'"([^"\\]*(?:ikwai|kwai|login|phone|signup)[^"\\]*)"',s,re.I):
               val=m.group(1)
               if len(val)<240: uri.append(f'{p}: {val}')
           Path('artifacts/login-uri-literals.txt').write_text('\n'.join(dict.fromkeys(uri)),encoding='utf-8')
@@ -99,9 +100,9 @@ jobs:
           PY
 
           echo '=== strongest hit files ==='
-          grep -Eai 'PhoneAccountActivityV2|buildLoginIntent|inject_kwai_force_login|PHONE_NUMBER_LOGIN_PAGE|UriRouterActivity' artifacts/hit-files.txt | head -n 120 || true
+          grep -Eai 'PhoneAccountActivity|PhoneVerifyActivity|ForcePhoneRegisterActivity|buildLoginIntent|inject_kwai_force_login|PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|SIGNUP_PHONE|UriRouterActivity' artifacts/hit-files.txt | head -n 160 || true
           echo '=== uri literals ==='
-          grep -Eai 'ikwai|kwai|phone|login' artifacts/login-uri-literals.txt | head -n 160 || true
+          grep -Eai 'ikwai|kwai|phone|login|signup' artifacts/login-uri-literals.txt | head -n 220 || true
 
       - name: Upload trace
         if: always()
