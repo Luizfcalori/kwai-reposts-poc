@@ -1,0 +1,100 @@
+name: Kwai phone login route proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-phone-route-proof.yml'
+      - 'scripts/kwai_phone_route_probe.py'
+      - 'scripts/kwai_ui_probe.py'
+      - 'scripts/kwai_ui_probe_confirm.py'
+
+permissions:
+  contents: read
+
+jobs:
+  phone-route-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Prepare KVM and Kwai package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts apks
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
+            -a com.kwai.video -d apk-pure \
+            -o 'acknowledge_dangers=true,arch=x86_64;x86' /output \
+            2>&1 | tee artifacts/download.txt
+
+          cat > /tmp/install-phone-route.sh <<'SH'
+          set -euo pipefail
+          EXPECTED_CERT='bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+          mkdir -p artifacts/ui artifacts/phone-route /tmp/kwai-package
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+
+          BUNDLE="$(find apks -maxdepth 1 -type f | head -n1)"
+          case "$BUNDLE" in
+            *.xapk|*.zip) unzip -q "$BUNDLE" -d /tmp/kwai-package ;;
+            *.apk) cp "$BUNDLE" /tmp/kwai-package/base.apk ;;
+            *) echo "Unsupported package: $BUNDLE"; exit 1 ;;
+          esac
+
+          mapfile -d '' APKS < <(find /tmp/kwai-package -type f -name '*.apk' -print0)
+          test "${#APKS[@]}" -gt 0
+          APKSIGNER="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -type f -name apksigner 2>/dev/null | sort -V | tail -n1)"
+          test -n "$APKSIGNER"
+          for apk in "${APKS[@]}"; do
+            CERT_OUTPUT="$($APKSIGNER verify --print-certs "$apk" 2>&1)"
+            CERT="$(printf '%s\n' "$CERT_OUTPUT" | sed -n -E 's/^(V[0-9.]+ Signer|Signer #[0-9]+): certificate SHA-256 digest: //p' | sed -n '1p' | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
+            test "$CERT" = "$EXPECTED_CERT"
+          done
+
+          adb install-multiple -r "${APKS[@]}"
+          python3 scripts/kwai_ui_probe_confirm.py 2>&1 | tee artifacts/ui-probe-console.txt
+          python3 scripts/kwai_phone_route_probe.py 2>&1 | tee artifacts/phone-route-console.txt
+          SH
+          chmod +x /tmp/install-phone-route.sh
+
+      - name: Boot Android and prove phone route
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/install-phone-route.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai phone login route proof'
+            cat artifacts/phone-route-result.txt 2>/dev/null || echo 'Phone route result not produced.'
+            echo
+            echo 'No phone number, OTP, password, upload, or publication was attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload safe UI evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-phone-route-proof-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
