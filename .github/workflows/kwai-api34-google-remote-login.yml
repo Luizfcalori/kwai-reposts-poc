@@ -9,6 +9,7 @@ on:
 permissions:
   contents: read
 
+# Re-run marker: protected login after KWAI_REMOTE_EMAIL configuration.
 jobs:
   remote-google-login-api34:
     runs-on: ubuntu-latest
@@ -126,7 +127,6 @@ jobs:
           adb install-multiple -r "${APKS[@]}"
           adb shell pm grant com.kwai.video android.permission.POST_NOTIFICATIONS 2>/dev/null || true
 
-          # Navigate automatically only to the already-proven Google authentication surface.
           set +e
           python3 scripts/kwai_google_login_probe.py
           PROBE_RC=$?
@@ -135,7 +135,6 @@ jobs:
           echo 'REMOTE_LOGIN_READY'
           echo 'Use the protected noVNC URL from the job summary to complete Google sign-in yourself.'
 
-          # Wait for the user to finish Google sign-in. Never type or capture credentials here.
           GOOGLE_ACCOUNT=false
           KWAI_RETURNED=false
           for _ in $(seq 1 120); do
