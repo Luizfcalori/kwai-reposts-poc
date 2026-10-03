@@ -1,0 +1,97 @@
+name: Kwai Aptoide AAB probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-aptoide-aab-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Query Aptoide app and AAB metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions,aab/language=pt_BR/country=br'
+          curl -fLsS --retry 3 --retry-delay 2 "$API" -o "$RUNNER_TEMP/kwai.json"
+          python3 - "$RUNNER_TEMP/kwai.json" <<'PY'
+          import json,sys,pathlib
+          data=json.load(open(sys.argv[1],encoding='utf-8'))
+          pathlib.Path('artifacts/status.txt').write_text('info_status='+str(data.get('info',{}).get('status'))+'\n')
+          nodes=data.get('nodes') or {}
+          meta=((nodes.get('meta') or {}).get('data') or {})
+          f=meta.get('file') or {}
+          aab=meta.get('aab') or nodes.get('aab') or {}
+          lines=[
+              f"package={meta.get('package')}",
+              f"name={meta.get('name')}",
+              f"version={f.get('vername')}",
+              f"vercode={f.get('vercode')}",
+              f"base_size={f.get('filesize') or f.get('size') or meta.get('size')}",
+              f"base_md5={f.get('md5sum')}",
+              f"base_path_present={bool(f.get('path') or f.get('path_alt'))}",
+              f"meta_aab_type={type(meta.get('aab')).__name__}",
+              f"nodes={','.join(sorted(nodes.keys()))}",
+          ]
+          pathlib.Path('artifacts/meta.txt').write_text('\n'.join(lines)+'\n')
+
+          def walk(obj,prefix=''):
+              out=[]
+              if isinstance(obj,dict):
+                  for k,v in obj.items():
+                      p=f'{prefix}.{k}' if prefix else k
+                      if isinstance(v,(dict,list)):
+                          out.extend(walk(v,p))
+                      elif any(x in k.lower() for x in ('path','name','type','size','md5','split','ver')):
+                          out.append((p,str(v)))
+              elif isinstance(obj,list):
+                  for i,v in enumerate(obj):
+                      out.extend(walk(v,f'{prefix}[{i}]'))
+              return out
+          structural=walk({'meta_aab':meta.get('aab'),'node_aab':nodes.get('aab')})
+          pathlib.Path('artifacts/aab-structure.txt').write_text('\n'.join(f'{k}={v}' for k,v in structural)+'\n')
+
+          versions=(nodes.get('versions') or {}).get('list') or (nodes.get('versions') or {}).get('datalist',{}).get('list') or []
+          vlines=[]
+          for v in versions[:100]:
+              vf=v.get('file') or {}
+              vlines.append(f"{vf.get('vername')}\t{vf.get('vercode')}\t{vf.get('filesize') or vf.get('size') or v.get('size')}\t{vf.get('md5sum')}\tpath={bool(vf.get('path') or vf.get('path_alt'))}")
+          pathlib.Path('artifacts/versions.txt').write_text('\n'.join(vlines)+'\n')
+
+          blob=json.dumps({'meta_aab':meta.get('aab'),'node_aab':nodes.get('aab')},ensure_ascii=False).lower()
+          full=any(x in blob for x in ('basis_extension','basis.config','"basis"'))
+          pathlib.Path('artifacts/result.txt').write_text(f'FULL_DYNAMIC_FEATURES_PRESENT={str(full).lower()}\n')
+          print('\n'.join(lines))
+          print(f'FULL_DYNAMIC_FEATURES_PRESENT={str(full).lower()}')
+          PY
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Aptoide AAB probe'
+            cat artifacts/status.txt 2>/dev/null || true
+            cat artifacts/meta.txt 2>/dev/null || true
+            cat artifacts/result.txt 2>/dev/null || true
+            echo 'AAB structure:'
+            head -n 80 artifacts/aab-structure.txt 2>/dev/null || true
+            echo 'Known versions:'
+            head -n 30 artifacts/versions.txt 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-aptoide-aab-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
