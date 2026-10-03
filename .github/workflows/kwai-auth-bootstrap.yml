@@ -1,0 +1,115 @@
+name: Kwai secure auth bootstrap
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  auth-bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      KWAI_GOOGLE_EMAIL: ${{ secrets.KWAI_GOOGLE_EMAIL }}
+      KWAI_GOOGLE_PASSWORD: ${{ secrets.KWAI_GOOGLE_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Prepare KVM and verified Kwai package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts apks
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
+            -a com.kwai.video -d apk-pure \
+            -o 'acknowledge_dangers=true,arch=x86_64;x86' /output \
+            2>&1 | tee artifacts/download.txt
+
+          cat > /tmp/install-auth-bootstrap.sh <<'SH'
+          set -euo pipefail
+          EXPECTED_CERT='bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+          mkdir -p artifacts/ui artifacts/google artifacts/auth-bootstrap /tmp/kwai-package
+
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+
+          BUNDLE="$(find apks -maxdepth 1 -type f | head -n1)"
+          case "$BUNDLE" in
+            *.xapk|*.zip) unzip -q "$BUNDLE" -d /tmp/kwai-package ;;
+            *.apk) cp "$BUNDLE" /tmp/kwai-package/base.apk ;;
+            *) echo "Unsupported package: $BUNDLE"; exit 1 ;;
+          esac
+
+          mapfile -d '' APKS < <(find /tmp/kwai-package -type f -name '*.apk' -print0)
+          test "${#APKS[@]}" -gt 0
+
+          APKSIGNER="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -type f -name apksigner 2>/dev/null | sort -V | tail -n1)"
+          test -n "$APKSIGNER"
+          : > artifacts/verified-signers.txt
+          for apk in "${APKS[@]}"; do
+            CERT_OUTPUT="$($APKSIGNER verify --print-certs "$apk" 2>&1)"
+            CERT="$(printf '%s\n' "$CERT_OUTPUT" \
+              | sed -n -E 's/^(V[0-9.]+ Signer|Signer #[0-9]+): certificate SHA-256 digest: //p' \
+              | sed -n '1p' | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
+            echo "$apk $CERT" | tee -a artifacts/verified-signers.txt
+            test "$CERT" = "$EXPECTED_CERT"
+          done
+
+          adb install-multiple -r "${APKS[@]}" 2>&1 | tee artifacts/install.txt
+          adb shell dumpsys package com.kwai.video \
+            | grep -E 'versionName=|versionCode=|primaryCpuAbi=|secondaryCpuAbi=' \
+            | head -n 20 | tee artifacts/installed-package.txt || true
+
+          python3 scripts/kwai_ui_probe_confirm.py 2>&1 | tee artifacts/ui-probe-console.txt
+          python3 scripts/kwai_google_auth_bootstrap.py 2>&1 | tee artifacts/auth-bootstrap-console.txt
+          adb exec-out screencap -p > artifacts/final-screen.png || true
+          SH
+          chmod +x /tmp/install-auth-bootstrap.sh
+
+      - name: Boot Android and authenticate Kwai
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/install-auth-bootstrap.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai secure auth bootstrap'
+            echo
+            cat artifacts/installed-package.txt 2>/dev/null || true
+            echo
+            cat artifacts/ui-result.txt 2>/dev/null || true
+            echo
+            cat artifacts/auth-bootstrap-result.txt 2>/dev/null || echo 'Auth result not produced.'
+            echo
+            echo 'Credentials are read only from GitHub Actions Secrets and are never written to repository files or artifacts.'
+            echo 'If Google requests 2FA/manual verification, the workflow stops instead of trying to bypass the challenge.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-auth-bootstrap-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
