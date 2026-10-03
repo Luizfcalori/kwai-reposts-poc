@@ -45,7 +45,6 @@ jobs:
           echo "intermediate_resolved=true" | tee artifacts/resolution.txt
 
           curl -fsSL --retry 3 --retry-delay 2 -A "$UA" -e "$PAGE" -c "$JAR" -b "$JAR" "$INTERMEDIATE" -o "$RUNNER_TEMP/intermediate.html"
-          # APKMirror intentionally delays free downloads on this page.
           sleep 17
           python3 - "$RUNNER_TEMP/intermediate.html" > "$RUNNER_TEMP/final.txt" <<'PY'
           import html,re,sys
@@ -99,3 +98,5 @@ jobs:
           path: artifacts/
           if-no-files-found: warn
           retention-days: 1
+
+# rerun marker: 2026-10-03T15:15Z
