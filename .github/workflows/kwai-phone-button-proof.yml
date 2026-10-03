@@ -1,0 +1,149 @@
+name: Kwai current Phone button proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-phone-button-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  phone-button:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Download and verify exact current Kwai
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts apks /tmp/kwai
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
+            -a 'com.kwai.kuaishou.video.live@13.8.30.646601' -d apk-pure \
+            -o 'acknowledge_dangers=true,arch=arm64-v8a' /output \
+            2>&1 | tee artifacts/download.txt
+
+          BUNDLE="$(find apks -maxdepth 1 -type f | head -n1)"
+          unzip -q "$BUNDLE" -d /tmp/kwai
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          : > artifacts/certificates.txt
+          while IFS= read -r apk; do
+            "$BT/apksigner" verify --print-certs "$apk" > /tmp/cert.txt 2>&1
+            CERT="$(awk -F': ' '/certificate SHA-256 digest:/{print tolower($NF); exit}' /tmp/cert.txt | tr -d '[:space:]')"
+            echo "$(basename "$apk") $CERT" >> artifacts/certificates.txt
+            test "$CERT" = '588774ea798843484c7100da2450005090522fda0dcb64be01c04079349c0acc'
+          done < <(find /tmp/kwai -type f -name '*.apk' | sort)
+
+          "$BT/aapt" dump badging /tmp/kwai/com.kwai.kuaishou.video.live.apk | head -n1 | tee artifacts/base-badging.txt
+          grep -q "versionName='13.8.30.646601'" artifacts/base-badging.txt
+
+          cat > /tmp/phone-proof.py <<'PY'
+          import pathlib,re,subprocess,time,xml.etree.ElementTree as ET
+          A=pathlib.Path('artifacts/ui'); A.mkdir(parents=True,exist_ok=True)
+          def adb(*a): return subprocess.run(['adb',*a],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+          def dump(tag):
+              adb('shell','uiautomator','dump','/sdcard/u.xml'); adb('pull','/sdcard/u.xml',str(A/f'{tag}.xml'))
+              with open(A/f'{tag}.png','wb') as f: subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
+              root=ET.parse(A/f'{tag}.xml').getroot(); texts=[]
+              for n in root.iter('node'):
+                  for k in ('text','content-desc','hint'):
+                      v=(n.attrib.get(k) or '').strip()
+                      if v and v not in texts: texts.append(v)
+              (A/f'{tag}.txt').write_text('\n'.join(texts),encoding='utf-8')
+              return root,texts
+          def center(bounds):
+              m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',bounds or '')
+              if not m:return None
+              x1,y1,x2,y2=map(int,m.groups()); return (x1+x2)//2,(y1+y2)//2
+          def tap_match(root,patterns):
+              rx=[re.compile(p,re.I) for p in patterns]
+              for n in root.iter('node'):
+                  s=' '.join(x for x in [n.attrib.get('text',''),n.attrib.get('content-desc',''),n.attrib.get('hint','')] if x).strip()
+                  if s and any(r.search(s) for r in rx):
+                      p=center(n.attrib.get('bounds',''))
+                      if p:
+                          print('TAP',repr(s),p); adb('shell','input','tap',str(p[0]),str(p[1])); time.sleep(4); return True
+              return False
+          def phone_field(root,texts):
+              joined='\n'.join(texts)
+              if any(re.search(p,joined,re.I) for p in [r'phone number',r'mobile number',r'country code',r'get code',r'send code',r'verification code',r'n[uú]mero de telefone',r'c[oó]digo de verifica',r'sms code']): return True
+              for n in root.iter('node'):
+                  if n.attrib.get('class')=='android.widget.EditText': return True
+              return False
+
+          time.sleep(15)
+          root,texts=dump('00-launch')
+          for i in range(1,18):
+              if phone_field(root,texts): break
+              # Clear only safe first-run controls.
+              if tap_match(root,[r'^Allow$',r'^Permitir$',r'^Not now$',r'^Skip$',r'^Pular$',r'^Agree$',r'^Aceitar$',r'^Continue$',r'^Start now$',r'^Got it$']):
+                  root,texts=dump(f'01-safe-{i:02d}'); continue
+              # If the login screen already exposes Phone, click it BEFORE Profile.
+              if tap_match(root,[r'(^|\||\s)Phone$',r'^Telefone$',r'^Celular$',r'usar.*telefone',r'phone login']):
+                  root,texts=dump(f'02-phone-click-{i:02d}')
+                  if phone_field(root,texts): break
+                  continue
+              # Reach the login screen through Profile.
+              if tap_match(root,[r'^Profile$',r'^Perfil$',r'^Me$',r'^Eu$']):
+                  root,texts=dump(f'03-profile-{i:02d}'); continue
+              adb('shell','input','tap','1000','2290'); time.sleep(4)
+              root,texts=dump(f'04-bottom-profile-{i:02d}')
+
+          ok=phone_field(root,texts)
+          pathlib.Path('artifacts/result.txt').write_text(
+              'status=' + ('phone_field_visible' if ok else 'phone_field_not_reached') + '\n' +
+              'final_texts=' + ' | '.join(texts[:50]) + '\n', encoding='utf-8')
+          print('RESULT', 'phone_field_visible' if ok else 'phone_field_not_reached')
+          raise SystemExit(0 if ok else 7)
+          PY
+
+          cat > /tmp/run.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != '1' ]; do sleep 2; done
+          mapfile -d '' APKS < <(find /tmp/kwai -type f -name '*.apk' -print0)
+          adb install-multiple -r "${APKS[@]}" | tee artifacts/install.txt
+          adb shell pm grant com.kwai.kuaishou.video.live android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+          adb shell appops set com.kwai.kuaishou.video.live POST_NOTIFICATION allow 2>/dev/null || true
+          adb shell monkey -p com.kwai.kuaishou.video.live -c android.intent.category.LAUNCHER 1 >/dev/null
+          python3 /tmp/phone-proof.py 2>&1 | tee artifacts/probe-console.txt
+          SH
+          chmod +x /tmp/run.sh
+
+      - name: Boot Android 14 and click Phone
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/run.sh
+
+      - name: Summary
+        if: always()
+        run: |
+          cat artifacts/result.txt 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          echo 'No phone number, OTP, password, login, upload, or publication attempted.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-phone-button-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
