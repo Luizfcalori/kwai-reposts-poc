@@ -1,0 +1,91 @@
+name: Kwai basis split delivery trace
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-basis-split-trace.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  trace-basis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download current base and feature
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/apks /tmp/jadx-out
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          f=((((d.get('nodes') or {}).get('meta') or {}).get('data') or {}).get('file') or {})
+          u=f.get('path') or f.get('path_alt'); md5=f.get('md5sum')
+          pathlib.Path('/tmp/base-url').write_text(u); pathlib.Path('/tmp/md5').write_text(md5)
+          PY
+          curl -fL "$(cat /tmp/base-url)" -o /tmp/apks/base.apk
+          curl -LsS "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=$(cat /tmp/md5)/language=pt_PT" -o /tmp/dynamic.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/dynamic.json',encoding='utf-8'))
+          f=next((x for x in d.get('list',[]) if x.get('type')=='FEATURE' and x.get('path')),None)
+          if f: pathlib.Path('/tmp/feature-url').write_text(f['path'])
+          PY
+          if [ -s /tmp/feature-url ]; then curl -fL "$(cat /tmp/feature-url)" -o /tmp/apks/feature.apk; fi
+
+      - name: Decompile focused split manager code
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL 'https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip' -o /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+          INPUTS=(/tmp/apks/base.apk); [ -f /tmp/apks/feature.apk ] && INPUTS+=(/tmp/apks/feature.apk)
+          /tmp/jadx/bin/jadx --no-res --show-bad-code --deobf -d /tmp/jadx-out "${INPUTS[@]}" >/tmp/jadx.log 2>&1 || true
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,shutil
+          src=Path('/tmp/jadx-out/sources'); out=Path('artifacts/sources'); out.mkdir(parents=True,exist_ok=True)
+          targets=['C2688b.java','C2687a.java','EnumC2535e.java','C2537g.java','C5885z.java','C7074j.java','C7075k.java','C0127f.java','C6262u2.java']
+          found=[]
+          for p in src.rglob('*.java'):
+              if p.name in targets:
+                  dst=out/(p.parent.name+'__'+p.name); shutil.copyfile(p,dst); found.append(str(p))
+          Path('artifacts/found.txt').write_text('\n'.join(found)+'\n')
+          needles=['basis','SplitInstall','SplitInstallManager','startInstall','getSplitNames','onDownloadFail','onDownloadSuccess','onDFMWillReady','install','download','session','errorCode','NETWORK_ERROR','API_NOT_AVAILABLE','PLAY_STORE_NOT_FOUND','ACCESS_DENIED','INCOMPATIBLE_WITH_EXISTING_SESSION']
+          report=[]
+          for p in src.rglob('*.java'):
+              try:s=p.read_text(errors='ignore')
+              except:continue
+              if not any(n.lower() in s.lower() for n in needles): continue
+              # constrain to split/dfm related packages/classes
+              if not any(k in str(p).lower() for k in ['/ej/','/dh1/','/qp/','/x11/','split','dfm','play/core']): continue
+              lines=s.splitlines(); idx=[i for i,l in enumerate(lines) if any(n.lower() in l.lower() for n in needles)]
+              if not idx: continue
+              report.append(f'===== {p} =====')
+              ranges=[]
+              for i in idx:
+                  a=max(0,i-22); b=min(len(lines),i+45)
+                  if ranges and a<=ranges[-1][1]+3:ranges[-1]=(ranges[-1][0],max(ranges[-1][1],b))
+                  else:ranges.append((a,b))
+              for a,b in ranges:
+                  for j in range(a,b):report.append(f'{j+1}: {lines[j]}')
+                  report.append('---')
+          Path('artifacts/basis-split-trace.txt').write_text('\n'.join(report),encoding='utf-8')
+          print('FOUND FILES')
+          print('\n'.join(found))
+          PY
+          echo '=== basis module names ==='
+          grep -RniE 'basis|getSplitNames|SplitInstall|startInstall|PLAY_STORE|API_NOT_AVAILABLE|NETWORK_ERROR' artifacts/sources artifacts/basis-split-trace.txt | head -n 600 || true
+
+      - name: Upload trace
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-basis-split-trace-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 1
