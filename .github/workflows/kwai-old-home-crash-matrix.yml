@@ -1,0 +1,136 @@
+name: Kwai old HomeActivity crash matrix
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-old-home-crash-matrix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  crash-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [30, 35]
+    steps:
+      - name: Prepare verified Kwai APK and KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          URL='https://pool.apk.aptoide.com/appupdater/com-kwai-video-511304-72159650-7b16f3bea9483d98a12611334e22b543.apk'
+          curl -fL --retry 4 --retry-delay 2 "$URL" -o /tmp/kwai-old.apk
+          test "$(md5sum /tmp/kwai-old.apk | awk '{print $1}')" = '7b16f3bea9483d98a12611334e22b543'
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/home-crash-probe.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+
+          BUILD_TOOLS="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+          CERT="$($BUILD_TOOLS/apksigner verify --print-certs /tmp/kwai-old.apk 2>&1)"
+          echo "$CERT" > artifacts/cert.txt
+          echo "$CERT" | grep -q 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+
+          adb install -r /tmp/kwai-old.apk 2>&1 | tee artifacts/install.txt
+          adb shell getprop ro.build.version.release | tee artifacts/android-release.txt
+          adb shell getprop ro.product.cpu.abi | tee artifacts/device-abi.txt
+          adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=|primaryCpuAbi=|secondaryCpuAbi=|nativeLibraryDir=' | head -n 30 | tee artifacts/package.txt || true
+
+          adb logcat -c || true
+          adb logcat -b crash -c || true
+          set +e
+          adb shell am start -W -n com.kwai.video/com.yxcorp.gifshow.homepage.HomeActivity 2>&1 | tee artifacts/start.txt
+          START_RC=${PIPESTATUS[0]}
+          set -e
+          sleep 12
+
+          adb shell pidof com.kwai.video > artifacts/pid.txt 2>&1 || true
+          adb shell dumpsys activity activities > artifacts/activities.txt 2>&1 || true
+          adb shell dumpsys activity exit-info com.kwai.video > artifacts/exit-info.txt 2>&1 || true
+          adb logcat -b crash -d -v threadtime > artifacts/crash-buffer.txt 2>&1 || true
+          adb logcat -d -v threadtime > artifacts/logcat.txt 2>&1 || true
+          adb exec-out screencap -p > artifacts/final.png || true
+
+          python3 - <<'PY'
+          import pathlib,re
+          crash=pathlib.Path('artifacts/crash-buffer.txt').read_text(errors='ignore')
+          log=pathlib.Path('artifacts/logcat.txt').read_text(errors='ignore')
+          pid=pathlib.Path('artifacts/pid.txt').read_text(errors='ignore').strip()
+          start=pathlib.Path('artifacts/start.txt').read_text(errors='ignore')
+          patterns=[
+              r'FATAL EXCEPTION[\s\S]{0,6000}',
+              r'Fatal signal[\s\S]{0,3000}',
+              r'UnsatisfiedLinkError[\s\S]{0,4000}',
+              r'NoClassDefFoundError[\s\S]{0,4000}',
+              r'Resources\$NotFoundException[\s\S]{0,4000}',
+              r'Process: com\.kwai\.video[\s\S]{0,6000}',
+          ]
+          hits=[]
+          for source in (crash,log):
+              for pat in patterns:
+                  m=re.search(pat,source,re.I)
+                  if m:
+                      hits.append(m.group(0))
+          excerpt='\n\n---\n\n'.join(dict.fromkeys(hits))[:20000]
+          pathlib.Path('artifacts/crash-excerpt.txt').write_text(excerpt+'\n',encoding='utf-8')
+          result={
+              'start_error': bool(re.search(r'Error|Exception|timeout',start,re.I)),
+              'pid_alive_after_12s': bool(pid),
+              'crash_buffer_nonempty': bool(crash.strip()),
+              'crash_excerpt_nonempty': bool(excerpt.strip()),
+          }
+          pathlib.Path('artifacts/result.txt').write_text('\n'.join(f'{k}={v}' for k,v in result.items())+'\n')
+          print(result)
+          if excerpt:
+              print(excerpt[:6000])
+          PY
+          exit 0
+          SH
+          chmod +x /tmp/home-crash-probe.sh
+
+      - name: Boot Android ${{ matrix.api }} and capture Kwai crash
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: ${{ matrix.api }}
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 4096M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/home-crash-probe.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai old HomeActivity crash — Android ${{ matrix.api }}'
+            cat artifacts/android-release.txt 2>/dev/null || true
+            cat artifacts/device-abi.txt 2>/dev/null || true
+            cat artifacts/package.txt 2>/dev/null || true
+            cat artifacts/result.txt 2>/dev/null || true
+            echo 'Crash excerpt:'
+            head -c 8000 artifacts/crash-excerpt.txt 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-old-home-api${{ matrix.api }}-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
