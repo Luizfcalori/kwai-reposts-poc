@@ -1,0 +1,124 @@
+name: Kwai Tiny to full mode JADX trace
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-fullmode-jadx-trace.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  fullmode-trace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download current base and feature APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/apks /tmp/jadx-out
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          f=((((d.get('nodes') or {}).get('meta') or {}).get('data') or {}).get('file') or {})
+          u=f.get('path') or f.get('path_alt'); md5=f.get('md5sum')
+          if not u or not md5: raise SystemExit('missing base metadata')
+          pathlib.Path('/tmp/base-url').write_text(u); pathlib.Path('/tmp/md5').write_text(md5)
+          pathlib.Path('artifacts/version.txt').write_text(f"version={f.get('vername')}\nvercode={f.get('vercode')}\n")
+          PY
+          curl -fL "$(cat /tmp/base-url)" -o /tmp/apks/base.apk
+          curl -LsS "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=$(cat /tmp/md5)/language=pt_PT" -o /tmp/dynamic.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/dynamic.json',encoding='utf-8'))
+          f=next((x for x in d.get('list',[]) if x.get('type')=='FEATURE' and x.get('path')),None)
+          if f: pathlib.Path('/tmp/feature-url').write_text(f['path'])
+          PY
+          if [ -s /tmp/feature-url ]; then curl -fL "$(cat /tmp/feature-url)" -o /tmp/apks/feature.apk; fi
+
+      - name: Install JADX
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL 'https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip' -o /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+
+      - name: Decompile and extract full-mode logic
+        shell: bash
+        run: |
+          set -euo pipefail
+          INPUTS=(/tmp/apks/base.apk)
+          [ -f /tmp/apks/feature.apk ] && INPUTS+=(/tmp/apks/feature.apk)
+          /tmp/jadx/bin/jadx --no-res --show-bad-code --deobf -d /tmp/jadx-out "${INPUTS[@]}" >/tmp/jadx.log 2>&1 || true
+          tail -n 100 /tmp/jadx.log > artifacts/jadx-tail.txt
+          SRC=/tmp/jadx-out/sources
+          test -d "$SRC"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,shutil
+          src=Path('/tmp/jadx-out/sources'); out=Path('artifacts/sources'); out.mkdir(parents=True,exist_ok=True)
+          wanted_names={
+            'TinySprKwaiInstrumentation.java','TinySprKwaiActivityContext.java','TinyRouterPluginImpl.java',
+            'TinyLoginPluginImpl.java','UriRouterActivity.java','C6643i2.java','C1054a.java','C1055b.java','C4210b.java'
+          }
+          copied=[]
+          for p in src.rglob('*.java'):
+            if p.name in wanted_names:
+              dst=out/(p.parent.name+'__'+p.name)
+              shutil.copyfile(p,dst); copied.append(str(p))
+          Path('artifacts/copied-sources.txt').write_text('\n'.join(copied)+'\n')
+
+          needles=['PhoneAccountActivityV2','ForcePhoneRegisterActivity','CommonLoginActivity','LoginActivity.class',
+                   'TinyNativeHomeActivity','TinyLoginActivity.class','inject_kwai_force_login','homeExists()',
+                   'isAvailable()','m26968c(','TinySprKwaiActivityContext','loginInfoSetting','arg_tiny_login_source']
+          report=[]
+          for p in src.rglob('*.java'):
+            try:s=p.read_text(errors='ignore')
+            except:continue
+            if not any(n in s for n in needles): continue
+            lines=s.splitlines(); idx=[]
+            for i,l in enumerate(lines):
+              if any(n in l for n in needles): idx.append(i)
+            if not idx: continue
+            report.append(f'===== {p} =====')
+            ranges=[]
+            for i in idx:
+              a=max(0,i-30); b=min(len(lines),i+55)
+              if ranges and a<=ranges[-1][1]+4: ranges[-1]=(ranges[-1][0],max(ranges[-1][1],b))
+              else:ranges.append((a,b))
+            for a,b in ranges:
+              for j in range(a,b): report.append(f'{j+1}: {lines[j]}')
+              report.append('---')
+          Path('artifacts/fullmode-references.txt').write_text('\n'.join(report),encoding='utf-8')
+
+          # Class existence and references summary.
+          names=['PhoneAccountActivityV2','ForcePhoneRegisterActivity','LoginActivity','CommonLoginActivity','TinySprKwaiInstrumentation','C6643i2']
+          summ=[]
+          for name in names:
+            decl=[]; refs=[]
+            for p in src.rglob('*.java'):
+              try:s=p.read_text(errors='ignore')
+              except:continue
+              if re.search(r'\b(class|interface|enum)\s+'+re.escape(name)+r'\b',s): decl.append(str(p))
+              if name in s: refs.append(str(p))
+            summ.append(f'{name}: declarations={decl} refs={refs[:80]}')
+          Path('artifacts/class-summary.txt').write_text('\n'.join(summ)+'\n')
+          print('\n'.join(summ))
+          PY
+
+          echo '=== redirect/full mode excerpts ==='
+          grep -Eain -B12 -A35 'TinyNativeHomeActivity|PhoneAccountActivityV2|TinySprKwaiActivityContext|m26968c\(|TinyLoginActivity.class|homeExists\(' artifacts/fullmode-references.txt | head -n 500 || true
+
+      - name: Upload full-mode trace
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-fullmode-jadx-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
