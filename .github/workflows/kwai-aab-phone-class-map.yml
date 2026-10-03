@@ -1,0 +1,104 @@
+name: Kwai AAB phone class map
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-aab-phone-class-map.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  class-map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download and scan every AAB split
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai/splits
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
+
+          python3 - <<'PY'
+          import json,pathlib,re
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}
+          splits=(m.get('aab') or {}).get('splits') or []
+          pathlib.Path('artifacts/version.txt').write_text(f"version={f.get('vername')}\nversionCode={f.get('vercode')}\n")
+          rows=[]
+          with open('/tmp/urls.tsv','w',encoding='utf-8') as out:
+              base=f.get('path') or f.get('path_alt')
+              if base: out.write('base\tBASE\tbase\t'+base+'\n')
+              for i,s in enumerate(splits):
+                  if not isinstance(s,dict): continue
+                  name=str(s.get('name') or f'split{i}')
+                  typ=str(s.get('type') or '')
+                  path=s.get('path') or s.get('path_alt')
+                  rows.append({k:s.get(k) for k in ('name','type','filesize','md5sum','path') if s.get(k) is not None})
+                  if isinstance(path,str) and path.startswith('http'):
+                      safe=re.sub(r'[^A-Za-z0-9_.-]+','_',name)[:80]
+                      out.write(f'{i}\t{typ}\t{safe}\t{path}\n')
+          pathlib.Path('artifacts/aab-splits.txt').write_text('\n'.join(str(r) for r in rows),encoding='utf-8')
+          PY
+
+          while IFS=$'\t' read -r idx typ name url; do
+            out="/tmp/kwai/splits/${idx}-${typ}-${name}.apk"
+            echo "Downloading $idx type=$typ name=$name"
+            curl -fL --retry 3 --retry-delay 2 "$url" -o "$out" || rm -f "$out"
+          done < /tmp/urls.tsv
+
+          find /tmp/kwai/splits -type f -name '*.apk' -printf '%f %s bytes\n' | sort > artifacts/downloaded.txt
+
+          TARGET='PhoneAccountActivityV2|ForcePhoneRegisterActivity|PhoneVerifyActivity|BindPhoneActivity|ChangePhoneActivity|PhoneResetPsdActivity|SplashLoginActivity|CommonLoginActivity'
+          : > artifacts/class-hits.txt
+          : > artifacts/route-hits.txt
+          : > artifacts/matching-apks.txt
+
+          for apk in /tmp/kwai/splits/*.apk; do
+            [ -f "$apk" ] || continue
+            tmp="$(mktemp -d)"
+            unzip -qq "$apk" 'classes*.dex' -d "$tmp" 2>/dev/null || true
+            hit=0
+            for dex in "$tmp"/classes*.dex; do
+              [ -f "$dex" ] || continue
+              cls="$(strings "$dex" | grep -E "$TARGET" || true)"
+              if [ -n "$cls" ]; then
+                hit=1
+                {
+                  echo "===== $(basename "$apk") :: $(basename "$dex") ====="
+                  echo "$cls"
+                } >> artifacts/class-hits.txt
+              fi
+              routes="$(strings "$dex" | grep -Ei '(i?kwai|kwaiapp)://[^ ]*(login|phone|auth|account|register|verify)|(login|phone|auth|account|register|verify)[^ ]*(i?kwai|kwaiapp)://' || true)"
+              if [ -n "$routes" ]; then
+                {
+                  echo "===== $(basename "$apk") :: $(basename "$dex") ====="
+                  echo "$routes"
+                } >> artifacts/route-hits.txt
+              fi
+            done
+            rm -rf "$tmp"
+            [ "$hit" -eq 1 ] && echo "$apk" >> artifacts/matching-apks.txt
+          done
+
+          echo '--- AAB split inventory ---'
+          cat artifacts/aab-splits.txt
+          echo '--- matching APKs ---'
+          cat artifacts/matching-apks.txt || true
+          echo '--- class hits ---'
+          cat artifacts/class-hits.txt || true
+          echo '--- route hits ---'
+          cat artifacts/route-hits.txt || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-aab-phone-class-map-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
