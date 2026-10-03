@@ -175,6 +175,10 @@ jobs:
           echo "install_rc=$RC" | tee artifacts/install-result.txt
           test "$RC" -eq 0
 
+          # Remove Android 13+ notification permission popup so the UI probe reaches Kwai itself.
+          adb shell pm grant com.kwai.video android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+          adb shell appops set com.kwai.video POST_NOTIFICATION allow 2>/dev/null || true
+
           adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=|primaryCpuAbi=' | head -n 20 | tee artifacts/installed-version.txt || true
           adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
           sleep 20
