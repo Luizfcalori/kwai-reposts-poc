@@ -1,0 +1,230 @@
+name: Kwai community Phone entry proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-community-phone-entry-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  phone-entry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download exact current Kwai community XAPK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts apks /tmp/kwai-full
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
+            -a 'com.kwai.kuaishou.video.live@13.8.30.646601' -d apk-pure \
+            -o 'acknowledge_dangers=true,arch=arm64-v8a' /output \
+            2>&1 | tee artifacts/download.txt
+
+          BUNDLE="$(find apks -maxdepth 1 -type f | head -n1)"
+          test -n "$BUNDLE"
+          unzip -q "$BUNDLE" -d /tmp/kwai-full
+
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          VERSION_OK=0
+          : > artifacts/certificates.txt
+          while IFS= read -r apk; do
+            "$BT/apksigner" verify --print-certs "$apk" > /tmp/cert.txt 2>&1
+            CERT="$(awk -F': ' '/certificate SHA-256 digest:/{print tolower($NF); exit}' /tmp/cert.txt | tr -d '[:space:]')"
+            echo "$(basename "$apk") $CERT" >> artifacts/certificates.txt
+            test "$CERT" = '588774ea798843484c7100da2450005090522fda0dcb64be01c04079349c0acc'
+            LINE="$("$BT/aapt" dump badging "$apk" | head -1 || true)"
+            if echo "$LINE" | grep -q "package: name='com.kwai.kuaishou.video.live'" && echo "$LINE" | grep -q "versionName='13.8.30.646601'"; then
+              VERSION_OK=1
+            fi
+          done < <(find /tmp/kwai-full -type f -name '*.apk' | sort)
+          test "$VERSION_OK" -eq 1
+
+          cat > /tmp/phone-entry.py <<'PY'
+          import pathlib,re,subprocess,time,xml.etree.ElementTree as ET
+          PKG='com.kwai.kuaishou.video.live'
+          A=pathlib.Path('artifacts/ui'); A.mkdir(parents=True,exist_ok=True)
+
+          def adb(*x):
+              return subprocess.run(['adb',*x],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+
+          def bounds(v):
+              m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',v or '')
+              return tuple(map(int,m.groups())) if m else None
+
+          def dump(tag):
+              adb('shell','uiautomator','dump','/sdcard/u.xml')
+              xp=A/f'{tag}.xml'; adb('pull','/sdcard/u.xml',str(xp))
+              with open(A/f'{tag}.png','wb') as f:
+                  subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
+              root=None; texts=[]
+              try:
+                  root=ET.parse(xp).getroot()
+                  for n in root.iter('node'):
+                      for k in ('text','content-desc','hint'):
+                          v=(n.attrib.get(k) or '').strip()
+                          if v and v not in texts: texts.append(v)
+              except Exception:
+                  pass
+              (A/f'{tag}.txt').write_text('\n'.join(texts),encoding='utf-8')
+              return root,texts
+
+          def tap_node(root, patterns):
+              if root is None: return False
+              rr=[re.compile(p,re.I) for p in patterns]
+              for n in root.iter('node'):
+                  s=' '.join(filter(None,[n.attrib.get('text',''),n.attrib.get('content-desc',''),n.attrib.get('hint','')])).strip()
+                  if s and any(r.search(s) for r in rr):
+                      b=bounds(n.attrib.get('bounds'))
+                      if b:
+                          x1,y1,x2,y2=b
+                          adb('shell','input','tap',str((x1+x2)//2),str((y1+y2)//2))
+                          time.sleep(3)
+                          return True
+              return False
+
+          def tap_phone_span(root):
+              if root is None: return False
+              for n in root.iter('node'):
+                  text=(n.attrib.get('text') or '')
+                  rid=n.attrib.get('resource-id') or ''
+                  if 'Phone' in text and ('login_platform_expand_text' in rid or 'Facebook' in text):
+                      b=bounds(n.attrib.get('bounds'))
+                      if not b: continue
+                      x1,y1,x2,y2=b
+                      # "Phone" is the right-hand clickable span in "Facebook | Phone".
+                      x=int(x1+(x2-x1)*0.86)
+                      y=(y1+y2)//2
+                      print(f'PHONE_SPAN bounds={b} tap=({x},{y}) text={text!r}')
+                      adb('shell','input','tap',str(x),str(y))
+                      time.sleep(5)
+                      return True
+              return False
+
+          def has_phone_entry(root,texts):
+              joined='\n'.join(texts)
+              if re.search(r'phone number|mobile number|n[uú]mero de telefone|country code|verification code|get code|send code|sms',joined,re.I):
+                  return True
+              if root is not None:
+                  for n in root.iter('node'):
+                      if n.attrib.get('class')=='android.widget.EditText':
+                          return True
+              return False
+
+          time.sleep(15)
+          root,texts=dump('00-launch')
+          reached_login=False
+          for i in range(1,26):
+              joined='\n'.join(texts)
+              if re.search(r'Welcome to Kwai',joined,re.I) and re.search(r'Phone',joined,re.I):
+                  reached_login=True
+                  break
+
+              if tap_node(root,[r'^Allow$',r'^Permitir$',r'^Not now$',r'Agora n[aã]o',r'^Skip$',r'^Pular$',r'^Agree$',r'^Aceitar$',r'^Continue$',r'^Continuar$',r'^Start now$',r'^Começar agora$',r'^Got it$',r'^Entendi$']):
+                  root,texts=dump(f'01-step-{i:02d}')
+                  continue
+
+              if re.search(r'\b\d+/\d+\b',joined) or re.search(r'choose like or dislike|swipe up',joined,re.I):
+                  tap_node(root,[r'^Like$',r'Gostei',r'like'])
+                  adb('shell','input','swipe','540','1950','540','400','1000')
+                  time.sleep(3)
+                  root,texts=dump(f'02-onboarding-{i:02d}')
+                  continue
+
+              # Profile is the proven entry point to this login surface.
+              if tap_node(root,[r'^Profile$',r'^Perfil$',r'^Me$',r'^Eu$']):
+                  root,texts=dump(f'03-profile-{i:02d}')
+                  if re.search(r'Welcome to Kwai','\n'.join(texts),re.I) and re.search(r'Phone','\n'.join(texts),re.I):
+                      reached_login=True
+                      break
+
+              adb('shell','input','tap','1000','2290')
+              time.sleep(3)
+              root,texts=dump(f'04-profile-coordinate-{i:02d}')
+              if re.search(r'Welcome to Kwai','\n'.join(texts),re.I) and re.search(r'Phone','\n'.join(texts),re.I):
+                  reached_login=True
+                  break
+
+          phone_clicked=False
+          phone_entry=False
+          if reached_login:
+              root,texts=dump('05-login-with-phone-visible')
+              phone_clicked=tap_phone_span(root)
+              root,texts=dump('06-after-phone-tap')
+              phone_entry=has_phone_entry(root,texts)
+
+          result={
+              'reached_login_screen': reached_login,
+              'phone_option_visible': reached_login and any('Phone' in t for t in texts) if not phone_clicked else True,
+              'phone_option_clicked': phone_clicked,
+              'phone_entry_detected': phone_entry,
+              'final_texts': ' | '.join(texts[:40]),
+              'pid': adb('shell','pidof',PKG).stdout.strip(),
+          }
+          pathlib.Path('artifacts/result.txt').write_text('\n'.join(f'{k}={v}' for k,v in result.items())+'\n',encoding='utf-8')
+          print(result)
+          if not reached_login: raise SystemExit('login screen with Phone option not reached')
+          if not phone_clicked: raise SystemExit('Phone option visible but targeted span tap failed')
+          if not phone_entry: raise SystemExit('Phone option tapped but phone-number entry screen not confirmed')
+          PY
+
+          cat > /tmp/run.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != 1 ]; do sleep 2; done
+          {
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            adb shell ip route || true
+            adb shell ping -c 1 -W 3 www.google.com || true
+          } | tee artifacts/network.txt
+          mapfile -d '' ALL < <(find /tmp/kwai-full -type f -name '*.apk' -print0)
+          adb install-multiple -r "${ALL[@]}" | tee artifacts/install.txt
+          adb shell pm grant com.kwai.kuaishou.video.live android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+          adb shell appops set com.kwai.kuaishou.video.live POST_NOTIFICATION allow 2>/dev/null || true
+          adb shell monkey -p com.kwai.kuaishou.video.live -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
+          python3 /tmp/phone-entry.py | tee artifacts/probe-console.txt
+          adb logcat -d -t 2500 > artifacts/logcat.txt || true
+          SH
+          chmod +x /tmp/run.sh
+
+      - name: Boot Android 14 and prove Phone entry
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/run.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai community Phone entry proof'
+            cat artifacts/result.txt 2>/dev/null || echo 'No result produced.'
+            echo
+            echo 'No phone number, OTP, password, account login, upload, or publication was attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-community-phone-entry-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
