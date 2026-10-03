@@ -1,0 +1,109 @@
+name: Kwai old manifest auth probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-old-manifest-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  manifest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download and inspect verified old Kwai manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          URL='https://pool.apk.aptoide.com/appupdater/com-kwai-video-511304-72159650-7b16f3bea9483d98a12611334e22b543.apk'
+          curl -fL --retry 3 --retry-delay 2 "$URL" -o /tmp/kwai-old.apk
+          test "$(md5sum /tmp/kwai-old.apk | awk '{print $1}')" = '7b16f3bea9483d98a12611334e22b543'
+
+          BUILD_TOOLS="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+          AAPT="$BUILD_TOOLS/aapt"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          "$APKSIGNER" verify --print-certs /tmp/kwai-old.apk > artifacts/cert.txt 2>&1
+          grep -E 'certificate SHA-(1|256) digest' artifacts/cert.txt | head -n4 | tee artifacts/cert-summary.txt
+          "$AAPT" dump xmltree /tmp/kwai-old.apk AndroidManifest.xml > artifacts/manifest-tree.txt
+          "$AAPT" dump badging /tmp/kwai-old.apk > artifacts/badging.txt
+
+          python3 - <<'PY'
+          import pathlib,re
+          text=pathlib.Path('artifacts/manifest-tree.txt').read_text(errors='ignore').splitlines()
+          components=[]
+          current=None
+          depth=None
+          actions=[]
+          cats=[]
+          for line in text:
+              indent=len(line)-len(line.lstrip())
+              s=line.strip()
+              if s.startswith('E: activity ') or s=='E: activity' or s.startswith('E: activity-alias'):
+                  if current:
+                      components.append((current,actions,cats))
+                  current=''; actions=[]; cats=[]; depth=indent
+              elif current is not None and s.startswith('A: android:name'):
+                  m=re.search(r'Raw: "([^"]+)"',s)
+                  if not m:
+                      m=re.search(r'="([^"]+)"',s)
+                  if m and not current:
+                      current=m.group(1)
+              elif current is not None and 'android.intent.action.' in s:
+                  m=re.search(r'android\.intent\.action\.[A-Z_]+' ,s)
+                  if m: actions.append(m.group(0))
+              elif current is not None and 'android.intent.category.' in s:
+                  m=re.search(r'android\.intent\.category\.[A-Z_]+' ,s)
+                  if m: cats.append(m.group(0))
+          if current:
+              components.append((current,actions,cats))
+
+          # Also extract every activity class directly from xmltree lines using a simpler context pass.
+          names=[]
+          for i,line in enumerate(text):
+              if line.strip().startswith('E: activity'):
+                  for nxt in text[i+1:i+12]:
+                      if 'A: android:name' in nxt:
+                          m=re.search(r'Raw: "([^"]+)"',nxt)
+                          if m: names.append(m.group(1)); break
+
+          pathlib.Path('artifacts/activity-names.txt').write_text('\n'.join(dict.fromkeys(names))+'\n')
+          launcher=[]
+          for name,acts,cats in components:
+              if 'android.intent.action.MAIN' in acts or 'android.intent.category.LAUNCHER' in cats:
+                  launcher.append(f'{name}\tactions={acts}\tcategories={cats}')
+          pathlib.Path('artifacts/launcher-candidates.txt').write_text('\n'.join(launcher)+'\n')
+
+          rx=re.compile(r'login|sign|auth|account|phone|mobile|profile|launch|splash|home|main',re.I)
+          auth=[n for n in dict.fromkeys(names) if rx.search(n)]
+          pathlib.Path('artifacts/auth-activity-candidates.txt').write_text('\n'.join(auth)+'\n')
+          print('activities',len(names),'launcher_candidates',len(launcher),'auth_candidates',len(auth))
+          print('LAUNCHERS:'); print('\n'.join(launcher[:30]))
+          print('AUTH:'); print('\n'.join(auth[:120]))
+          PY
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Old Kwai manifest probe'
+            echo 'Certificate:'
+            cat artifacts/cert-summary.txt 2>/dev/null || true
+            echo 'Launcher candidates:'
+            cat artifacts/launcher-candidates.txt 2>/dev/null || true
+            echo 'Auth/activity candidates:'
+            head -n 120 artifacts/auth-activity-candidates.txt 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-old-manifest-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
