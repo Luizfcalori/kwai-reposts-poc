@@ -1,0 +1,170 @@
+name: Kwai resource wait and phone proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-resource-wait-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  resource-wait:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Prepare current verified Kwai ARM64 bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/kwai.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/kwai.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}; splits=(m.get('aab') or {}).get('splits') or []
+          abi=next(s for s in splits if s.get('type')=='ABI' and 'arm64' in (s.get('name') or '').lower())
+          den=next((s for s in splits if s.get('type')=='DENSITY' and 'mdpi' in (s.get('name') or '').lower()),None) or next(s for s in splits if s.get('type')=='DENSITY')
+          vals={'base':f.get('path') or f.get('path_alt'),'md5':f.get('md5sum'),'version':f.get('vername'),'abi':abi.get('path'),'density':den.get('path')}
+          if not all(vals.values()): raise SystemExit('missing bundle metadata')
+          pathlib.Path('/tmp/meta.env').write_text('\n'.join(f"{k.upper()}={v}" for k,v in vals.items())+'\n')
+          pathlib.Path('artifacts/source.txt').write_text('\n'.join(f'{k}={v}' for k,v in vals.items())+'\n')
+          PY
+          source /tmp/meta.env
+          curl -fL --retry 4 --retry-delay 2 "$BASE" -o /tmp/kwai/base.apk
+          curl -fL --retry 4 --retry-delay 2 "$ABI" -o /tmp/kwai/config.arm64_v8a.apk
+          curl -fL --retry 4 --retry-delay 2 "$DENSITY" -o /tmp/kwai/config.mdpi.apk
+          curl -LsS "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${MD5}/language=pt_PT" -o /tmp/dynamic.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/dynamic.json',encoding='utf-8'))
+          f=next((x for x in d.get('list',[]) if x.get('type')=='FEATURE' and x.get('path')),None)
+          if f: pathlib.Path('/tmp/feature-url').write_text(f['path'])
+          PY
+          if [ -s /tmp/feature-url ]; then curl -fL "$(cat /tmp/feature-url)" -o /tmp/kwai/feature.apk; fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/probe.py <<'PY'
+          import pathlib,re,subprocess,time,xml.etree.ElementTree as ET
+          A=pathlib.Path('artifacts/ui'); A.mkdir(parents=True,exist_ok=True)
+          def adb(*x): return subprocess.run(['adb',*x],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+          def bounds(v):
+              m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',v or '')
+              if not m:return None
+              x1,y1,x2,y2=map(int,m.groups()); return ((x1+x2)//2,(y1+y2)//2)
+          def dump(tag):
+              adb('shell','uiautomator','dump','/sdcard/u.xml')
+              adb('pull','/sdcard/u.xml',str(A/f'{tag}.xml'))
+              with open(A/f'{tag}.png','wb') as f: subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
+              root=None; texts=[]
+              try:
+                  root=ET.parse(A/f'{tag}.xml').getroot()
+                  for n in root.iter('node'):
+                      for k in ('text','content-desc'):
+                          v=(n.attrib.get(k) or '').strip()
+                          if v and v not in texts:texts.append(v)
+              except Exception: pass
+              (A/f'{tag}.txt').write_text('\n'.join(texts),encoding='utf-8')
+              return root,texts
+          def tap(root,patterns):
+              if root is None:return False
+              rr=[re.compile(p,re.I) for p in patterns]
+              for n in root.iter('node'):
+                  s=' '.join(filter(None,[n.attrib.get('text',''),n.attrib.get('content-desc','')])).strip()
+                  if s and any(r.search(s) for r in rr):
+                      p=bounds(n.attrib.get('bounds'))
+                      if p: adb('shell','input','tap',str(p[0]),str(p[1])); time.sleep(3); return True
+              return False
+          def has(texts,pats):
+              s='\n'.join(texts); return any(re.search(p,s,re.I) for p in pats)
+          phone=[r'phone number',r'mobile number',r'n[uú]mero de telefone',r'country code',r'get code',r'send code',r'verification code',r'c[oó]digo de verifica']
+          login=[r'log in',r'login',r'sign in',r'entrar',r'google',r'facebook']
+          resource=[r'resource downloading',r'access to all the features',r"can.?t connect to server"]
+          state='unknown'; history=[]
+          root,texts=dump('00-start')
+          tap(root,[r'^Hide$',r'^Ocultar$'])
+          for sec in (0,30,60,90,120,150,180):
+              if sec: time.sleep(30)
+              root,texts=dump(f'{sec:03d}s')
+              history.append(f'{sec}s: '+ ' | '.join(texts[:12]))
+              if has(texts,phone): state='phone_login'; break
+              if has(texts,resource): tap(root,[r'^Hide$',r'^Ocultar$'])
+              # Try Profile after each checkpoint.
+              if not tap(root,[r'^Profile$',r'^Perfil$',r'^Me$',r'^Eu$']):
+                  adb('shell','input','tap','995','2290'); time.sleep(4)
+              root,texts=dump(f'{sec:03d}s-profile')
+              if has(texts,phone): state='phone_login'; break
+              if has(texts,resource):
+                  tap(root,[r'^Hide$',r'^Ocultar$'])
+                  state='resource_wait'
+                  continue
+              tap(root,[r'^Log in$',r'^Login$',r'^Sign in$',r'^Entrar$',r'^Fazer login$',r'Sign up or log in'])
+              root,texts=dump(f'{sec:03d}s-login')
+              if has(texts,phone): state='phone_login'; break
+              if has(texts,login): state='login_screen'
+          pathlib.Path('artifacts/result.txt').write_text(f'state={state}\nphone_route_detected={str(state=="phone_login").lower()}\n'+'\n'.join(history)+'\n')
+          print('FINAL_STATE',state)
+          PY
+
+          cat > /tmp/run.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != 1 ]; do sleep 2; done
+          {
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo "dns1=$(adb shell getprop net.dns1 | tr -d '\r')"
+            echo "dns2=$(adb shell getprop net.dns2 | tr -d '\r')"
+            echo '--- ping IP ---'; adb shell ping -c 1 -W 3 8.8.8.8 || true
+            echo '--- ping DNS ---'; adb shell ping -c 1 -W 3 www.google.com || true
+          } | tee artifacts/network.txt
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BT/apksigner" verify --print-certs /tmp/kwai/base.apk > artifacts/cert.txt 2>&1
+          grep -qi 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047' artifacts/cert.txt
+          APKS=(/tmp/kwai/base.apk /tmp/kwai/config.arm64_v8a.apk /tmp/kwai/config.mdpi.apk)
+          [ -f /tmp/kwai/feature.apk ] && APKS+=(/tmp/kwai/feature.apk)
+          adb install-multiple -r "${APKS[@]}" | tee artifacts/install.txt
+          adb shell pm grant com.kwai.video android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+          adb shell appops set com.kwai.video POST_NOTIFICATION allow 2>/dev/null || true
+          adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
+          sleep 20
+          python3 /tmp/probe.py | tee artifacts/probe-console.txt
+          adb shell pidof com.kwai.video | tee artifacts/pid.txt || true
+          adb logcat -d -t 2500 > artifacts/logcat.txt || true
+          SH
+          chmod +x /tmp/run.sh
+
+      - name: Boot Android and wait for Kwai resources
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics -dns-server 8.8.8.8,1.1.1.1
+          script: bash /tmp/run.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          cat artifacts/result.txt 2>/dev/null || true
+          cat artifacts/network.txt 2>/dev/null || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-resource-wait-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
