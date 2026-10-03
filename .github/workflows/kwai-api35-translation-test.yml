@@ -110,6 +110,18 @@ jobs:
                           print('tap',label,p)
                           adb('shell','input','tap',str(p[0]),str(p[1])); time.sleep(4); return True
               return False
+          def tap_id(root,suffix):
+              if root is None:return False
+              for n in root.iter('node'):
+                  rid=n.attrib.get('resource-id','')
+                  if rid.endswith(suffix):
+                      p=center(n.attrib.get('bounds',''))
+                      if p:
+                          print('tap-id',rid,p)
+                          adb('shell','input','tap',str(p[0]),str(p[1])); time.sleep(4); return True
+              return False
+          def has_id(root,suffix):
+              return root is not None and any((n.attrib.get('resource-id','') or '').endswith(suffix) for n in root.iter('node'))
           def has(texts,pats):
               s='\n'.join(texts)
               return any(re.search(p,s,re.I) for p in pats)
@@ -125,6 +137,18 @@ jobs:
           phone=[r'phone number',r'mobile number',r'n[uú]mero de telefone',r'n[uú]mero do celular',r'country code',r'c[oó]digo do pa[ií]s',r'get code',r'send code',r'verification code',r'c[oó]digo de verifica',r'sms code']
           crash=[r'keeps stopping',r'has stopped',r'isn.?t responding']
           root,texts=dump('01-launch')
+
+          # Current Kwai presents a three-card preference onboarding. Advance it by stable resource ID.
+          onboarding_steps=0
+          for i in range(4):
+              if not has_id(root,'tiny_discovery_like_button'):
+                  break
+              if not tap_id(root,'tiny_discovery_like_button'):
+                  break
+              onboarding_steps += 1
+              root,texts=dump(f'01-onboarding-{onboarding_steps}')
+          print('onboarding_steps=',onboarding_steps)
+
           (root,texts),_=hide_overlay(root,texts,'01b-after-hide')
           if has(texts,crash):
               state='crash'
@@ -147,7 +171,7 @@ jobs:
                   root,texts=dump('05-phone')
                   (root,texts),_=hide_overlay(root,texts,'05b-after-hide')
               state='phone_login' if has(texts,phone) else ('login_screen' if has(texts,[r'login',r'log in',r'sign in',r'entrar',r'google']) else 'app_open')
-          pathlib.Path('artifacts/result.txt').write_text(f'state={state}\nphone_route_detected={str(state=="phone_login").lower()}\n')
+          pathlib.Path('artifacts/result.txt').write_text(f'state={state}\nphone_route_detected={str(state=="phone_login").lower()}\nonboarding_steps={onboarding_steps}\n')
           print('state=',state)
           PY
 
