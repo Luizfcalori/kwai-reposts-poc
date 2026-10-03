@@ -1,0 +1,122 @@
+name: Kwai all dynamic auth features
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-all-dynamic-auth-features.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  scan-features:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Download metadata and every dynamic feature
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/features
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}
+          md5=f.get('md5sum') or ''
+          if not md5: raise SystemExit('missing md5')
+          pathlib.Path('/tmp/md5').write_text(md5)
+          pathlib.Path('artifacts/version.txt').write_text(f"version={f.get('vername')}\nversionCode={f.get('vercode')}\nmd5={md5}\n")
+          PY
+
+          curl -LsS --retry 4 --retry-delay 2 \
+            "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=$(cat /tmp/md5)/language=pt_PT" \
+            -o /tmp/dynamic.json
+          cp /tmp/dynamic.json artifacts/dynamic.json
+
+          python3 - <<'PY'
+          import json,pathlib,re
+          d=json.load(open('/tmp/dynamic.json',encoding='utf-8'))
+          rows=[]
+          with open('/tmp/features.tsv','w',encoding='utf-8') as out:
+              for i,x in enumerate(d.get('list') or []):
+                  if not isinstance(x,dict): continue
+                  typ=str(x.get('type') or '')
+                  name=str(x.get('name') or x.get('id') or f'feature{i}')
+                  path=x.get('path') or ''
+                  rows.append({k:x.get(k) for k in ('name','type','md5sum','filesize','path') if x.get(k) is not None})
+                  if typ.upper()=='FEATURE' and isinstance(path,str) and path.startswith('http'):
+                      safe=re.sub(r'[^A-Za-z0-9_.-]+','_',name)[:100]
+                      out.write(f'{i}\t{safe}\t{path}\n')
+          pathlib.Path('artifacts/dynamic-inventory.txt').write_text('\n'.join(map(str,rows))+'\n',encoding='utf-8')
+          PY
+
+          while IFS=$'\t' read -r idx name url; do
+            [ -n "$url" ] || continue
+            echo "Downloading FEATURE $idx $name"
+            curl -fL --retry 3 --retry-delay 2 "$url" -o "/tmp/features/${idx}-${name}.apk" || true
+          done < /tmp/features.tsv
+
+          find /tmp/features -type f -name '*.apk' -printf '%f %s bytes\n' | sort > artifacts/downloaded-features.txt
+
+      - name: Scan every feature for phone-login implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          AAPT="$BT/aapt"
+          : > artifacts/auth-feature-hits.txt
+          : > artifacts/auth-feature-manifest-hits.txt
+          : > artifacts/auth-feature-dex-hits.txt
+          : > artifacts/matching-features.txt
+
+          PAT='PhoneAccountActivityV2|PhoneAccountActivity|PhoneVerifyActivity|ForcePhoneRegisterActivity|CommonLoginActivity|LoginPlugin|BindPhoneActivity|ChangePhoneActivity|PhoneResetPsdActivity|VerifyPhoneActivity|PHONE_NUMBER_LOGIN_PAGE|PHONE_LOGIN_NEW|CLICK_PHONE_LOGIN|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|phone.?login|login.?phone'
+
+          for apk in /tmp/features/*.apk; do
+            [ -f "$apk" ] || continue
+            b="$(basename "$apk")"
+            hit=0
+            echo "===== $b =====" >> artifacts/auth-feature-hits.txt
+
+            if "$AAPT" dump xmltree "$apk" AndroidManifest.xml > /tmp/manifest.txt 2>/dev/null; then
+              mh="$(grep -Ei -C 4 "$PAT" /tmp/manifest.txt || true)"
+              if [ -n "$mh" ]; then
+                hit=1
+                { echo "===== $b ====="; echo "$mh"; } >> artifacts/auth-feature-manifest-hits.txt
+              fi
+            fi
+
+            tmp="$(mktemp -d)"
+            unzip -qq "$apk" 'classes*.dex' -d "$tmp" 2>/dev/null || true
+            for dex in "$tmp"/classes*.dex; do
+              [ -f "$dex" ] || continue
+              dh="$(strings "$dex" | grep -Ei "$PAT" | sort -u || true)"
+              if [ -n "$dh" ]; then
+                hit=1
+                { echo "===== $b :: $(basename "$dex") ====="; echo "$dh"; } >> artifacts/auth-feature-dex-hits.txt
+              fi
+            done
+            rm -rf "$tmp"
+            if [ "$hit" -eq 1 ]; then echo "$b" >> artifacts/matching-features.txt; fi
+          done
+
+          echo '--- dynamic inventory ---'
+          cat artifacts/dynamic-inventory.txt || true
+          echo '--- matching feature APKs ---'
+          cat artifacts/matching-features.txt || true
+          echo '--- manifest auth hits ---'
+          head -n 1000 artifacts/auth-feature-manifest-hits.txt || true
+          echo '--- dex auth hits ---'
+          head -n 1200 artifacts/auth-feature-dex-hits.txt || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-all-dynamic-auth-features-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
