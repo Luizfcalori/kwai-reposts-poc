@@ -1,0 +1,109 @@
+name: Kwai current safe login proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-current-safe-login-proof.yml'
+      - 'scripts/kwai_ui_probe.py'
+
+permissions:
+  contents: read
+
+jobs:
+  safe-login-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout probe
+        uses: actions/checkout@v4
+
+      - name: Download and verify current Kwai ARM64 bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/kwai.json
+          python3 - <<'PY'
+          import json,pathlib,shlex
+          data=json.load(open('/tmp/kwai.json',encoding='utf-8'))
+          meta=((data.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=meta.get('file') or {}
+          splits=(meta.get('aab') or {}).get('splits') or []
+          abi=next((s for s in splits if s.get('type')=='ABI' and 'arm64' in (s.get('name') or '').lower()),None)
+          density=next((s for s in splits if s.get('type')=='DENSITY' and 'mdpi' in (s.get('name') or '').lower()),None) or next((s for s in splits if s.get('type')=='DENSITY'),None)
+          vals={'BASE_URL':f.get('path') or f.get('path_alt'),'BASE_MD5':f.get('md5sum'),'VERSION':f.get('vername'),'VERCODE':f.get('vercode'),'ABI_URL':(abi or {}).get('path'),'DENSITY_URL':(density or {}).get('path')}
+          if not vals['BASE_URL'] or not vals['ABI_URL'] or not vals['DENSITY_URL']:
+              raise SystemExit('required current Kwai ARM64 split paths missing')
+          pathlib.Path('/tmp/kwai.env').write_text('\n'.join(f'{k}={shlex.quote(str(v))}' for k,v in vals.items())+'\n')
+          pathlib.Path('artifacts/source.txt').write_text('\n'.join(f'{k}={v}' for k,v in vals.items())+'\n')
+          PY
+          source /tmp/kwai.env
+          curl -fL --retry 4 --retry-delay 2 "$BASE_URL" -o /tmp/kwai/base.apk
+          curl -fL --retry 4 --retry-delay 2 "$ABI_URL" -o /tmp/kwai/config.arm64_v8a.apk
+          curl -fL --retry 4 --retry-delay 2 "$DENSITY_URL" -o /tmp/kwai/config.mdpi.apk
+          curl -LsS --retry 4 --retry-delay 2 "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${BASE_MD5}/language=pt_PT" -o /tmp/dynamic.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/dynamic.json',encoding='utf-8'))
+          feat=next((x for x in (d.get('list') or []) if x.get('type')=='FEATURE' and x.get('path')),None)
+          if feat:pathlib.Path('/tmp/feature-url.txt').write_text(feat['path'])
+          PY
+          if [ -s /tmp/feature-url.txt ]; then curl -fL --retry 4 --retry-delay 2 "$(cat /tmp/feature-url.txt)" -o /tmp/kwai/feature.apk; fi
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BUILD_TOOLS/apksigner" verify --print-certs /tmp/kwai/base.apk > artifacts/base-cert.txt 2>&1
+          SHA256="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-256 digest:/{print tolower($NF); exit}' artifacts/base-cert.txt)"
+          test "$SHA256" = 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+          echo 'CERTIFICATE MATCH' | tee artifacts/cert-check.txt
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/run-proof.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          APKS=(/tmp/kwai/base.apk /tmp/kwai/config.arm64_v8a.apk /tmp/kwai/config.mdpi.apk)
+          [ -f /tmp/kwai/feature.apk ] && APKS+=(/tmp/kwai/feature.apk)
+          adb install-multiple -r "${APKS[@]}" | tee artifacts/install.txt
+          adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=|primaryCpuAbi=' | head -n 20 | tee artifacts/installed-version.txt || true
+          python3 scripts/kwai_ui_probe.py 2>&1 | tee artifacts/probe-console.txt
+          SH
+          chmod +x /tmp/run-proof.sh
+
+      - name: Boot Android and reach login safely
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/run-proof.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai current safe login proof'
+            cat artifacts/ui-result.txt 2>/dev/null || echo 'UI result not produced.'
+            cat artifacts/installed-version.txt 2>/dev/null || true
+            echo
+            echo 'No phone number, SMS code, credentials, upload, or publication attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-current-safe-login-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
