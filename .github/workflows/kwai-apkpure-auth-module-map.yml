@@ -1,0 +1,83 @@
+name: Kwai APKPure auth module map
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-apkpure-auth-module-map.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  auth-module-map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Download exact official bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts apks /tmp/kwai
+          docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
+            -a 'com.kwai.kuaishou.video.live@13.8.30.646601' -d apk-pure \
+            -o 'acknowledge_dangers=true,arch=arm64-v8a' /output \
+            2>&1 | tee artifacts/download.txt
+          BUNDLE="$(find apks -maxdepth 1 -type f | head -n1)"
+          test -n "$BUNDLE"
+          echo "bundle=$(basename "$BUNDLE")" > artifacts/bundle.txt
+          echo "bundle_size=$(stat -c %s "$BUNDLE")" >> artifacts/bundle.txt
+          unzip -q "$BUNDLE" -d /tmp/kwai
+          find /tmp/kwai -type f -printf '%P\t%s\n' | sort > artifacts/bundle-files.txt
+
+      - name: Verify and scan every APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          : > artifacts/apk-inventory.txt
+          : > artifacts/auth-class-hits.txt
+          : > artifacts/auth-manifest-hits.txt
+          : > artifacts/embedded-payloads.txt
+          PAT='PhoneAccountActivityV2|PhoneAccountActivity|PhoneVerifyActivity|ForcePhoneRegisterActivity|CommonLoginActivity|LoginActivity|LoginPlugin|BindPhoneActivity|ChangePhoneActivity|PhoneResetPsdActivity|VerifyPhoneActivity|PHONE_NUMBER_LOGIN_PAGE|PHONE_LOGIN_NEW|CLICK_PHONE_LOGIN|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|phone.?login|login.?phone'
+
+          while IFS= read -r apk; do
+            b="$(basename "$apk")"
+            sz="$(stat -c %s "$apk")"
+            cert="$($BT/apksigner verify --print-certs "$apk" 2>/dev/null | awk -F': ' '/certificate SHA-256 digest:/{print tolower($NF); exit}' | tr -d '[:space:]')"
+            echo -e "$b\t$sz\t$cert" >> artifacts/apk-inventory.txt
+
+            if "$BT/aapt" dump xmltree "$apk" AndroidManifest.xml >/tmp/m.xml 2>/dev/null; then
+              mh="$(grep -Ei -C 5 "$PAT" /tmp/m.xml || true)"
+              if [ -n "$mh" ]; then { echo "===== $b ====="; echo "$mh"; } >> artifacts/auth-manifest-hits.txt; fi
+            fi
+
+            tmp="$(mktemp -d)"
+            unzip -qq "$apk" 'classes*.dex' -d "$tmp" 2>/dev/null || true
+            for dex in "$tmp"/classes*.dex; do
+              [ -f "$dex" ] || continue
+              dh="$(strings "$dex" | grep -Ei "$PAT" | sort -u || true)"
+              if [ -n "$dh" ]; then { echo "===== $b :: $(basename "$dex") ====="; echo "$dh"; } >> artifacts/auth-class-hits.txt; fi
+            done
+            rm -rf "$tmp"
+
+            unzip -l "$apk" 2>/dev/null | grep -Ei 'assets/.*\.(apk|dex|jar|zip|7z|dat|so)|lib/.+\.so' | head -n 400 | sed "s#^#$b :: #" >> artifacts/embedded-payloads.txt || true
+          done < <(find /tmp/kwai -type f -name '*.apk' | sort)
+
+          echo '--- APK inventory ---'
+          cat artifacts/apk-inventory.txt
+          echo '--- auth manifest hits ---'
+          head -n 1400 artifacts/auth-manifest-hits.txt || true
+          echo '--- auth class/string hits ---'
+          head -n 1600 artifacts/auth-class-hits.txt || true
+          echo '--- embedded payload candidates ---'
+          head -n 1000 artifacts/embedded-payloads.txt || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-apkpure-auth-module-map-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
