@@ -1,0 +1,122 @@
+name: Kwai full 66MB bundle map
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-full-bundle-map.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  full-bundle-map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch fresh APKMirror bundle link
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai-full
+          python3 - <<'PY'
+          import html, re, urllib.request, urllib.parse, pathlib
+
+          ua={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/154 Safari/537.36'}
+          variant='https://www.apkmirror.com/apk/joyo-technology-pte-ltd-2/kwai-short-video-maker-community/kwai-video-drama-13-8-30-646601-release/kwai-video-drama-13-8-30-646601-android-apk-download/'
+
+          def get(url):
+              req=urllib.request.Request(url,headers=ua)
+              with urllib.request.urlopen(req,timeout=30) as r:
+                  return r.geturl(), r.read().decode('utf-8','ignore')
+
+          final, page=get(variant)
+          pathlib.Path('artifacts/apkmirror-variant-url.txt').write_text(final+'\n')
+
+          # APKMirror's first download step is a relative /download/?key=... URL.
+          candidates=[]
+          for pat in [
+              r'href=["\']([^"\']+/download/\?key=[^"\']+)["\']',
+              r'href=["\']([^"\']*download[^"\']*key=[^"\']+)["\']',
+          ]:
+              candidates += re.findall(pat,page,re.I)
+          candidates=[html.unescape(x) for x in candidates]
+          if not candidates:
+              pathlib.Path('artifacts/variant-head.html').write_text(page[:200000])
+              raise SystemExit('Could not find APKMirror first-stage download link')
+          stage1=urllib.parse.urljoin(variant,candidates[0])
+          pathlib.Path('artifacts/stage1-url.txt').write_text(stage1+'\n')
+
+          final2, page2=get(stage1)
+          pathlib.Path('artifacts/stage1-final-url.txt').write_text(final2+'\n')
+          pathlib.Path('artifacts/stage1-head.html').write_text(page2[:200000])
+
+          # Second stage points to wp-content/themes/APKMirror/download.php?id=...&key=...
+          hits=[]
+          for pat in [
+              r'href=["\']([^"\']*download\.php\?id=\d+&(?:amp;)?key=[^"\']+)["\']',
+              r'(https?://[^"\'<> ]*download\.php\?id=\d+&(?:amp;)?key=[^"\'<> ]+)',
+          ]:
+              hits += re.findall(pat,page2,re.I)
+          hits=[html.unescape(x).replace('&amp;','&') for x in hits]
+          if not hits:
+              raise SystemExit('Could not find APKMirror final download.php link')
+          final_download=urllib.parse.urljoin(final2,hits[0])
+          pathlib.Path('/tmp/final-url.txt').write_text(final_download+'\n')
+          # Do not print the temporary key into the log; retain only the endpoint id for diagnostics.
+          m=re.search(r'id=(\d+)',final_download)
+          pathlib.Path('artifacts/download-id.txt').write_text((m.group(1) if m else 'unknown')+'\n')
+          print('fresh_download_endpoint_ready=true')
+          PY
+
+      - name: Download and verify 66MB APKM
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="$(cat /tmp/final-url.txt)"
+          curl -fL --retry 3 --retry-delay 2 \
+            -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/154 Safari/537.36' \
+            -e 'https://www.apkmirror.com/' \
+            "$URL" -o /tmp/kwai-full/kwai.apkm
+
+          stat -c 'bytes=%s' /tmp/kwai-full/kwai.apkm | tee artifacts/bundle-size.txt
+          sha256sum /tmp/kwai-full/kwai.apkm | tee artifacts/bundle-sha256.txt
+          test "$(stat -c '%s' /tmp/kwai-full/kwai.apkm)" -gt 60000000
+          echo '536ae315a4d5d5742ba5d2073c4058a57e6f3abc89150fd4b3af23ab4159492a  /tmp/kwai-full/kwai.apkm' | sha256sum -c -
+
+          unzip -q /tmp/kwai-full/kwai.apkm -d /tmp/kwai-full/unpacked
+          find /tmp/kwai-full/unpacked -type f -printf '%P\t%s bytes\n' | sort | tee artifacts/bundle-files.txt
+
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          APKSIGNER="$BT/apksigner"
+          AAPT="$BT/aapt"
+          : > artifacts/apk-map.txt
+          : > artifacts/signatures.txt
+          n=0
+          bad=0
+          while IFS= read -r -d '' apk; do
+            n=$((n+1))
+            rel="${apk#/tmp/kwai-full/unpacked/}"
+            echo "===== $rel =====" >> artifacts/apk-map.txt
+            "$AAPT" dump badging "$apk" 2>/dev/null | head -n 12 >> artifacts/apk-map.txt || true
+            "$APKSIGNER" verify --print-certs "$apk" > /tmp/cert.txt 2>&1 || { echo "VERIFY_FAIL $rel" >> artifacts/signatures.txt; bad=$((bad+1)); continue; }
+            sha="$(awk -F': ' '/certificate SHA-256 digest:/{print tolower($NF); exit}' /tmp/cert.txt)"
+            echo "$rel sha256cert=$sha" >> artifacts/signatures.txt
+            if [ "$sha" != 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047' ]; then bad=$((bad+1)); fi
+          done < <(find /tmp/kwai-full/unpacked -type f -name '*.apk' -print0 | sort -z)
+          echo "apk_count=$n" | tee artifacts/apk-count.txt
+          echo "bad_signatures=$bad" | tee -a artifacts/apk-count.txt
+          test "$n" -ge 18
+          test "$bad" -eq 0
+
+          cat artifacts/bundle-files.txt
+          cat artifacts/apk-map.txt
+
+      - name: Upload bundle map
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-full-bundle-map-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
