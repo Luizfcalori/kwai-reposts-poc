@@ -73,9 +73,10 @@ jobs:
               shutil.copyfile(p,dst); copied.append(str(p))
           Path('artifacts/copied-sources.txt').write_text('\n'.join(copied)+'\n')
 
-          needles=['PhoneAccountActivityV2','ForcePhoneRegisterActivity','CommonLoginActivity','LoginActivity.class',
+          needles=['PhoneAccountActivityV2','PhoneAccountActivity','PhoneVerifyActivity','ForcePhoneRegisterActivity','CommonLoginActivity','LoginActivity.class',
                    'TinyNativeHomeActivity','TinyLoginActivity.class','inject_kwai_force_login','homeExists()',
-                   'isAvailable()','m26968c(','TinySprKwaiActivityContext','loginInfoSetting','arg_tiny_login_source']
+                   'isAvailable()','m26968c(','TinySprKwaiActivityContext','loginInfoSetting','arg_tiny_login_source',
+                   'PHONE_NUMBER_LOGIN_PAGE','PHONE_LOGIN_NEW','CLICK_PHONE_LOGIN','SIGNUP_PHONE','INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS']
           report=[]
           for p in src.rglob('*.java'):
             try:s=p.read_text(errors='ignore')
@@ -96,8 +97,7 @@ jobs:
               report.append('---')
           Path('artifacts/fullmode-references.txt').write_text('\n'.join(report),encoding='utf-8')
 
-          # Class existence and references summary.
-          names=['PhoneAccountActivityV2','ForcePhoneRegisterActivity','LoginActivity','CommonLoginActivity','TinySprKwaiInstrumentation','C6643i2']
+          names=['PhoneAccountActivityV2','PhoneAccountActivity','PhoneVerifyActivity','ForcePhoneRegisterActivity','LoginActivity','CommonLoginActivity','TinySprKwaiInstrumentation','C6643i2']
           summ=[]
           for name in names:
             decl=[]; refs=[]
@@ -112,7 +112,7 @@ jobs:
           PY
 
           echo '=== redirect/full mode excerpts ==='
-          grep -Eain -B12 -A35 'TinyNativeHomeActivity|PhoneAccountActivityV2|TinySprKwaiActivityContext|m26968c\(|TinyLoginActivity.class|homeExists\(' artifacts/fullmode-references.txt | head -n 500 || true
+          grep -Eain -B12 -A35 'TinyNativeHomeActivity|PhoneAccountActivity|PhoneVerifyActivity|ForcePhoneRegisterActivity|TinySprKwaiActivityContext|m26968c\(|TinyLoginActivity.class|homeExists\(|PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|SIGNUP_PHONE' artifacts/fullmode-references.txt | head -n 650 || true
 
       - name: Upload full-mode trace
         if: always()
