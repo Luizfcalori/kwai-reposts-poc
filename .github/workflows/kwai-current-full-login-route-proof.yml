@@ -1,0 +1,185 @@
+name: Kwai current full login route proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-current-full-login-route-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  full-login-route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Prepare current verified Kwai bundle and probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/full-route /tmp/kwai
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/kwai.json
+          python3 - <<'PY'
+          import json,pathlib,shlex
+          d=json.load(open('/tmp/kwai.json',encoding='utf-8'))
+          meta=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=meta.get('file') or {}
+          splits=(meta.get('aab') or {}).get('splits') or []
+          abi=next((s for s in splits if s.get('type')=='ABI' and 'arm64' in (s.get('name') or '').lower()),None)
+          den=next((s for s in splits if s.get('type')=='DENSITY' and 'mdpi' in (s.get('name') or '').lower()),None) or next((s for s in splits if s.get('type')=='DENSITY'),None)
+          vals={'BASE_URL':f.get('path') or f.get('path_alt'),'BASE_MD5':f.get('md5sum'),'VERSION':f.get('vername'),'VERCODE':f.get('vercode'),'ABI_URL':(abi or {}).get('path'),'DENSITY_URL':(den or {}).get('path')}
+          if not vals['BASE_URL'] or not vals['ABI_URL'] or not vals['DENSITY_URL']:
+              raise SystemExit('missing required split URLs')
+          pathlib.Path('/tmp/kwai.env').write_text('\n'.join(f'{k}={shlex.quote(str(v))}' for k,v in vals.items())+'\n')
+          pathlib.Path('artifacts/full-route/source.txt').write_text('\n'.join(f'{k}={v}' for k,v in vals.items())+'\n')
+          PY
+          source /tmp/kwai.env
+          curl -fL --retry 4 --retry-delay 2 "$BASE_URL" -o /tmp/kwai/base.apk
+          curl -fL --retry 4 --retry-delay 2 "$ABI_URL" -o /tmp/kwai/config.arm64_v8a.apk
+          curl -fL --retry 4 --retry-delay 2 "$DENSITY_URL" -o /tmp/kwai/config.mdpi.apk
+          curl -LsS --retry 4 --retry-delay 2 "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${BASE_MD5}/language=pt_PT" -o /tmp/dynamic.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/dynamic.json',encoding='utf-8'))
+          feat=next((x for x in (d.get('list') or []) if x.get('type')=='FEATURE' and x.get('path')),None)
+          if feat:pathlib.Path('/tmp/feature-url.txt').write_text(feat['path'])
+          PY
+          if [ -s /tmp/feature-url.txt ]; then curl -fL --retry 4 --retry-delay 2 "$(cat /tmp/feature-url.txt)" -o /tmp/kwai/feature.apk; fi
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BUILD_TOOLS/apksigner" verify --print-certs /tmp/kwai/base.apk > artifacts/full-route/base-cert.txt 2>&1
+          SHA256="$(awk -F': ' '/^V[0-9].* Signer: certificate SHA-256 digest:/{print tolower($NF); exit}' artifacts/full-route/base-cert.txt)"
+          test "$SHA256" = 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047'
+          "$BUILD_TOOLS/aapt" dump xmltree /tmp/kwai/base.apk AndroidManifest.xml > artifacts/full-route/manifest-xmltree.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          lines=Path('artifacts/full-route/manifest-xmltree.txt').read_text(errors='replace').splitlines()
+          keys=('PhoneAccountActivityV2','PhoneVerifyActivity','LoginActivity','LoginHalfActivity','SplashLoginActivity','TinyLaunchActivity','HomeActivity','scheme','host','authority','BROWSABLE','LAUNCHER')
+          keep=[]
+          for i,line in enumerate(lines):
+              if any(k.lower() in line.lower() for k in keys):
+                  a=max(0,i-12); b=min(len(lines),i+24)
+                  keep.append(f'--- around line {i+1} ---\n'+'\n'.join(lines[a:b]))
+          Path('artifacts/full-route/manifest-targets.txt').write_text('\n'.join(keep))
+          PY
+
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/full-route-probe.py <<'PY'
+          import pathlib,re,subprocess,time,xml.etree.ElementTree as ET
+          ART=pathlib.Path('artifacts/full-route')
+          PKG='com.kwai.video'
+          def adb(*a): return subprocess.run(['adb',*a],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+          def dump(tag):
+              adb('shell','uiautomator','dump','/sdcard/full-route.xml')
+              adb('pull','/sdcard/full-route.xml',str(ART/f'{tag}.xml'))
+              with open(ART/f'{tag}.png','wb') as f: subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
+              texts=[]
+              try:
+                  root=ET.parse(ART/f'{tag}.xml').getroot()
+                  for n in root.iter('node'):
+                      for k in ('text','content-desc','hint'):
+                          v=(n.attrib.get(k) or '').strip()
+                          if v and v not in texts:texts.append(v)
+              except Exception: pass
+              (ART/f'{tag}.txt').write_text('\n'.join(texts),encoding='utf-8')
+              return texts
+          def phoneish(texts):
+              s='\n'.join(texts)
+              return bool(re.search(r'phone number|mobile number|n[uú]mero de telefone|n[uú]mero do celular|country code|c[oó]digo do pa[ií]s|get code|send code|verification code|c[oó]digo de verifica|sms code',s,re.I))
+
+          queries=[]
+          for args in [
+              ('cmd','package','resolve-activity','--brief','-a','android.intent.action.MAIN','-c','android.intent.category.LAUNCHER',PKG),
+              ('cmd','package','query-activities','--brief','-a','android.intent.action.MAIN','-c','android.intent.category.LAUNCHER',PKG),
+              ('cmd','package','query-activities','--brief','-a','android.intent.action.VIEW','-c','android.intent.category.BROWSABLE'),
+          ]:
+              out=adb('shell',*args).stdout; queries.append(' '.join(args)+'\n'+out)
+          (ART/'package-queries.txt').write_text('\n---\n'.join(queries),encoding='utf-8')
+          pkg=adb('shell','dumpsys','package',PKG).stdout
+          (ART/'dumpsys-package.txt').write_text(pkg,encoding='utf-8')
+          interesting=[]
+          for line in pkg.splitlines():
+              if re.search(r'launch|homeactivity|tiny|login|phoneaccount|phoneverify|scheme|authority|myprofile|profile|account|auth',line,re.I): interesting.append(line)
+          (ART/'dumpsys-interesting.txt').write_text('\n'.join(interesting[:7000]),encoding='utf-8')
+
+          resolved=adb('shell','cmd','package','resolve-activity','--brief','-a','android.intent.action.MAIN','-c','android.intent.category.LAUNCHER',PKG).stdout.strip().splitlines()
+          candidates=[]
+          for line in resolved:
+              line=line.strip()
+              if '/' in line and line not in candidates:candidates.append(line)
+          for c in [
+              f'{PKG}/com.yxcorp.gifshow.homepage.HomeActivityAlias',
+              f'{PKG}/com.yxcorp.gifshow.homepage.HomeActivity',
+              f'{PKG}/com.yxcorp.gifshow.tiny.TinyLaunchActivity',
+          ]:
+              if c not in candidates:candidates.append(c)
+
+          records=[]
+          for i,c in enumerate(candidates[:8],1):
+              adb('shell','am','force-stop',PKG)
+              start=adb('shell','am','start','-W','-n',c).stdout
+              time.sleep(12)
+              pid=adb('shell','pidof',PKG).stdout.strip()
+              texts=dump(f'{i:02d}-launch-{c.rsplit(".",1)[-1]}')
+              rec=f'component={c} pid={bool(pid)} phoneish={phoneish(texts)} start={start.strip()!r} texts={texts[:60]!r}'
+              print(rec); records.append(rec)
+          (ART/'launch-attempts.txt').write_text('\n'.join(records)+'\n',encoding='utf-8')
+          PY
+
+          cat > /tmp/run-full-route.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; do sleep 3; done
+          APKS=(/tmp/kwai/base.apk /tmp/kwai/config.arm64_v8a.apk /tmp/kwai/config.mdpi.apk)
+          [ -f /tmp/kwai/feature.apk ] && APKS+=(/tmp/kwai/feature.apk)
+          adb install-multiple -r "${APKS[@]}" | tee artifacts/full-route/install.txt
+          adb shell pm grant com.kwai.video android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+          adb shell appops set com.kwai.video POST_NOTIFICATION allow 2>/dev/null || true
+          adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=|primaryCpuAbi=' | head -n20 | tee artifacts/full-route/version.txt || true
+          python3 /tmp/full-route-probe.py 2>&1 | tee artifacts/full-route/console.txt
+          SH
+          chmod +x /tmp/run-full-route.sh
+
+      - name: Boot Android and inspect full routes
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/run-full-route.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Current Kwai full login route probe'
+            cat artifacts/full-route/version.txt 2>/dev/null || true
+            echo
+            cat artifacts/full-route/package-queries.txt 2>/dev/null || true
+            echo
+            cat artifacts/full-route/launch-attempts.txt 2>/dev/null || true
+            echo
+            echo 'No phone number, OTP, credentials, upload, or publication attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-current-full-route-${{ github.run_id }}
+          path: artifacts/full-route/
+          if-no-files-found: error
+          retention-days: 1
