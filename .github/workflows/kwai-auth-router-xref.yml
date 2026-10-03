@@ -12,13 +12,13 @@ permissions:
 jobs:
   router-xref:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
-      - name: Download current Kwai base APK
+      - name: Download current Kwai base and dynamic split metadata
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifacts /tmp/kwai /tmp/jadx
+          mkdir -p artifacts /tmp/kwai/splits /tmp/jadx
           API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
           curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
           python3 - <<'PY'
@@ -27,11 +27,75 @@ jobs:
           m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
           f=m.get('file') or {}
           url=f.get('path') or f.get('path_alt') or ''
-          if not url: raise SystemExit('missing APK URL')
+          md5=f.get('md5sum') or ''
+          if not url or not md5: raise SystemExit('missing APK metadata')
           pathlib.Path('/tmp/base-url').write_text(url)
-          pathlib.Path('artifacts/version.txt').write_text(f"version={f.get('vername')}\nversionCode={f.get('vercode')}\n")
+          pathlib.Path('/tmp/base-md5').write_text(md5)
+          pathlib.Path('artifacts/version.txt').write_text(f"version={f.get('vername')}\nversionCode={f.get('vercode')}\nmd5={md5}\n")
           PY
           curl -fL --retry 4 --retry-delay 2 "$(cat /tmp/base-url)" -o /tmp/kwai/base.apk
+          curl -LsS --retry 4 --retry-delay 2 "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=$(cat /tmp/base-md5)/language=pt_PT" -o /tmp/dynamic.json
+          cp /tmp/dynamic.json artifacts/dynamic.json
+
+          python3 - <<'PY'
+          import json,pathlib,re
+          d=json.load(open('/tmp/dynamic.json',encoding='utf-8'))
+          rows=[]; urls=[]
+          for i,x in enumerate(d.get('list') or []):
+              if not isinstance(x,dict): continue
+              row={k:x.get(k) for k in ('name','type','md5sum','path','filesize') if x.get(k) is not None}
+              rows.append(row)
+              p=x.get('path')
+              if isinstance(p,str) and p.startswith('http'): urls.append((i,row.get('name') or row.get('type') or f'split{i}',p))
+          pathlib.Path('artifacts/dynamic-summary.txt').write_text('\n'.join(str(r) for r in rows),encoding='utf-8')
+          with open('/tmp/split-urls.tsv','w',encoding='utf-8') as f:
+              for i,name,url in urls:
+                  safe=re.sub(r'[^A-Za-z0-9_.-]+','_',str(name))[:80]
+                  f.write(f'{i}\t{safe}\t{url}\n')
+          PY
+
+          while IFS=$'\t' read -r idx name url; do
+            out="/tmp/kwai/splits/${idx}-${name}.apk"
+            echo "Downloading split $idx $name"
+            curl -fL --retry 3 --retry-delay 2 "$url" -o "$out" || rm -f "$out"
+          done < /tmp/split-urls.tsv
+          find /tmp/kwai/splits -type f -name '*.apk' -printf '%f %s bytes\n' | sort > artifacts/downloaded-splits.txt
+
+      - name: Locate phone-login classes across splits
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > artifacts/split-target-hits.txt
+          : > /tmp/matching-apks.txt
+          TARGET='PhoneAccountActivityV2|ForcePhoneRegisterActivity|PhoneVerifyActivity|BindPhoneActivity|ChangePhoneActivity|PhoneResetPsdActivity|PHONE_NUMBER_LOGIN_PAGE|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|CLICK_PHONE_LOGIN|PHONE_LOGIN_NEW'
+
+          scan_apk() {
+            apk="$1"
+            tmp="$(mktemp -d)"
+            unzip -qq "$apk" 'classes*.dex' -d "$tmp" 2>/dev/null || true
+            hit=0
+            for dex in "$tmp"/classes*.dex; do
+              [ -f "$dex" ] || continue
+              matches="$(strings "$dex" | grep -E "$TARGET" || true)"
+              if [ -n "$matches" ]; then
+                hit=1
+                {
+                  echo "===== $apk :: $(basename "$dex") ====="
+                  echo "$matches"
+                } >> artifacts/split-target-hits.txt
+              fi
+            done
+            rm -rf "$tmp"
+            if [ "$hit" -eq 1 ]; then echo "$apk" >> /tmp/matching-apks.txt; fi
+          }
+
+          scan_apk /tmp/kwai/base.apk
+          for apk in /tmp/kwai/splits/*.apk; do [ -f "$apk" ] && scan_apk "$apk"; done
+          sort -u /tmp/matching-apks.txt -o /tmp/matching-apks.txt
+          echo '--- matching APKs ---'
+          cat /tmp/matching-apks.txt || true
+          echo '--- target hits ---'
+          cat artifacts/split-target-hits.txt || true
 
       - name: Install JADX
         shell: bash
@@ -43,12 +107,20 @@ jobs:
           unzip -q /tmp/jadx.zip -d /tmp/jadx-bin
           /tmp/jadx-bin/bin/jadx --version | tee artifacts/jadx-version.txt
 
-      - name: Decompile and map phone-login router references
+      - name: Decompile matching splits and map router references
         shell: bash
         run: |
           set -euo pipefail
+          INPUTS=(/tmp/kwai/base.apk)
+          while IFS= read -r apk; do
+            [ -n "$apk" ] || continue
+            [ "$apk" = /tmp/kwai/base.apk ] && continue
+            INPUTS+=("$apk")
+          done < /tmp/matching-apks.txt
+          printf '%s\n' "${INPUTS[@]}" > artifacts/jadx-inputs.txt
+
           set +e
-          timeout 600 /tmp/jadx-bin/bin/jadx --no-res --show-bad-code -d /tmp/jadx /tmp/kwai/base.apk > artifacts/jadx-console.txt 2>&1
+          timeout 720 /tmp/jadx-bin/bin/jadx --no-res --show-bad-code -d /tmp/jadx "${INPUTS[@]}" > artifacts/jadx-console.txt 2>&1
           JRC=$?
           set -e
           echo "jadx_rc=$JRC" > artifacts/result.txt
@@ -59,31 +131,29 @@ jobs:
           grep -RInE "$PATTERN" "$SRC" > artifacts/all-hits.txt || true
 
           python3 - <<'PY'
-          import pathlib,re
+          import pathlib
           src=pathlib.Path('/tmp/jadx/sources')
           terms=[
             'PHONE_NUMBER_LOGIN_PAGE','CLICK_PHONE_LOGIN','PHONE_LOGIN_NEW','INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS',
             'PhoneAccountActivityV2','ForcePhoneRegisterActivity','PhoneVerifyActivity','BindPhoneActivity',
             'ChangePhoneActivity','PhoneResetPsdActivity','UriRouterActivity','ikwai://','kwai://'
           ]
-          out=[]
-          files=[]
+          out=[]; files=[]
           for p in src.rglob('*.java'):
             try: text=p.read_text(errors='ignore')
             except Exception: continue
-            if any(t in text for t in terms):
-              files.append(p)
-              lines=text.splitlines()
-              for i,line in enumerate(lines):
-                if any(t in line for t in terms):
-                  a=max(0,i-35); b=min(len(lines),i+36)
-                  out.append(f'===== {p.relative_to(src)}:{i+1} =====')
-                  out.extend(f'{n+1:06d}: {lines[n]}' for n in range(a,b))
+            if not any(t in text for t in terms): continue
+            files.append(p)
+            lines=text.splitlines()
+            for i,line in enumerate(lines):
+              if any(t in line for t in terms):
+                a=max(0,i-45); b=min(len(lines),i+46)
+                out.append(f'===== {p.relative_to(src)}:{i+1} =====')
+                out.extend(f'{n+1:06d}: {lines[n]}' for n in range(a,b))
           pathlib.Path('artifacts/xref-context.txt').write_text('\n'.join(out),encoding='utf-8')
           pathlib.Path('artifacts/hit-files.txt').write_text('\n'.join(str(p.relative_to(src)) for p in files),encoding='utf-8')
           PY
 
-          # Route-like constants close to login/auth code.
           grep -RhoE "(i?kwai|kwaiapp)://[A-Za-z0-9_./?=&%-]+" "$SRC" | sort -u > artifacts/all-kwai-routes.txt || true
           grep -Ei 'login|auth|phone|account|register|verify' artifacts/all-kwai-routes.txt > artifacts/auth-routes.txt || true
 
@@ -91,8 +161,8 @@ jobs:
           cat artifacts/hit-files.txt || true
           echo '--- candidate auth routes ---'
           cat artifacts/auth-routes.txt || true
-          echo '--- exact markers ---'
-          grep -E 'PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|PHONE_LOGIN_NEW|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|PhoneAccountActivityV2|ForcePhoneRegisterActivity|PhoneVerifyActivity|BindPhoneActivity' artifacts/all-hits.txt | head -n 300 || true
+          echo '--- class and route references ---'
+          grep -E 'PhoneAccountActivityV2|ForcePhoneRegisterActivity|PhoneVerifyActivity|BindPhoneActivity|ChangePhoneActivity|PhoneResetPsdActivity|ikwai://|kwai://' artifacts/all-hits.txt | head -n 500 || true
 
       - name: Upload evidence
         if: always()
