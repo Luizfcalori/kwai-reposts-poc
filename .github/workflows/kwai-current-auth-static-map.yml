@@ -1,0 +1,63 @@
+name: Kwai current auth static map
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-current-auth-static-map.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  auth-map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download current Kwai base and map auth surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}
+          pathlib.Path('/tmp/base-url').write_text(f.get('path') or f.get('path_alt') or '')
+          pathlib.Path('artifacts/version.txt').write_text(f"version={f.get('vername')}\nversionCode={f.get('vercode')}\n")
+          PY
+          curl -fL "$(cat /tmp/base-url)" -o /tmp/kwai/base.apk
+
+          AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -1)"
+          test -n "$AAPT"
+          "$AAPT" dump badging /tmp/kwai/base.apk > artifacts/badging.txt
+          "$AAPT" dump xmltree /tmp/kwai/base.apk AndroidManifest.xml > artifacts/manifest-tree.txt
+
+          # Exported/auth-related manifest lines and intent filters.
+          grep -Ein -C 4 'login|sign.?in|auth|phone|mobile|account|scheme|host|exported|BROWSABLE' artifacts/manifest-tree.txt > artifacts/auth-manifest-hits.txt || true
+
+          # Class/string hints from DEX; useful for discovering phone-login activity names and route tokens.
+          unzip -q /tmp/kwai/base.apk 'classes*.dex' -d /tmp/kwai/dex || true
+          : > artifacts/auth-dex-strings.txt
+          for f in /tmp/kwai/dex/classes*.dex; do
+            [ -f "$f" ] || continue
+            strings "$f" | grep -Ei 'phone.{0,40}(login|sign|auth)|(?:login|sign|auth).{0,40}phone|mobile.{0,40}(login|sign|auth)|PhoneLogin|PhoneAuth|MobileLogin|login/phone|phone/login|kwai://|kwaiapp://' >> artifacts/auth-dex-strings.txt || true
+          done
+          sort -u artifacts/auth-dex-strings.txt -o artifacts/auth-dex-strings.txt
+
+          echo '--- candidate exported auth components ---'
+          grep -Ei 'activity|login|auth|phone|mobile|scheme|host' artifacts/auth-manifest-hits.txt | head -n 300 || true
+          echo '--- candidate DEX strings ---'
+          head -n 300 artifacts/auth-dex-strings.txt || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-current-auth-map-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
