@@ -76,115 +76,459 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
           cat > /tmp/ui_probe.py <<'PY'
-          import pathlib,re,subprocess,time,xml.etree.ElementTree as ET
-          ART=pathlib.Path('artifacts')
-          def adb(*a):
-              return subprocess.run(['adb',*a],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-          def center(v):
-              m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',v or '')
-              if not m:return None
-              x1,y1,x2,y2=map(int,m.groups()); return ((x1+x2)//2,(y1+y2)//2)
+          #!/usr/bin/env python3
+          import pathlib
+          import re
+          import subprocess
+          import time
+          import xml.etree.ElementTree as ET
+          
+          ART = pathlib.Path("artifacts/ui")
+          ART.mkdir(parents=True, exist_ok=True)
+          
+          
+          def run(*args, check=False):
+              p = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              if check and p.returncode:
+                  raise RuntimeError(f"command failed {p.returncode}: {' '.join(args)}\n{p.stdout}")
+              return p.returncode, p.stdout
+          
+          
+          def adb(*args, check=False):
+              return run("adb", *args, check=check)
+          
+          
+          def screen_size():
+              _, out = adb("shell", "wm", "size")
+              m = re.search(r"(\d+)x(\d+)", out)
+              return (int(m.group(1)), int(m.group(2))) if m else (1080, 2400)
+          
+          
+          def parse_bounds(value):
+              m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", value or "")
+              if not m:
+                  return None
+              x1, y1, x2, y2 = map(int, m.groups())
+              return (x1 + x2) // 2, (y1 + y2) // 2
+          
+          
+          def node_texts(root):
+              vals = []
+              if root is None:
+                  return vals
+              for node in root.iter("node"):
+                  for key in ("text", "content-desc"):
+                      value = (node.attrib.get(key) or "").strip()
+                      if value and value not in vals:
+                          vals.append(value)
+              return vals
+          
+          
           def dump(tag):
-              adb('shell','uiautomator','dump','/sdcard/u.xml')
-              adb('pull','/sdcard/u.xml',str(ART/f'{tag}.xml'))
-              with open(ART/f'{tag}.png','wb') as f:
-                  subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
-              texts=[]; root=None
+              remote = "/sdcard/kwai-probe.xml"
+              adb("shell", "rm", "-f", remote)
+              rc, out = adb("shell", "uiautomator", "dump", remote)
+              (ART / f"{tag}-dump-status.txt").write_text(f"rc={rc}\n{out}", encoding="utf-8")
+              xml_path = ART / f"{tag}.xml"
+              adb("pull", remote, str(xml_path))
+              with open(ART / f"{tag}.png", "wb") as f:
+                  subprocess.run(["adb", "exec-out", "screencap", "-p"], stdout=f, stderr=subprocess.DEVNULL)
               try:
-                  root=ET.parse(ART/f'{tag}.xml').getroot()
-                  for n in root.iter('node'):
-                      for k in ('text','content-desc','hint'):
-                          v=(n.attrib.get(k) or '').strip()
-                          if v and v not in texts:texts.append(v)
-              except Exception: pass
-              (ART/f'{tag}-texts.txt').write_text('\n'.join(texts),encoding='utf-8')
-              return root,texts
-          def tap(root,patterns):
-              if root is None:return False
-              regs=[re.compile(p,re.I) for p in patterns]
-              for n in root.iter('node'):
-                  label=' '.join(filter(None,[n.attrib.get('text',''),n.attrib.get('content-desc',''),n.attrib.get('hint','')])).strip()
-                  if label and any(r.search(label) for r in regs):
-                      p=center(n.attrib.get('bounds',''))
-                      if p:
-                          print('tap',label,p)
-                          adb('shell','input','tap',str(p[0]),str(p[1])); time.sleep(4); return True
+                  root = ET.parse(xml_path).getroot()
+              except Exception:
+                  root = None
+              texts = node_texts(root)
+              (ART / f"{tag}.txt").write_text("\n".join(texts), encoding="utf-8")
+              return root, texts
+          
+          
+          def tap_node(root, matcher):
+              if root is None:
+                  return False
+              for node in root.iter("node"):
+                  label = " ".join(filter(None, [node.attrib.get("text", ""), node.attrib.get("content-desc", "")])).strip()
+                  if matcher(label):
+                      point = parse_bounds(node.attrib.get("bounds", ""))
+                      if point:
+                          adb("shell", "input", "tap", str(point[0]), str(point[1]))
+                          return True
               return False
-          def tap_id(root,suffix):
-              if root is None:return False
-              for n in root.iter('node'):
-                  rid=n.attrib.get('resource-id','')
-                  if rid.endswith(suffix):
-                      p=center(n.attrib.get('bounds',''))
-                      if p:
-                          print('tap-id',rid,p)
-                          adb('shell','input','tap',str(p[0]),str(p[1])); time.sleep(4); return True
+          
+          
+          def tap_resource_id(root, resource_id):
+              if root is None:
+                  return False
+              for node in root.iter("node"):
+                  if node.attrib.get("resource-id") == resource_id:
+                      point = parse_bounds(node.attrib.get("bounds", ""))
+                      if point:
+                          adb("shell", "input", "tap", str(point[0]), str(point[1]))
+                          return True
               return False
-          def has_id(root,suffix):
-              return root is not None and any((n.attrib.get('resource-id','') or '').endswith(suffix) for n in root.iter('node'))
-          def has(texts,pats):
-              s='\n'.join(texts)
-              return any(re.search(p,s,re.I) for p in pats)
-          def hide_overlay(root,texts,tag):
-              if tap(root,[r'^Hide$',r'^Ocultar$',r'^Close$',r'^Fechar$']):
-                  return dump(tag), True
-              return (root,texts), False
-          def open_profile(root,texts,tag):
-              if not tap(root,[r'^Profile$',r'^Me$',r'^Eu$',r'^Perfil$',r'^Account$',r'^Conta$']):
-                  adb('shell','input','tap','1000','2290'); time.sleep(5)
-              return dump(tag)
-
-          phone=[r'phone number',r'mobile number',r'n[uú]mero de telefone',r'n[uú]mero do celular',r'country code',r'c[oó]digo do pa[ií]s',r'get code',r'send code',r'verification code',r'c[oó]digo de verifica',r'sms code']
-          crash=[r'keeps stopping',r'has stopped',r'isn.?t responding']
-          def is_phone_form(root,texts):
-              # A phone choice in the provider menu is not yet the phone entry form.
-              if root is None:return False
-              fields=[n for n in root.iter('node')
-                      if n.attrib.get('package')=='com.kwai.video'
-                      and n.attrib.get('class')=='android.widget.EditText'
-                      and n.attrib.get('enabled')=='true']
-              return bool(fields) and has(texts,phone)
-          root,texts=dump('01-launch')
-
-          # Preference cards require a vote followed by an upward swipe (observed 1/9).
-          onboarding_steps=0
-          for i in range(24):
-              if not has_id(root,'tiny_discovery_like_button'):
-                  break
-              if has(texts,[r'Swipe up',r'Deslize.*cima']):
-                  adb('shell','input','swipe','540','1750','540','500','450')
+          
+          
+          def contains(texts, pattern):
+              rx = re.compile(pattern, re.I)
+              return any(rx.search(t) for t in texts)
+          
+          
+          def is_login_screen(texts):
+              joined = "\n".join(texts)
+              return bool(re.search(
+                  r"phone number|telefone|mobile number|e-?mail|continue with|google|facebook|"
+                  r"log in|login|sign in|entrar|verification code|c[oó]digo de verifica|"
+                  r"sign up|cadastre-se|create account",
+                  joined,
+                  re.I,
+              ))
+          
+          
+          def onboarding_counter(texts):
+              m = re.search(r"\b(\d+)/(\d+)\b", "\n".join(texts))
+              if not m:
+                  return None
+              current, total = int(m.group(1)), int(m.group(2))
+              if total < 2 or total > 50 or current < 1 or current > total:
+                  return None
+              return current, total
+          
+          
+          def dismiss_safe_system_overlays(round_no):
+              root, texts = dump(f"overlay-{round_no}")
+              joined = "\n".join(texts)
+              if re.search(r"Pixel Launcher.*isn't responding", joined, re.I):
+                  if tap_node(root, lambda s: s.strip().lower() == "close app"):
+                      time.sleep(2)
+                      return True
+              if contains(texts, r"send you notifications|notifications"):
+                  if tap_node(root, lambda s: s.strip().lower() in {"allow", "while using the app"}):
+                      time.sleep(2)
+                      return True
+              return False
+          
+          
+          def swipe_next(root, texts, w, h, step):
+              before = onboarding_counter(texts)
+              attempts = [
+                  (0.38, 0.82, 0.38, 0.16, 1200),
+                  (0.50, 0.79, 0.50, 0.18, 900),
+                  (0.62, 0.80, 0.62, 0.14, 700),
+                  (0.50, 0.86, 0.50, 0.12, 1500),
+              ]
+              for attempt, (x1, y1, x2, y2, duration) in enumerate(attempts, start=1):
+                  adb("shell", "input", "touchscreen", "swipe",
+                      str(int(w*x1)), str(int(h*y1)), str(int(w*x2)), str(int(h*y2)), str(duration))
+                  time.sleep(3)
+                  root, texts = dump(f"02-onboarding-{step:02d}-swipe-{attempt}")
+                  after = onboarding_counter(texts)
+                  print(f"onboarding swipe attempt={attempt} before={before} after={after} duration_ms={duration}")
+                  if before and after and after != before:
+                      return root, texts, True
+                  if before and not after:
+                      return root, texts, True
+                  if not contains(texts, r"swipe up to view the next video") and after != before:
+                      return root, texts, True
+              return root, texts, False
+          
+          
+          def run_onboarding(root, texts, w, h):
+              steps = 0
+              failures = 0
+              last_counter = onboarding_counter(texts)
+              for step in range(1, 51):
+                  joined = "\n".join(texts)
+                  if not (onboarding_counter(texts) or re.search(r"choose like or dislike|know you better|swipe up to view the next video", joined, re.I)):
+                      break
+                  steps += 1
+                  print(f"onboarding step={step} counter={onboarding_counter(texts)}")
+                  chose = tap_resource_id(root, "com.kwai.video:id/tiny_discovery_like_button")
+                  if not chose and re.search(r"choose like or dislike|know you better", joined, re.I):
+                      adb("shell", "input", "tap", str(int(w*0.27)), str(int(h*0.915)))
+                      chose = True
+                  if chose:
+                      time.sleep(1.5)
+                      root, texts = dump(f"02-onboarding-{step:02d}-chosen")
+                  current = onboarding_counter(texts)
+                  joined = "\n".join(texts)
+                  if current or re.search(r"swipe up to view the next video", joined, re.I):
+                      if current and current[0] >= current[1] and not re.search(r"swipe up to view the next video", joined, re.I):
+                          time.sleep(2)
+                          root, texts = dump(f"02-onboarding-{step:02d}-complete-check")
+                          last_counter = onboarding_counter(texts)
+                          continue
+                      root, texts, advanced = swipe_next(root, texts, w, h, step)
+                      if not advanced:
+                          failures += 1
+                          break
+                      last_counter = onboarding_counter(texts)
+                  elif chose:
+                      time.sleep(1)
+                      root, texts = dump(f"02-onboarding-{step:02d}-advanced")
+                      last_counter = onboarding_counter(texts)
+                  else:
+                      break
+              return root, texts, steps, failures, last_counter
+          
+          
+          def skip_slow_loader(root, texts, w, h, tag):
+              slow = contains(texts, r"internet.?s a bit slow|hang in there|^Skip$")
+              if not slow:
+                  return root, texts, False
+          
+              skipped = tap_node(root, lambda s: s.strip().lower() == "skip")
+              if not skipped:
+                  adb("shell", "input", "tap", str(int(w*0.73)), str(int(h*0.88)))
+                  skipped = True
+          
+              time.sleep(3)
+              root, texts = dump(f"{tag}-confirm")
+              if contains(texts, r"skip the preparation|^yes, skip$"):
+                  confirmed = tap_node(root, lambda s: s.strip().lower() == "yes, skip")
+                  if not confirmed:
+                      adb("shell", "input", "tap", str(int(w*0.35)), str(int(h*0.62)))
+                  time.sleep(7)
+                  root, texts = dump(tag)
+              else:
                   time.sleep(4)
-              elif not tap_id(root,'tiny_discovery_like_button'):
-                  break
-              onboarding_steps += 1
-              root,texts=dump(f'01-onboarding-{onboarding_steps}')
-          print('onboarding_steps=',onboarding_steps)
-
-          (root,texts),_=hide_overlay(root,texts,'01b-after-hide')
-          if has(texts,crash):
-              state='crash'
-          else:
-              tap(root,[r'^Skip$',r'^Pular$',r'Not now',r'Agora n[aã]o'])
-              root,texts=dump('02-after-skip')
-              (root,texts),_=hide_overlay(root,texts,'02b-after-hide')
-              if not is_phone_form(root,texts):
-                  root,texts=open_profile(root,texts,'03-profile')
-                  (root,texts),hidden=hide_overlay(root,texts,'03b-after-hide')
-                  if hidden and not is_phone_form(root,texts):
-                      root,texts=open_profile(root,texts,'03c-profile-retry')
-                      (root,texts),_=hide_overlay(root,texts,'03d-after-second-hide')
-              if not is_phone_form(root,texts):
-                  tap(root,[r'^Log in$',r'^Login$',r'^Sign in$',r'^Entrar$',r'^Fazer login$',r'Sign up or log in',r'Cadastre-se ou entre'])
-                  root,texts=dump('04-login')
-                  (root,texts),_=hide_overlay(root,texts,'04b-after-hide')
-              if not is_phone_form(root,texts):
-                  tap(root,[r'phone number',r'mobile number',r'continue with phone',r'log in with phone',r'sign in with phone',r'usar telefone',r'entrar com telefone',r'^Phone$',r'^Telefone$'])
-                  root,texts=dump('05-phone')
-                  (root,texts),_=hide_overlay(root,texts,'05b-after-hide')
-              state='phone_login' if is_phone_form(root,texts) else ('login_screen' if has(texts,[r'login',r'log in',r'sign in',r'entrar',r'google']) else 'app_open')
-          pathlib.Path('artifacts/result.txt').write_text(f'state={state}\nphone_route_detected={str(state=="phone_login").lower()}\nonboarding_steps={onboarding_steps}\n')
-          print('state=',state)
-          print('final_screen_texts=',texts)
+                  root, texts = dump(tag)
+          
+              return root, texts, skipped
+          
+          
+          def finish_onboarding(root, texts, w, h):
+              finished = False
+              if contains(texts, r"you.?re all set|hope you enjoy the kwai|^start now$"):
+                  finished = tap_node(root, lambda s: s.strip().lower() == "start now")
+                  if not finished:
+                      adb("shell", "input", "tap", str(int(w*0.50)), str(int(h*0.91)))
+                      finished = True
+                  time.sleep(8)
+                  root, texts = dump("03b-after-start-now")
+              return root, texts, finished
+          
+          
+          def tap_profile(root, w, h):
+              patterns = [r"^Profile$", r"^Me$", r"^Eu$", r"^Perfil$", r"^Account$", r"^Conta$"]
+              for pat in patterns:
+                  rx = re.compile(pat, re.I)
+                  if tap_node(root, lambda s, rx=rx: bool(rx.search(s))):
+                      return "semantic"
+              adb("shell", "input", "tap", str(int(w*0.92)), str(int(h*0.955)))
+              return "coordinate"
+          
+          
+          def try_login_button(root, texts):
+              login_patterns = [
+                  r"^Log in$", r"^Login$", r"^Sign in$", r"^Entrar$", r"^Fazer login$",
+                  r"^Sign up or log in$", r"^Cadastre-se ou entre$", r"^Entrar ou cadastrar$",
+                  r"Log in to", r"Sign in to",
+              ]
+              for pat in login_patterns:
+                  rx = re.compile(pat, re.I)
+                  if tap_node(root, lambda s, rx=rx: bool(rx.search(s))):
+                      time.sleep(5)
+                      root, texts = dump("04-login-button")
+                      return True, root, texts
+              return False, root, texts
+          
+          
+          def auth_fallback(root, texts, w, h):
+              attempts = []
+              if contains(texts, r"Resource downloading|access to all the features when it.s done"):
+                  hidden = tap_node(root, lambda s: s.strip().lower() == "hide")
+                  attempts.append(f"hide_resource={hidden}")
+                  time.sleep(3)
+                  root, texts = dump("04-fallback-hidden")
+          
+              inbox_rx = re.compile(r"^(Inbox|Messages|Caixa de entrada|Mensagens)$", re.I)
+              inbox = tap_node(root, lambda s: bool(inbox_rx.search(s)))
+              if not inbox:
+                  adb("shell", "input", "tap", str(int(w*0.70)), str(int(h*0.955)))
+                  inbox = True
+              attempts.append(f"inbox={inbox}")
+              time.sleep(6)
+              root, texts = dump("04-fallback-inbox")
+              if is_login_screen(texts):
+                  return root, texts, "inbox", attempts
+          
+              root, texts, skipped = skip_slow_loader(root, texts, w, h, "04-fallback-inbox-skip")
+              if skipped:
+                  attempts.append("skip_after_inbox=True")
+                  if is_login_screen(texts):
+                      return root, texts, "inbox-skip", attempts
+                  inbox = tap_node(root, lambda s: bool(inbox_rx.search(s)))
+                  if not inbox:
+                      adb("shell", "input", "tap", str(int(w*0.70)), str(int(h*0.955)))
+                  time.sleep(6)
+                  root, texts = dump("04-fallback-inbox-retry")
+                  if is_login_screen(texts):
+                      return root, texts, "inbox-retry", attempts
+          
+              if contains(texts, r"Resource downloading|access to all the features when it.s done"):
+                  tap_node(root, lambda s: s.strip().lower() == "hide")
+                  time.sleep(2)
+                  root, texts = dump("04-fallback-inbox-hidden")
+          
+              follow_rx = re.compile(r"^(Follow|Seguir)$", re.I)
+              followed = tap_node(root, lambda s: bool(follow_rx.search(s)))
+              attempts.append(f"follow_entry={followed}")
+              if followed:
+                  time.sleep(6)
+                  root, texts = dump("04-fallback-follow")
+                  if is_login_screen(texts):
+                      return root, texts, "follow", attempts
+          
+              tap_profile(root, w, h)
+              time.sleep(6)
+              root, texts = dump("04-fallback-profile")
+              root, texts, skipped = skip_slow_loader(root, texts, w, h, "04-fallback-profile-skip")
+              if skipped:
+                  attempts.append("skip_after_profile=True")
+              clicked, root, texts = try_login_button(root, texts)
+              attempts.append(f"profile_login_button={clicked}")
+              if clicked or is_login_screen(texts):
+                  return root, texts, "profile", attempts
+          
+              return root, texts, "none", attempts
+          
+          
+          def save_package_diagnostics():
+              _, out = adb("shell", "dumpsys", "package", "com.kwai.video")
+              interesting = []
+              for line in out.splitlines():
+                  if re.search(r"login|sign.?in|auth|account|profile|activity", line, re.I):
+                      interesting.append(line)
+              pathlib.Path("artifacts/package-activity-candidates.txt").write_text(
+                  "\n".join(interesting[:4000]) + "\n", encoding="utf-8"
+              )
+          
+          
+          
+          def is_phone_form(root, texts):
+              if root is None:
+                  return False
+              fields = [n for n in root.iter("node")
+                        if n.get("package") == "com.kwai.video"
+                        and n.get("class") == "android.widget.EditText"
+                        and n.get("enabled") == "true"]
+              return bool(fields) and contains(texts, r"phone number|mobile number|telefone|celular|country code|c[oó]digo do pa[ií]s")
+          
+          def open_phone_option(root, texts, tag):
+              if not is_phone_form(root, texts):
+                  chosen = tap_node(root, lambda s: bool(re.search(
+                      r"phone|mobile|telefone|celular", s, re.I)) and not re.search(r"terms|privacy|policy", s, re.I))
+                  if chosen:
+                      time.sleep(5)
+                      root, texts = dump(tag)
+              return root, texts
+          
+          def phone_route(root, texts, w, h):
+              root, texts = open_phone_option(root, texts, "06-phone-option")
+              if is_phone_form(root, texts):
+                  return root, texts
+              # These are standard activity entry points; Android still enforces exported access.
+              # No root, account data, phone entry or SMS submission is used.
+              for i, activity in enumerate([
+                  "com.yxcorp.gifshow.homepage.HomeActivity",
+                  "com.yxcorp.gifshow.login.PhoneAccountActivityV2",
+              ], 1):
+                  _, launch = adb("shell", "am", "start", "-W", "-n", f"com.kwai.video/{activity}")
+                  (ART / f"06-entry-{i}.txt").write_text(launch, encoding="utf-8")
+                  if "Error" in launch or "Permission Denial" in launch or "Exception" in launch:
+                      continue
+                  time.sleep(10)
+                  root, texts = dump(f"06-entry-{i}")
+                  if is_phone_form(root, texts):
+                      break
+                  if activity.endswith("HomeActivity"):
+                      tap_profile(root, w, h)
+                      time.sleep(5)
+                      root, texts = dump("06-full-profile")
+                      _, root, texts = try_login_button(root, texts)
+                  root, texts = open_phone_option(root, texts, f"06-phone-{i}")
+                  if is_phone_form(root, texts):
+                      break
+              return root, texts
+          
+          
+          def main():
+              w, h = screen_size()
+              print(f"screen={w}x{h}")
+              adb("shell", "pm", "grant", "com.kwai.video", "android.permission.POST_NOTIFICATIONS")
+              adb("shell", "am", "force-stop", "com.kwai.video")
+              adb("shell", "am", "start", "-n", "com.kwai.video/com.yxcorp.gifshow.tiny.TinyLaunchActivity")
+              time.sleep(12)
+          
+              for i in range(3):
+                  if not dismiss_safe_system_overlays(i):
+                      break
+          
+              root, texts = dump("01-first-clear-view")
+              root, texts, onboarding_steps, swipe_failures, final_onboarding_counter = run_onboarding(root, texts, w, h)
+              root, texts = dump("03-after-onboarding")
+              root, texts, clicked_start_now = finish_onboarding(root, texts, w, h)
+              root, texts, clicked_skip_slow = skip_slow_loader(root, texts, w, h, "03c-after-slow-skip")
+          
+              profile_tap_method = tap_profile(root, w, h)
+              time.sleep(6)
+              root, texts = dump("04-profile-attempt")
+          
+              resource_seen = contains(texts, r"Resource downloading|access to all the features when it.s done")
+              resource_completed = not resource_seen
+              resource_wait_seconds = 0
+              if resource_seen:
+                  for step in range(1, 4):
+                      time.sleep(10)
+                      resource_wait_seconds += 10
+                      root, texts = dump(f"04-resource-wait-{step:02d}")
+                      if not contains(texts, r"Resource downloading|access to all the features when it.s done"):
+                          resource_completed = True
+                          break
+          
+              clicked_login, root, texts = try_login_button(root, texts)
+              fallback_method = "not_needed"
+              fallback_attempts = []
+              if not clicked_login and not is_login_screen(texts):
+                  root, texts, fallback_method, fallback_attempts = auth_fallback(root, texts, w, h)
+          
+              root, texts = dump("05-login-options")
+              root, texts = phone_route(root, texts, w, h)
+              root, texts = dump("07-final-phone")
+              login_screen = is_login_screen(texts)
+              phone_login = is_phone_form(root, texts)
+              pathlib.Path("artifacts/result.txt").write_text(f"state={'phone_login' if phone_login else 'login_screen' if login_screen else 'app_open'}\nphone_route_detected={str(phone_login).lower()}\n")
+              save_package_diagnostics()
+          
+              result = {
+                  "onboarding_steps": onboarding_steps,
+                  "swipe_failures": swipe_failures,
+                  "final_onboarding_counter": final_onboarding_counter,
+                  "clicked_start_now": clicked_start_now,
+                  "clicked_skip_slow": clicked_skip_slow,
+                  "profile_tap_method": profile_tap_method,
+                  "resource_seen": resource_seen,
+                  "resource_completed": resource_completed,
+                  "resource_wait_seconds": resource_wait_seconds,
+                  "clicked_login": clicked_login,
+                  "fallback_method": fallback_method,
+                  "fallback_attempts": ";".join(fallback_attempts),
+                  "login_screen_detected": login_screen,
+                  "phone_route_detected": phone_login,
+                  "final_screen_texts": repr(texts),
+                  "pid": adb("shell", "pidof", "com.kwai.video")[1].strip(),
+              }
+              pathlib.Path("artifacts/ui-result.txt").write_text(
+                  "\n".join(f"{k}={v}" for k, v in result.items()) + "\n", encoding="utf-8"
+              )
+              print(result)
+              if not result["pid"]:
+                  raise SystemExit("Kwai process stopped during safe UI probe")
+              if not phone_login:
+                  raise SystemExit("Phone input form not reached; evidence saved for the next targeted adjustment")
+          
+          
+          if __name__ == "__main__":
+              main()
           PY
 
           cat > /tmp/test-api35.sh <<'SH'
@@ -204,6 +548,7 @@ jobs:
           AAPT="$BUILD_TOOLS/aapt"
           APKSIGNER="$BUILD_TOOLS/apksigner"
           "$AAPT" dump badging /tmp/kwai/base.apk > artifacts/base-badging.txt
+          "$AAPT" dump xmltree /tmp/kwai/base.apk AndroidManifest.xml > artifacts/base-manifest.txt
           PACKAGE="$(awk -F"'" '/^package: name=/{print $2; exit}' artifacts/base-badging.txt)"
           test "$PACKAGE" = 'com.kwai.video'
           "$APKSIGNER" verify --print-certs /tmp/kwai/base.apk > artifacts/base-cert.txt 2>&1
@@ -232,9 +577,13 @@ jobs:
           adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=|primaryCpuAbi=' | head -n 20 | tee artifacts/installed-version.txt || true
           adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt
           sleep 20
-          python3 /tmp/ui_probe.py 2>&1 | tee artifacts/ui-probe-console.txt
+          set +e
+          python3 -u /tmp/ui_probe.py 2>&1 | tee artifacts/ui-probe-console.txt
+          PROBE_RC=${PIPESTATUS[0]}
+          set -e
           adb shell pidof com.kwai.video | tee artifacts/pid.txt || true
           adb logcat -d -t 1500 > artifacts/logcat.txt || true
+          exit "$PROBE_RC"
           SH
           chmod +x /tmp/test-api35.sh
 
