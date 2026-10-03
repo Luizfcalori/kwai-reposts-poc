@@ -27,21 +27,21 @@ jobs:
           API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
           curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
           python3 - <<'PY'
-          import json,pathlib
+          import json,pathlib,shlex
           d=json.load(open('/tmp/meta.json',encoding='utf-8'))
           m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
           f=m.get('file') or {}; splits=(m.get('aab') or {}).get('splits') or []
           abi=next(s for s in splits if s.get('type')=='ABI' and 'arm64' in (s.get('name') or '').lower())
-          den=next((s for s in splits if s.get('type')=='DENSITY' and 'mdpi' in (s.get('name') or '').lower()),None) or next(s for s in splits if s.get('type')=='DENSITY')
+          den=next((s for s in splits if s.get('type')=='DENSITY' and 'hdpi' in (s.get('name') or '').lower()),None) or next(s for s in splits if s.get('type')=='DENSITY')
           vals={'BASE':f.get('path') or f.get('path_alt'),'MD5':f.get('md5sum'),'VERSION':f.get('vername'),'ABI':abi.get('path'),'DENSITY':den.get('path')}
           if not all(vals.values()): raise SystemExit('missing bundle metadata')
-          pathlib.Path('/tmp/meta.env').write_text('\n'.join(f'{k}={v}' for k,v in vals.items())+'\n')
+          pathlib.Path('/tmp/meta.env').write_text('\n'.join(f'{k}={shlex.quote(str(v))}' for k,v in vals.items())+'\n')
           pathlib.Path('artifacts/source.txt').write_text('\n'.join(f'{k}={v}' for k,v in vals.items())+'\n')
           PY
           source /tmp/meta.env
           curl -fL --retry 4 --retry-delay 2 "$BASE" -o /tmp/kwai/base.apk
           curl -fL --retry 4 --retry-delay 2 "$ABI" -o /tmp/kwai/config.arm64_v8a.apk
-          curl -fL --retry 4 --retry-delay 2 "$DENSITY" -o /tmp/kwai/config.mdpi.apk
+          curl -fL --retry 4 --retry-delay 2 "$DENSITY" -o /tmp/kwai/config.density.apk
           curl -LsS "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${MD5}/language=pt_PT" -o /tmp/dynamic.json
           python3 - <<'PY'
           import json,pathlib
@@ -62,15 +62,13 @@ jobs:
               adb('shell','uiautomator','dump','/sdcard/route.xml')
               adb('pull','/sdcard/route.xml',str(A/f'{tag}.xml'))
               with open(A/f'{tag}.png','wb') as f: subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
-              texts=[]; cls=[]
+              texts=[]
               try:
                   root=ET.parse(A/f'{tag}.xml').getroot()
                   for n in root.iter('node'):
                       for k in ('text','content-desc','hint'):
                           v=(n.attrib.get(k) or '').strip()
                           if v and v not in texts: texts.append(v)
-                      c=(n.attrib.get('class') or '').strip()
-                      if c and c not in cls: cls.append(c)
               except Exception: pass
               top=adb('shell','dumpsys','activity','activities').stdout
               m=re.search(r'mResumedActivity:.*? ([^ ]+)/(\S+)',top)
@@ -81,28 +79,33 @@ jobs:
               s='\n'.join(texts)
               if re.search(r'phone number|mobile number|n[uú]mero de telefone|country code|get code|send code|c[oó]digo de verifica',s,re.I): return 'phone'
               if 'PhoneAccountActivity' in resumed or 'PhoneVerifyActivity' in resumed: return 'phone_activity'
-              if re.search(r'continue with google',s,re.I) and 'tiny' in resumed.lower(): return 'tiny_login'
+              if re.search(r'continue with google',s,re.I): return 'google_only_login'
               if re.search(r'log in|login|sign in|entrar|create account|sign up',s,re.I): return 'login'
               return 'other'
-          candidates=[
-              ('ikwai_authorization',['shell','am','start','-W','-a','android.intent.action.VIEW','-d','ikwai://authorization','com.kwai.video']),
-              ('kwai_authorization',['shell','am','start','-W','-a','android.intent.action.VIEW','-d','kwai://authorization','com.kwai.video']),
-              ('explicit_ikwai_auth',['shell','am','start','-W','-n','com.kwai.video/com.yxcorp.gifshow.authorization.KwaiAuthActivity','-a','android.intent.action.VIEW','-d','ikwai://authorization']),
-              ('home_select_force',['shell','am','start','-W','-a','android.intent.action.VIEW','-d','ikwai://home/select?inject_kwai_force_login=1','com.kwai.video']),
-              ('webview_force',['shell','am','start','-W','-a','android.intent.action.VIEW','-d','ikwai://webview?inject_kwai_force_login=1','com.kwai.video']),
-              ('home_hot_force',['shell','am','start','-W','-n','com.kwai.video/com.kscorp.oversea.platform.router.ui.UriRouterActivity','-a','android.intent.action.VIEW','-d','ikwai://ug.pro/home/hot?inject_kwai_force_login=1']),
+          uri_candidates=[
+              'ikwai://authorization',
+              'kwai://authorization',
+              'ikwai://login',
+              'kwai://login',
+              'ikwai://login/phone',
+              'kwai://login/phone',
+              'ikwai://account/login',
+              'kwai://account/login',
+              'ikwai://home/select?inject_kwai_force_login=1',
+              'ikwai://webview?inject_kwai_force_login=1',
+              'ikwai://ug.pro/home/hot?inject_kwai_force_login=1',
           ]
           results=[]
-          for name,cmd in candidates:
+          for idx,uri in enumerate(uri_candidates,1):
+              name=f'uri-{idx:02d}'
               adb('shell','am','force-stop','com.kwai.video'); time.sleep(1)
-              out=adb(*cmd).stdout
-              (A/f'{name}-start.txt').write_text(out,encoding='utf-8')
+              out=adb('shell','am','start','-W','-a','android.intent.action.VIEW','-d',uri,'com.kwai.video').stdout
+              (A/f'{name}-start.txt').write_text('URI='+uri+'\n'+out,encoding='utf-8')
               time.sleep(6)
               texts,resumed=dump(name)
               state=classify(texts,resumed)
-              results.append(f'{name}: state={state} resumed={resumed}')
-              if state in {'phone','phone_activity'}:
-                  break
+              results.append(f'{uri}: state={state} resumed={resumed}')
+              if state in {'phone','phone_activity'}: break
           pathlib.Path('artifacts/route-results.txt').write_text('\n'.join(results)+'\n',encoding='utf-8')
           print('\n'.join(results))
           PY
@@ -112,17 +115,20 @@ jobs:
           adb wait-for-device
           while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != 1 ]; do sleep 2; done
           sleep 10
+          {
+            echo '--- route ---'; adb shell ip route || true
+            echo '--- resolve ---'; adb shell getent hosts www.google.com || true
+          } | tee artifacts/network.txt
           BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
           "$BT/apksigner" verify --print-certs /tmp/kwai/base.apk > artifacts/cert.txt 2>&1
           grep -qi 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047' artifacts/cert.txt
-          APKS=(/tmp/kwai/base.apk /tmp/kwai/config.arm64_v8a.apk /tmp/kwai/config.mdpi.apk)
+          APKS=(/tmp/kwai/base.apk /tmp/kwai/config.arm64_v8a.apk /tmp/kwai/config.density.apk)
           [ -f /tmp/kwai/feature.apk ] && APKS+=(/tmp/kwai/feature.apk)
           adb install-multiple -r "${APKS[@]}" | tee artifacts/install.txt
           adb shell pm grant com.kwai.video android.permission.POST_NOTIFICATIONS 2>/dev/null || true
           adb shell appops set com.kwai.video POST_NOTIFICATION allow 2>/dev/null || true
           adb shell monkey -p com.kwai.video -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
           sleep 10
-          # Finish onboarding once so public auth routes are not masked by first-run UI.
           set +e
           python3 scripts/kwai_ui_probe_confirm.py > artifacts/onboarding-console.txt 2>&1
           set -e
@@ -133,10 +139,10 @@ jobs:
           SH
           chmod +x /tmp/run.sh
 
-      - name: Boot Android and probe public auth routes
+      - name: Boot connected Android 14 and probe public auth routes
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         with:
-          api-level: 35
+          api-level: 34
           target: google_apis
           arch: x86_64
           profile: pixel_6
@@ -152,7 +158,9 @@ jobs:
         if: always()
         shell: bash
         run: |
-          echo '## Kwai public auth route proof' >> "$GITHUB_STEP_SUMMARY"
+          echo '## Kwai public auth route proof on API 34' >> "$GITHUB_STEP_SUMMARY"
+          cat artifacts/network.txt 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          echo >> "$GITHUB_STEP_SUMMARY"
           cat artifacts/route-results.txt 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
           echo >> "$GITHUB_STEP_SUMMARY"
           echo 'No phone number, OTP, password, upload or publication attempted.' >> "$GITHUB_STEP_SUMMARY"
