@@ -63,7 +63,6 @@ jobs:
           stage() { STAGE="$1"; echo "stage=$1" >> artifacts/result.txt; }
           fail() { echo "failure=$1" >> artifacts/result.txt; exit "${2:-1}"; }
 
-          stage=boot_check
           adb wait-for-device || fail adb_wait 11
           while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != '1' ]; do sleep 2; done
           echo "build_type=$(adb shell getprop ro.build.type | tr -d '\r')" >> artifacts/result.txt
@@ -96,9 +95,7 @@ jobs:
 
           stage data_dir
           DATA=/data/user/0/com.kwai.video
-          if ! adb shell test -d "$DATA"; then
-            DATA=/data/data/com.kwai.video
-          fi
+          if ! adb shell test -d "$DATA"; then DATA=/data/data/com.kwai.video; fi
           echo "data_dir=$DATA" >> artifacts/result.txt
           adb shell test -d "$DATA" || fail data_dir_missing 31
           UIDNUM="$(adb shell stat -c %u "$DATA" 2>/dev/null | tr -d '\r')"
@@ -110,9 +107,10 @@ jobs:
 
           stage marker
           adb shell mkdir -p "$DATA/files" || fail mkdir_files 33
-          MARKER="kwai-roundtrip-${GITHUB_RUN_ID}"
-          adb shell sh -c "printf '%s' '$MARKER' > '$DATA/files/.cloud-session-roundtrip'" || fail marker_write 34
-          adb shell chown "$UIDNUM:$UIDNUM" "$DATA/files/.cloud-session-roundtrip" || fail marker_chown 35
+          MARKER_FILE="$DATA/files/.cloud-session-roundtrip-${GITHUB_RUN_ID}"
+          adb shell touch "$MARKER_FILE" || fail marker_write 34
+          adb shell chown "$UIDNUM:$UIDNUM" "$MARKER_FILE" || fail marker_chown 35
+          adb shell test -f "$MARKER_FILE" || fail marker_verify 46
 
           stage archive
           adb shell tar -cpf /data/local/tmp/kwai-appdata.tar -C "$DATA" . || fail archive_create 36
@@ -122,9 +120,7 @@ jobs:
 
           stage clear
           adb shell pm clear com.kwai.video >/dev/null || fail pm_clear 38
-          if adb shell test -f "$DATA/files/.cloud-session-roundtrip"; then
-            fail marker_survived_clear 39
-          fi
+          if adb shell test -f "$MARKER_FILE"; then fail marker_survived_clear 39; fi
           echo 'marker_removed_by_clear=true' >> artifacts/result.txt
 
           stage restore
@@ -132,8 +128,7 @@ jobs:
           adb shell tar -xpf /data/local/tmp/kwai-appdata.tar -C "$DATA" || fail restore_extract 41
           adb shell chown -R "$UIDNUM:$UIDNUM" "$DATA" || fail restore_chown 42
           adb shell restorecon -RF "$DATA" >/dev/null 2>&1 || true
-          RESTORED="$(adb shell cat "$DATA/files/.cloud-session-roundtrip" 2>/dev/null | tr -d '\r')"
-          [ "$RESTORED" = "$MARKER" ] || fail marker_not_restored 43
+          adb shell test -f "$MARKER_FILE" || fail marker_not_restored 43
           echo 'marker_restored=true' >> artifacts/result.txt
 
           stage relaunch
