@@ -1,0 +1,113 @@
+name: Kwai JADX login route trace
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-jadx-login-trace.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  jadx-trace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download current Kwai base APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/jadx-out
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          f=((((d.get('nodes') or {}).get('meta') or {}).get('data') or {}).get('file') or {})
+          u=f.get('path') or f.get('path_alt')
+          if not u: raise SystemExit('base URL missing')
+          pathlib.Path('/tmp/base-url').write_text(u)
+          pathlib.Path('artifacts/version.txt').write_text(f"version={f.get('vername')}\nvercode={f.get('vercode')}\n")
+          PY
+          curl -fL --retry 4 --retry-delay 2 "$(cat /tmp/base-url)" -o /tmp/base.apk
+
+      - name: Install JADX 1.5.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 4 --retry-delay 2 \
+            'https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip' \
+            -o /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+          /tmp/jadx/bin/jadx --version | tee artifacts/jadx-version.txt
+
+      - name: Decompile and trace login code
+        shell: bash
+        run: |
+          set -euo pipefail
+          /tmp/jadx/bin/jadx --no-res --show-bad-code --deobf -d /tmp/jadx-out /tmp/base.apk >/tmp/jadx.log 2>&1 || true
+          tail -n 80 /tmp/jadx.log > artifacts/jadx-tail.txt
+          SRC=/tmp/jadx-out/sources
+          test -d "$SRC"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          src=Path('/tmp/jadx-out/sources')
+          needles=[
+            'PHONE_NUMBER_LOGIN_PAGE','PHONE_LOGIN_NEW','PURE_PHONE_QUICK_LOGIN','CLICK_PHONE_LOGIN',
+            'PhoneAccountActivityV2','ForcePhoneRegisterActivity','buildLoginIntent','inject_kwai_force_login',
+            'setUriRouterUrl','getUrlFromRouter','KwaiAuthActivity','UriRouterActivity'
+          ]
+          hits=[]
+          files=[]
+          for p in src.rglob('*.java'):
+            try:s=p.read_text(errors='ignore')
+            except:continue
+            found=[n for n in needles if n in s]
+            if found:
+              files.append((p,found,s))
+          Path('artifacts/hit-files.txt').write_text('\n'.join(f'{p}: {", ".join(f)}' for p,f,_ in files)+'\n')
+          out=[]
+          for p,found,s in files:
+            lines=s.splitlines()
+            idx=set()
+            for i,l in enumerate(lines):
+              if any(n in l for n in found): idx.add(i)
+            if not idx: continue
+            out.append(f'===== {p} | {found} =====')
+            ranges=[]
+            for i in sorted(idx):
+              a=max(0,i-18); b=min(len(lines),i+32)
+              if ranges and a<=ranges[-1][1]+3: ranges[-1]=(ranges[-1][0],max(ranges[-1][1],b))
+              else:ranges.append((a,b))
+            for a,b in ranges:
+              for j in range(a,b): out.append(f'{j+1}: {lines[j]}')
+              out.append('---')
+          Path('artifacts/login-trace-excerpts.txt').write_text('\n'.join(out),encoding='utf-8')
+
+          # Extra search for URI literals near login-related code.
+          uri=[]
+          for p,found,s in files:
+            for m in re.finditer(r'"([^"\\]*(?:ikwai|kwai|login|phone)[^"\\]*)"',s,re.I):
+              val=m.group(1)
+              if len(val)<240: uri.append(f'{p}: {val}')
+          Path('artifacts/login-uri-literals.txt').write_text('\n'.join(dict.fromkeys(uri)),encoding='utf-8')
+          print('files_with_hits=',len(files))
+          print('excerpt_lines=',len(out))
+          PY
+
+          echo '=== strongest hit files ==='
+          grep -Eai 'PhoneAccountActivityV2|buildLoginIntent|inject_kwai_force_login|PHONE_NUMBER_LOGIN_PAGE|UriRouterActivity' artifacts/hit-files.txt | head -n 120 || true
+          echo '=== uri literals ==='
+          grep -Eai 'ikwai|kwai|phone|login' artifacts/login-uri-literals.txt | head -n 160 || true
+
+      - name: Upload trace
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-jadx-login-trace-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
