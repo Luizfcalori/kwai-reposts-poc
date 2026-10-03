@@ -1,0 +1,204 @@
+name: Kwai API34 cross-runner state proof
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-api34-crossrunner-state-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  export-state:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download current Kwai bundle and prepare KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p state /tmp/kwai
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib,shlex
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}; s=(m.get('aab') or {}).get('splits') or []
+          abi=next((x for x in s if x.get('type')=='ABI' and 'arm64' in (x.get('name') or '').lower()),None)
+          den=next((x for x in s if x.get('type')=='DENSITY' and 'mdpi' in (x.get('name') or '').lower()),None) or next((x for x in s if x.get('type')=='DENSITY'),None)
+          vals={'BASE':f.get('path') or f.get('path_alt'),'MD5':f.get('md5sum'),'ABI':(abi or {}).get('path'),'DENSITY':(den or {}).get('path')}
+          if not all(vals.values()): raise SystemExit('missing bundle metadata')
+          pathlib.Path('/tmp/meta.env').write_text('\n'.join(f'{k}={shlex.quote(str(v))}' for k,v in vals.items())+'\n')
+          PY
+          source /tmp/meta.env
+          curl -fL "$BASE" -o /tmp/kwai/base.apk
+          curl -fL "$ABI" -o /tmp/kwai/config.arm64_v8a.apk
+          curl -fL "$DENSITY" -o /tmp/kwai/config.density.apk
+          curl -LsS "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${MD5}/language=pt_PT" -o /tmp/dynamic.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/dynamic.json',encoding='utf-8'))
+          feat=next((x for x in d.get('list',[]) if x.get('type')=='FEATURE' and x.get('path')),None)
+          if feat: pathlib.Path('/tmp/feature-url').write_text(feat['path'])
+          PY
+          if [ -s /tmp/feature-url ]; then curl -fL "$(cat /tmp/feature-url)" -o /tmp/kwai/feature.apk; fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          cat > /tmp/export-state.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != 1 ]; do sleep 2; done
+          APKS=(/tmp/kwai/base.apk /tmp/kwai/config.arm64_v8a.apk /tmp/kwai/config.density.apk)
+          [ -f /tmp/kwai/feature.apk ] && APKS+=(/tmp/kwai/feature.apk)
+          adb install-multiple -r "${APKS[@]}" >/dev/null
+          adb shell am start -n com.kwai.video/com.yxcorp.gifshow.tiny.TinyLaunchActivity >/dev/null
+          sleep 5
+          adb shell am force-stop com.kwai.video
+          adb root >/dev/null 2>&1 || true
+          sleep 2
+          adb wait-for-device
+          adb shell id | grep -q 'uid=0(root)'
+          DATA=/data/user/0/com.kwai.video
+          MARKER="$DATA/files/.crossrunner-${GITHUB_RUN_ID}"
+          adb shell mkdir -p "$DATA/files"
+          adb shell touch "$MARKER"
+          adb shell tar -cpf /data/local/tmp/kwai-appdata.tar -C "$DATA" .
+          adb pull /data/local/tmp/kwai-appdata.tar state/kwai-appdata.tar >/dev/null
+          test -s state/kwai-appdata.tar
+          printf 'export_bytes=%s\nmarker=.crossrunner-%s\n' "$(stat -c %s state/kwai-appdata.tar)" "$GITHUB_RUN_ID" > state/export-result.txt
+          SH
+          chmod +x /tmp/export-state.sh
+
+      - name: Boot first API34 runner and export state
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/export-state.sh
+
+      - name: Save test state to Actions cache
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: state/kwai-appdata.tar
+          key: kwai-crossrunner-proof-${{ github.run_id }}
+
+      - name: Export summary
+        shell: bash
+        run: cat state/export-result.txt >> "$GITHUB_STEP_SUMMARY"
+
+  restore-state:
+    needs: export-state
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Restore state produced by first runner
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: state/kwai-appdata.tar
+          key: kwai-crossrunner-proof-${{ github.run_id }}
+          fail-on-cache-miss: true
+
+      - name: Validate restored host file
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s state/kwai-appdata.tar
+          echo "restored_cache_bytes=$(stat -c %s state/kwai-appdata.tar)" > state/restore-result.txt
+
+      - name: Download current Kwai bundle and prepare KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/kwai
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib,shlex
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}; s=(m.get('aab') or {}).get('splits') or []
+          abi=next((x for x in s if x.get('type')=='ABI' and 'arm64' in (x.get('name') or '').lower()),None)
+          den=next((x for x in s if x.get('type')=='DENSITY' and 'mdpi' in (x.get('name') or '').lower()),None) or next((x for x in s if x.get('type')=='DENSITY'),None)
+          vals={'BASE':f.get('path') or f.get('path_alt'),'MD5':f.get('md5sum'),'ABI':(abi or {}).get('path'),'DENSITY':(den or {}).get('path')}
+          if not all(vals.values()): raise SystemExit('missing bundle metadata')
+          pathlib.Path('/tmp/meta.env').write_text('\n'.join(f'{k}={shlex.quote(str(v))}' for k,v in vals.items())+'\n')
+          PY
+          source /tmp/meta.env
+          curl -fL "$BASE" -o /tmp/kwai/base.apk
+          curl -fL "$ABI" -o /tmp/kwai/config.arm64_v8a.apk
+          curl -fL "$DENSITY" -o /tmp/kwai/config.density.apk
+          curl -LsS "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${MD5}/language=pt_PT" -o /tmp/dynamic.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/dynamic.json',encoding='utf-8'))
+          feat=next((x for x in d.get('list',[]) if x.get('type')=='FEATURE' and x.get('path')),None)
+          if feat: pathlib.Path('/tmp/feature-url').write_text(feat['path'])
+          PY
+          if [ -s /tmp/feature-url ]; then curl -fL "$(cat /tmp/feature-url)" -o /tmp/kwai/feature.apk; fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          cat > /tmp/restore-state.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != 1 ]; do sleep 2; done
+          APKS=(/tmp/kwai/base.apk /tmp/kwai/config.arm64_v8a.apk /tmp/kwai/config.density.apk)
+          [ -f /tmp/kwai/feature.apk ] && APKS+=(/tmp/kwai/feature.apk)
+          adb install-multiple -r "${APKS[@]}" >/dev/null
+          adb shell am start -n com.kwai.video/com.yxcorp.gifshow.tiny.TinyLaunchActivity >/dev/null
+          sleep 3
+          adb shell am force-stop com.kwai.video
+          adb root >/dev/null 2>&1 || true
+          sleep 2
+          adb wait-for-device
+          adb shell id | grep -q 'uid=0(root)'
+          DATA=/data/user/0/com.kwai.video
+          UIDNUM="$(adb shell stat -c %u "$DATA" | tr -d '\r')"
+          adb shell pm clear com.kwai.video >/dev/null
+          adb push state/kwai-appdata.tar /data/local/tmp/kwai-appdata.tar >/dev/null
+          adb shell mkdir -p "$DATA"
+          adb shell tar -xpf /data/local/tmp/kwai-appdata.tar -C "$DATA"
+          adb shell chown -R "$UIDNUM:$UIDNUM" "$DATA"
+          adb shell restorecon -RF "$DATA" >/dev/null 2>&1 || true
+          MARKER="$DATA/files/.crossrunner-${GITHUB_RUN_ID}"
+          adb shell test -f "$MARKER"
+          adb shell am start -n com.kwai.video/com.yxcorp.gifshow.tiny.TinyLaunchActivity >/dev/null
+          sleep 5
+          adb shell pidof com.kwai.video >/dev/null
+          {
+            echo 'marker_restored_on_second_runner=true'
+            echo 'app_relaunch_on_second_runner=true'
+            echo 'crossrunner_state_success=true'
+          } >> state/restore-result.txt
+          SH
+          chmod +x /tmp/restore-state.sh
+
+      - name: Boot second API34 runner and restore state
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/restore-state.sh
+
+      - name: Final proof
+        shell: bash
+        run: cat state/restore-result.txt | tee -a "$GITHUB_STEP_SUMMARY"
