@@ -1,0 +1,144 @@
+name: Kwai API34 Google auth seed
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  google-auth-seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Validate required secrets
+        shell: bash
+        env:
+          KWAI_GOOGLE_EMAIL: ${{ secrets.KWAI_GOOGLE_EMAIL }}
+          KWAI_GOOGLE_PASSWORD: ${{ secrets.KWAI_GOOGLE_PASSWORD }}
+        run: |
+          set +x
+          python3 - <<'PY'
+          import os
+          missing=[n for n in ('KWAI_GOOGLE_EMAIL','KWAI_GOOGLE_PASSWORD') if not os.environ.get(n)]
+          if missing:
+              raise SystemExit('Missing required GitHub Actions secrets: ' + ', '.join(missing))
+          print('Required Google auth secrets are present; values will not be printed.')
+          PY
+
+      - name: Download current verified ARM64 Kwai bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/kwai.json
+          python3 - <<'PY'
+          import json,pathlib,shlex
+          d=json.load(open('/tmp/kwai.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}; splits=(m.get('aab') or {}).get('splits') or []
+          abi=next((s for s in splits if s.get('type')=='ABI' and 'arm64' in (s.get('name') or '').lower()),None)
+          den=next((s for s in splits if s.get('type')=='DENSITY' and 'mdpi' in (s.get('name') or '').lower()),None) or next((s for s in splits if s.get('type')=='DENSITY'),None)
+          vals={'BASE':f.get('path') or f.get('path_alt'),'MD5':f.get('md5sum'),'VERSION':f.get('vername'),'ABI':(abi or {}).get('path'),'DENSITY':(den or {}).get('path')}
+          if not all(vals.values()): raise SystemExit('missing required bundle metadata')
+          pathlib.Path('/tmp/meta.env').write_text('\n'.join(f'{k}={shlex.quote(str(v))}' for k,v in vals.items())+'\n')
+          PY
+          source /tmp/meta.env
+          curl -fL --retry 4 --retry-delay 2 "$BASE" -o /tmp/kwai/base.apk
+          curl -fL --retry 4 --retry-delay 2 "$ABI" -o /tmp/kwai/config.arm64_v8a.apk
+          curl -fL --retry 4 --retry-delay 2 "$DENSITY" -o /tmp/kwai/config.density.apk
+          curl -LsS "https://ws75.aptoide.com/api/7/app/getDynamicSplits/apk_md5sum=${MD5}/language=pt_PT" -o /tmp/dynamic.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/dynamic.json',encoding='utf-8'))
+          feat=next((x for x in d.get('list',[]) if x.get('type')=='FEATURE' and x.get('path')),None)
+          if feat: pathlib.Path('/tmp/feature-url').write_text(feat['path'])
+          PY
+          if [ -s /tmp/feature-url ]; then curl -fL "$(cat /tmp/feature-url)" -o /tmp/kwai/feature.apk; fi
+
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/run-api34-google-auth.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != '1' ]; do sleep 2; done
+
+          {
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo "gms_present=$(adb shell pm path com.google.android.gms >/dev/null 2>&1 && echo true || echo false)"
+          } > artifacts/environment.txt
+
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BT/apksigner" verify --print-certs /tmp/kwai/base.apk > /tmp/kwai-cert.txt 2>&1
+          grep -qi 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047' /tmp/kwai-cert.txt
+
+          APKS=(/tmp/kwai/base.apk /tmp/kwai/config.arm64_v8a.apk /tmp/kwai/config.density.apk)
+          [ -f /tmp/kwai/feature.apk ] && APKS+=(/tmp/kwai/feature.apk)
+          adb install-multiple -r "${APKS[@]}" >/dev/null
+          adb shell pm grant com.kwai.video android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+          adb shell appops set com.kwai.video POST_NOTIFICATION allow 2>/dev/null || true
+          adb shell dumpsys package com.kwai.video | grep -E 'versionName=|versionCode=|primaryCpuAbi=' | head -n20 > artifacts/installed-version.txt || true
+
+          # Navigate only as far as the empty Google credential screen first.
+          python3 scripts/kwai_google_login_probe.py >/tmp/kwai-preauth.log 2>&1
+
+          # Credentials are consumed only from the step environment. The script never prints or saves them.
+          set +e
+          python3 scripts/kwai_google_auth_seed.py 2>&1 | tee artifacts/google-auth-seed-console.txt
+          RC=${PIPESTATUS[0]}
+          set -e
+          echo "auth_seed_rc=$RC" >> artifacts/google-auth-seed/result.txt
+          exit "$RC"
+          SH
+          chmod +x /tmp/run-api34-google-auth.sh
+
+      - name: Boot Android 14 and seed Google auth
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        env:
+          KWAI_GOOGLE_EMAIL: ${{ secrets.KWAI_GOOGLE_EMAIL }}
+          KWAI_GOOGLE_PASSWORD: ${{ secrets.KWAI_GOOGLE_PASSWORD }}
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/run-api34-google-auth.sh
+
+      - name: Safe summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai Google auth seed'
+            cat artifacts/environment.txt 2>/dev/null || true
+            cat artifacts/installed-version.txt 2>/dev/null || true
+            cat artifacts/google-auth-seed/result.txt 2>/dev/null || true
+            echo
+            echo 'No email, password, OTP, post-credential screenshot, or post-credential logcat is uploaded.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload sanitized evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-google-auth-seed-safe-${{ github.run_id }}
+          path: |
+            artifacts/environment.txt
+            artifacts/installed-version.txt
+            artifacts/google-login/result.txt
+            artifacts/google-auth-seed/result.txt
+            artifacts/google-auth-seed-console.txt
+          if-no-files-found: warn
+          retention-days: 1
