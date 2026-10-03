@@ -23,26 +23,71 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          cat > /tmp/tap_text.py <<'PY'
-          import subprocess, sys, re, time
-          needle=sys.argv[1].lower()
-          subprocess.run(['adb','shell','uiautomator','dump','/sdcard/window.xml'], check=False, stdout=subprocess.DEVNULL)
-          subprocess.run(['adb','pull','/sdcard/window.xml','/tmp/window.xml'], check=False, stdout=subprocess.DEVNULL)
-          data=open('/tmp/window.xml',errors='ignore').read()
-          for node in re.findall(r'<node[^>]+>', data):
-              tm=re.search(r'text="([^"]*)"',node); cm=re.search(r'content-desc="([^"]*)"',node); bm=re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',node)
-              hay=' '.join([(tm.group(1) if tm else ''),(cm.group(1) if cm else '')]).lower()
-              if needle in hay and bm:
-                  x1,y1,x2,y2=map(int,bm.groups()); x=(x1+x2)//2; y=(y1+y2)//2
-                  print(f'Tapping {needle!r} at {x},{y}: {hay}')
-                  subprocess.run(['adb','shell','input','tap',str(x),str(y)],check=True)
-                  time.sleep(3)
-                  sys.exit(0)
-          print(f'NOT FOUND: {needle}')
-          sys.exit(2)
+
+          cat > /tmp/ui_tool.py <<'PY'
+          import subprocess, sys, re, time, pathlib
+
+          def adb(*args):
+              return subprocess.run(['adb', *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+          def dump(path='/tmp/window.xml'):
+              adb('shell','uiautomator','dump','/sdcard/window.xml')
+              adb('pull','/sdcard/window.xml',path)
+              try:
+                  return pathlib.Path(path).read_text(errors='ignore')
+              except Exception:
+                  return ''
+
+          def nodes(data):
+              for node in re.findall(r'<node[^>]+>', data):
+                  tm=re.search(r'text="([^"]*)"',node)
+                  cm=re.search(r'content-desc="([^"]*)"',node)
+                  bm=re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',node)
+                  hay=' '.join([(tm.group(1) if tm else ''),(cm.group(1) if cm else '')]).strip()
+                  yield node, hay, bm
+
+          def tap_text(needle):
+              data=dump()
+              low=needle.lower()
+              for node,hay,bm in nodes(data):
+                  if low in hay.lower() and bm:
+                      x1,y1,x2,y2=map(int,bm.groups()); x=(x1+x2)//2; y=(y1+y2)//2
+                      print(f'Tapping {needle!r} at {x},{y}: {hay}')
+                      adb('shell','input','tap',str(x),str(y))
+                      time.sleep(3)
+                      return True
+              print(f'NOT FOUND: {needle}')
+              return False
+
+          def dismiss_overlays(rounds=5):
+              changed=False
+              for i in range(rounds):
+                  data=dump(f'/tmp/overlay-{i}.xml')
+                  if re.search(r"Pixel Launcher isn.?t responding", data, re.I):
+                      if tap_text('Close app'):
+                          changed=True
+                          time.sleep(2)
+                          continue
+                  if re.search(r"System UI isn.?t responding", data, re.I):
+                      if tap_text('Close app'):
+                          changed=True
+                          time.sleep(2)
+                          continue
+                  break
+              return changed
+
+          cmd=sys.argv[1]
+          if cmd=='tap':
+              sys.exit(0 if tap_text(sys.argv[2]) else 2)
+          if cmd=='dismiss':
+              dismiss_overlays()
+              sys.exit(0)
+          raise SystemExit(2)
           PY
+
           cat > /tmp/dump_stage.sh <<'SH'
           name="$1"
+          python3 /tmp/ui_tool.py dismiss || true
           adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
           adb pull /sdcard/window.xml "artifacts/${name}.xml" >/dev/null 2>&1 || true
           adb exec-out screencap -p > "artifacts/${name}.png"
@@ -62,6 +107,7 @@ jobs:
           PY
           SH
           chmod +x /tmp/dump_stage.sh
+
           cat > /tmp/run-anonymous.sh <<'SH'
           set -euo pipefail
           adb wait-for-device
@@ -69,15 +115,18 @@ jobs:
           adb install -r /tmp/aurora.apk | tee artifacts/install.txt
           adb shell monkey -p com.aurora.store -c android.intent.category.LAUNCHER 1 >/dev/null
           sleep 10
+          python3 /tmp/ui_tool.py dismiss || true
           /tmp/dump_stage.sh welcome
 
-          python3 /tmp/tap_text.py Skip || true
+          python3 /tmp/ui_tool.py tap Skip || true
           sleep 5
+          python3 /tmp/ui_tool.py dismiss || true
           /tmp/dump_stage.sh after-skip
 
-          if python3 /tmp/tap_text.py Anonymous; then
+          if python3 /tmp/ui_tool.py tap Anonymous; then
             echo 'Anonymous button found and tapped.' | tee artifacts/anonymous-action.txt
             sleep 18
+            python3 /tmp/ui_tool.py dismiss || true
             /tmp/dump_stage.sh after-anonymous
           else
             echo 'Anonymous button not found after Skip.' | tee artifacts/anonymous-action.txt
@@ -101,11 +150,11 @@ jobs:
           arch: x86_64
           profile: pixel_6
           cores: 2
-          ram-size: 2048M
-          heap-size: 512M
+          ram-size: 3072M
+          heap-size: 768M
           emulator-boot-timeout: 600
           disable-animations: true
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
           script: bash /tmp/run-anonymous.sh
 
       - name: Summary
