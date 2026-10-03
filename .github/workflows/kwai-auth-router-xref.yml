@@ -1,0 +1,104 @@
+name: Kwai auth router xref
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-auth-router-xref.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  router-xref:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download current Kwai base APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts /tmp/kwai /tmp/jadx
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
+          python3 - <<'PY'
+          import json,pathlib
+          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
+          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
+          f=m.get('file') or {}
+          url=f.get('path') or f.get('path_alt') or ''
+          if not url: raise SystemExit('missing APK URL')
+          pathlib.Path('/tmp/base-url').write_text(url)
+          pathlib.Path('artifacts/version.txt').write_text(f"version={f.get('vername')}\nversionCode={f.get('vercode')}\n")
+          PY
+          curl -fL --retry 4 --retry-delay 2 "$(cat /tmp/base-url)" -o /tmp/kwai/base.apk
+
+      - name: Install JADX
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="$(curl -LsS https://api.github.com/repos/skylot/jadx/releases/latest | jq -r '.assets[] | select(.name|test("jadx-[0-9].*\\.zip$")) | .browser_download_url' | head -1)"
+          test -n "$URL" -a "$URL" != null
+          curl -fL --retry 4 "$URL" -o /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx-bin
+          /tmp/jadx-bin/bin/jadx --version | tee artifacts/jadx-version.txt
+
+      - name: Decompile and map phone-login router references
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          timeout 600 /tmp/jadx-bin/bin/jadx --no-res --show-bad-code -d /tmp/jadx /tmp/kwai/base.apk > artifacts/jadx-console.txt 2>&1
+          JRC=$?
+          set -e
+          echo "jadx_rc=$JRC" > artifacts/result.txt
+          SRC=/tmp/jadx/sources
+          test -d "$SRC"
+
+          PATTERN='PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|PHONE_LOGIN_NEW|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|PhoneAccountActivityV2|ForcePhoneRegisterActivity|PhoneVerifyActivity|BindPhoneActivity|ChangePhoneActivity|PhoneResetPsdActivity|UriRouterActivity|ikwai://|kwai://'
+          grep -RInE "$PATTERN" "$SRC" > artifacts/all-hits.txt || true
+
+          python3 - <<'PY'
+          import pathlib,re
+          src=pathlib.Path('/tmp/jadx/sources')
+          terms=[
+            'PHONE_NUMBER_LOGIN_PAGE','CLICK_PHONE_LOGIN','PHONE_LOGIN_NEW','INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS',
+            'PhoneAccountActivityV2','ForcePhoneRegisterActivity','PhoneVerifyActivity','BindPhoneActivity',
+            'ChangePhoneActivity','PhoneResetPsdActivity','UriRouterActivity','ikwai://','kwai://'
+          ]
+          out=[]
+          files=[]
+          for p in src.rglob('*.java'):
+            try: text=p.read_text(errors='ignore')
+            except Exception: continue
+            if any(t in text for t in terms):
+              files.append(p)
+              lines=text.splitlines()
+              for i,line in enumerate(lines):
+                if any(t in line for t in terms):
+                  a=max(0,i-35); b=min(len(lines),i+36)
+                  out.append(f'===== {p.relative_to(src)}:{i+1} =====')
+                  out.extend(f'{n+1:06d}: {lines[n]}' for n in range(a,b))
+          pathlib.Path('artifacts/xref-context.txt').write_text('\n'.join(out),encoding='utf-8')
+          pathlib.Path('artifacts/hit-files.txt').write_text('\n'.join(str(p.relative_to(src)) for p in files),encoding='utf-8')
+          PY
+
+          # Route-like constants close to login/auth code.
+          grep -RhoE "(i?kwai|kwaiapp)://[A-Za-z0-9_./?=&%-]+" "$SRC" | sort -u > artifacts/all-kwai-routes.txt || true
+          grep -Ei 'login|auth|phone|account|register|verify' artifacts/all-kwai-routes.txt > artifacts/auth-routes.txt || true
+
+          echo '--- relevant hit files ---'
+          cat artifacts/hit-files.txt || true
+          echo '--- candidate auth routes ---'
+          cat artifacts/auth-routes.txt || true
+          echo '--- exact markers ---'
+          grep -E 'PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|PHONE_LOGIN_NEW|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|PhoneAccountActivityV2|ForcePhoneRegisterActivity|PhoneVerifyActivity|BindPhoneActivity' artifacts/all-hits.txt | head -n 300 || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-auth-router-xref-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 1
