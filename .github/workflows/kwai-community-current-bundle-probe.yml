@@ -1,0 +1,70 @@
+name: Kwai current community bundle probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-community-current-bundle-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Download exact 13.8.30.646601 bundle and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts apks /tmp/kwai
+          docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
+            -a 'com.kwai.kuaishou.video.live@13.8.30.646601' -d apk-pure \
+            -o 'acknowledge_dangers=true,arch=arm64-v8a' /output \
+            2>&1 | tee artifacts/download.txt
+
+          find apks -maxdepth 1 -type f -printf '%f\t%s bytes\n' | tee artifacts/downloaded-files.txt
+          BUNDLE="$(find apks -maxdepth 1 -type f | head -n1)"
+          test -n "$BUNDLE"
+          case "$BUNDLE" in
+            *.xapk|*.zip|*.apkm) unzip -q "$BUNDLE" -d /tmp/kwai ;;
+            *.apk) cp "$BUNDLE" /tmp/kwai/base.apk ;;
+            *) echo "unsupported package $BUNDLE"; exit 2 ;;
+          esac
+          find /tmp/kwai -type f -name '*.apk' -printf '%f\t%s bytes\n' | sort | tee artifacts/apk-files.txt
+
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          BASE="$(find /tmp/kwai -type f -name '*.apk' | sort | head -n1)"
+          # Find whichever APK carries the base package declaration.
+          : > artifacts/badging-all.txt
+          FOUND=''
+          while IFS= read -r apk; do
+            line="$($BT/aapt dump badging "$apk" | head -n1 || true)"
+            echo "$(basename "$apk") :: $line" >> artifacts/badging-all.txt
+            if echo "$line" | grep -q "package: name='com.kwai.kuaishou.video.live'" && echo "$line" | grep -q "versionName='13.8.30.646601'"; then
+              FOUND="$apk"
+            fi
+          done < <(find /tmp/kwai -type f -name '*.apk' | sort)
+          test -n "$FOUND"
+          echo "base_candidate=$(basename "$FOUND")" | tee artifacts/version-check.txt
+          "$BT/aapt" dump badging "$FOUND" | head -n1 | tee -a artifacts/version-check.txt
+
+          : > artifacts/certificates.txt
+          while IFS= read -r apk; do
+            "$BT/apksigner" verify --print-certs "$apk" > /tmp/cert.txt 2>&1
+            CERT="$(awk -F': ' '/certificate SHA-256 digest:/{print tolower($NF); exit}' /tmp/cert.txt | tr -d '[:space:]')"
+            echo "$(basename "$apk") $CERT" | tee -a artifacts/certificates.txt
+            test "$CERT" = '588774ea798843484c7100da2450005090522fda0dcb64be01c04079349c0acc'
+          done < <(find /tmp/kwai -type f -name '*.apk' | sort)
+
+          echo 'PASS exact current community bundle' | tee artifacts/result.txt
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-community-current-bundle-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 1
