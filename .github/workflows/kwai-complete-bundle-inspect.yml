@@ -1,35 +1,245 @@
-name: Kwai complete bundle inspection
+name: Kwai complete bundle and phone login proof
+
 on:
   workflow_dispatch:
   push:
     paths:
       - '.github/workflows/kwai-complete-bundle-inspect.yml'
+      - 'scripts/kwai_ui_probe.py'
+      - 'scripts/kwai_ui_probe_confirm.py'
+      - 'scripts/kwai_phone_route_probe.py'
+
 permissions:
   contents: read
+
 jobs:
-  inspect:
+  inspect-and-probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 35
     steps:
-      - name: Download and verify candidate
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Fetch fresh APKMirror bundle and verify every split
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p artifacts /tmp/kwai
-          curl -fL --max-time 180 --retry 2 'https://www.apkmirror.com/wp-content/themes/APKMirror/download.php?id=16206618&key=a1db1ecbde418cd3ba5c01e0e6a8b809d62e4f7e' -o /tmp/kwai.apkm
-          echo '536ae315a4d5d5742ba5d2073c4058a57e6f3abc89150fd4b3af23ab4159492a  /tmp/kwai.apkm' | sha256sum -c - | tee artifacts/hash.txt
+
+          PRODUCT='https://www.apkmirror.com/apk/joyo-technology-pte-ltd-2/kwai-short-video-maker-community/kwai-video-drama-13-8-30-646601-release/kwai-video-drama-13-8-30-646601-android-apk-download/'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
+          JAR=/tmp/apkmirror.cookies
+
+          curl -fsSL --compressed --retry 4 --retry-all-errors --retry-delay 3 \
+            -A "$UA" -H 'Accept-Language: en-US,en;q=0.9' \
+            -c "$JAR" -b "$JAR" "$PRODUCT" -o /tmp/product.html
+          cp /tmp/product.html artifacts/product-page.html
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import html,re
+          base='https://www.apkmirror.com'
+          text=Path('/tmp/product.html').read_text(errors='ignore')
+          hrefs=[html.unescape(x) for x in re.findall(r'href=["\']([^"\']+)["\']',text,re.I)]
+          candidates=[h for h in hrefs if '/download/?key=' in h and 'download.php' not in h]
+          if not candidates:
+              raise SystemExit('fresh APKMirror step link not found on product page')
+          # Prefer the bundle download step for this release.
+          step=urljoin(base,candidates[0])
+          Path('/tmp/step-url').write_text(step)
+          Path('artifacts/step-url.txt').write_text(step+'\n')
+          print(step)
+          PY
+
+          STEP_URL="$(cat /tmp/step-url)"
+          curl -fsSL --compressed --retry 4 --retry-all-errors --retry-delay 3 \
+            -A "$UA" -H 'Accept-Language: en-US,en;q=0.9' -e "$PRODUCT" \
+            -c "$JAR" -b "$JAR" "$STEP_URL" -o /tmp/step.html
+          cp /tmp/step.html artifacts/download-step.html
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import html,re
+          base='https://www.apkmirror.com'
+          text=Path('/tmp/step.html').read_text(errors='ignore')
+          hrefs=[html.unescape(x) for x in re.findall(r'href=["\']([^"\']+)["\']',text,re.I)]
+          candidates=[h for h in hrefs if 'download.php?id=16206618' in h and 'key=' in h]
+          if not candidates:
+              # Generic fallback: any APKMirror download.php link with a key.
+              candidates=[h for h in hrefs if 'download.php?id=' in h and 'key=' in h]
+          if not candidates:
+              raise SystemExit('fresh APKMirror final download link not found')
+          final=urljoin(base,candidates[0])
+          Path('/tmp/final-url').write_text(final)
+          # Keep only non-secret structural info in artifact; the key is intentionally not persisted.
+          Path('artifacts/final-link-found.txt').write_text('fresh_final_download_link_found=true\n')
+          print('fresh final link found')
+          PY
+
+          # APKMirror may intentionally delay the final asset link briefly.
+          sleep 16
+          FINAL_URL="$(cat /tmp/final-url)"
+          curl -fL --compressed --max-time 240 --retry 4 --retry-all-errors --retry-delay 4 \
+            -A "$UA" -H 'Accept-Language: en-US,en;q=0.9' -e "$STEP_URL" \
+            -c "$JAR" -b "$JAR" "$FINAL_URL" -o /tmp/kwai.apkm
+
+          echo '536ae315a4d5d5742ba5d2073c4058a57e6f3abc89150fd4b3af23ab4159492a  /tmp/kwai.apkm' \
+            | sha256sum -c - | tee artifacts/bundle-hash.txt
+          stat -c 'bundle_bytes=%s' /tmp/kwai.apkm | tee artifacts/bundle-size.txt
           unzip -l /tmp/kwai.apkm | tee artifacts/contents.txt
           unzip -q /tmp/kwai.apkm '*.apk' -d /tmp/kwai
+
+          find /tmp/kwai -type f -name '*.apk' -printf '%f\n' | sort | tee artifacts/apk-files.txt
+          grep -Eai 'basis|basis_extension|dfm_ug' artifacts/apk-files.txt | tee artifacts/core-module-files.txt
+          grep -Eqi 'basis' artifacts/core-module-files.txt
+          grep -Eqi 'basis_extension' artifacts/core-module-files.txt
+
           BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
-          for apk in /tmp/kwai/*.apk; do
-            "$BT/apksigner" verify --print-certs "$apk" > /tmp/cert.txt
-            grep -qi 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047' /tmp/cert.txt
-            echo "VERIFIED $(basename "$apk")" | tee -a artifacts/certificates.txt
-            "$BT/aapt" dump badging "$apk" | head -1 | tee -a artifacts/packages.txt
-          done
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
+          : > artifacts/certificates.txt
+          : > artifacts/packages.txt
+          while IFS= read -r apk; do
+            "$BT/apksigner" verify --print-certs "$apk" > /tmp/cert.txt 2>&1
+            CERT="$(awk -F': ' '/certificate SHA-256 digest:/{print tolower($NF); exit}' /tmp/cert.txt | tr -d '[:space:]')"
+            if [ "$CERT" != 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047' ]; then
+              echo "CERT MISMATCH $(basename "$apk") $CERT" >&2
+              exit 41
+            fi
+            echo "VERIFIED $(basename "$apk") $CERT" >> artifacts/certificates.txt
+            "$BT/aapt" dump badging "$apk" | head -1 >> artifacts/packages.txt || true
+          done < <(find /tmp/kwai -type f -name '*.apk' | sort)
+
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          cat > /tmp/run-full-bundle.sh <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          while [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != '1' ]; do sleep 2; done
+
+          {
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo '--- route ---'; adb shell ip route || true
+            echo '--- ping IP ---'; adb shell ping -c 1 -W 3 8.8.8.8 || true
+            echo '--- ping DNS ---'; adb shell ping -c 1 -W 3 www.google.com || true
+          } | tee artifacts/network.txt
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          files=sorted(Path('/tmp/kwai').glob('*.apk'))
+          def pick(patterns, required=True):
+              for pat in patterns:
+                  rx=re.compile(pat,re.I)
+                  for p in files:
+                      if rx.fullmatch(p.name):
+                          return p
+              if required:
+                  raise SystemExit('required split not found: '+repr(patterns))
+              return None
+
+          selected=[]
+          selected.append(pick([r'base\.apk',r'com\.kwai\.video\.apk']))
+          selected.append(pick([r'split_config\.arm64_v8a\.apk',r'config\.arm64_v8a\.apk']))
+          density=pick([r'split_config\.xxhdpi\.apk',r'split_config\.xhdpi\.apk',r'split_config\.hdpi\.apk',r'split_config\.mdpi\.apk',r'config\.xxhdpi\.apk',r'config\.hdpi\.apk',r'config\.mdpi\.apk'],False)
+          if density: selected.append(density)
+          selected.append(pick([r'split_basis\.apk',r'basis\.apk']))
+          selected.append(pick([r'split_basis\.config\.arm64_v8a\.apk',r'basis\.config\.arm64_v8a\.apk']))
+          bd=pick([r'split_basis\.config\.xxhdpi\.apk',r'split_basis\.config\.xhdpi\.apk',r'split_basis\.config\.hdpi\.apk',r'basis\.config\.xxhdpi\.apk',r'basis\.config\.hdpi\.apk'],False)
+          if bd: selected.append(bd)
+          selected.append(pick([r'split_basis_extension\.apk',r'basis_extension\.apk']))
+          beabi=pick([r'split_basis_extension\.config\.arm64_v8a\.apk',r'basis_extension\.config\.arm64_v8a\.apk'],False)
+          if beabi: selected.append(beabi)
+          ug=pick([r'split_dfm_ug\.apk',r'dfm_ug\.apk'],False)
+          if ug: selected.append(ug)
+          # de-duplicate while preserving order
+          uniq=[]
+          for p in selected:
+              if p and p not in uniq: uniq.append(p)
+          Path('/tmp/selected-apks').write_text('\n'.join(str(p) for p in uniq)+'\n')
+          Path('artifacts/selected-apks.txt').write_text('\n'.join(p.name for p in uniq)+'\n')
+          print('\n'.join(p.name for p in uniq))
+          PY
+
+          mapfile -t APKS < /tmp/selected-apks
+          adb install-multiple -r "${APKS[@]}" 2>&1 | tee artifacts/install-full-bundle.txt
+          adb shell pm grant com.kwai.video android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+          adb shell appops set com.kwai.video POST_NOTIFICATION allow 2>/dev/null || true
+
+          adb shell pm path com.kwai.video | tee artifacts/installed-paths.txt
+          adb shell dumpsys package com.kwai.video \
+            | grep -E 'versionName=|versionCode=|primaryCpuAbi=|splitNames=' \
+            | head -n 40 | tee artifacts/installed-package.txt || true
+
+          grep -Eqi 'basis' artifacts/installed-paths.txt
+          grep -Eqi 'basis_extension' artifacts/installed-paths.txt
+
+          set +e
+          python3 scripts/kwai_ui_probe_confirm.py 2>&1 | tee artifacts/onboarding-console.txt
+          ONBOARD_RC=${PIPESTATUS[0]}
+          if [ "$ONBOARD_RC" -eq 0 ]; then
+            python3 scripts/kwai_phone_route_probe.py 2>&1 | tee artifacts/phone-route-console.txt
+            PHONE_RC=${PIPESTATUS[0]}
+          else
+            PHONE_RC=$ONBOARD_RC
+          fi
+          set -e
+
+          adb shell pidof com.kwai.video | tee artifacts/pid.txt || true
+          adb logcat -d -t 3500 > artifacts/logcat.txt || true
+          {
+            echo "onboarding_rc=$ONBOARD_RC"
+            echo "phone_route_rc=$PHONE_RC"
+            cat artifacts/phone-route-result.txt 2>/dev/null || true
+          } | tee artifacts/result.txt
+          exit "$PHONE_RC"
+          SH
+          chmod +x /tmp/run-full-bundle.sh
+
+      - name: Boot connected Android 14 and install full basis bundle
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         with:
-          name: kwai-complete-bundle-inspection
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash /tmp/run-full-bundle.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Kwai full APKM / basis phone-route proof'
+            cat artifacts/bundle-hash.txt 2>/dev/null || true
+            cat artifacts/bundle-size.txt 2>/dev/null || true
+            echo
+            echo '### Selected APKs'
+            cat artifacts/selected-apks.txt 2>/dev/null || true
+            echo
+            echo '### Installed package'
+            cat artifacts/installed-package.txt 2>/dev/null || true
+            echo
+            echo '### Result'
+            cat artifacts/result.txt 2>/dev/null || true
+            echo
+            echo 'Safety boundary: no phone number, OTP, password, account login, upload, or publication attempted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kwai-full-basis-phone-route-${{ github.run_id }}
           path: artifacts/
-          retention-days: 3
+          if-no-files-found: warn
+          retention-days: 1
