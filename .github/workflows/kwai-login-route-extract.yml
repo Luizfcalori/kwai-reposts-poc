@@ -19,7 +19,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts /tmp/apk/dex /tmp/apk/full /tmp/apk/nested
-          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions,aab=1/language=pt_PT/country=br'
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
           curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
           python3 - <<'PY'
           import json,pathlib
@@ -43,107 +43,73 @@ jobs:
         run: |
           set -euo pipefail
           PAT='PhoneAccountActivityV2|PhoneAccountActivity|PhoneVerifyActivity|ForcePhoneRegisterActivity|CommonLoginActivity|SplashLoginActivity|AutoLoginActivity|TinyLoginActivity|userlogin|PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|arg_tiny_login_source|ACCESS_REMOTE_LOGIN|UriRouterActivity'
-
-          echo '--- suspicious APK entries ---' > artifacts/suspicious-entries.txt
-          grep -Eai 'login|auth|account|phone|user|plugin|klw|krst|dynamic|feature|patch|dex|jar|zip|apk|\.so' artifacts/apk-entry-list.txt >> artifacts/suspicious-entries.txt || true
-
+          grep -Eai 'login|auth|account|phone|user|plugin|klw|krst|dynamic|feature|patch|dex|jar|zip|apk|\.so' artifacts/apk-entry-list.txt > artifacts/suspicious-entries.txt || true
           : > artifacts/file-content-hits.txt
           : > artifacts/file-type-inventory.txt
           while IFS= read -r -d '' f; do
             rel="${f#/tmp/apk/full/}"
-            typ="$(file -b "$f" 2>/dev/null || true)"
-            printf '%s\t%s\n' "$rel" "$typ" >> artifacts/file-type-inventory.txt
+            printf '%s\t%s\n' "$rel" "$(file -b "$f" 2>/dev/null || true)" >> artifacts/file-type-inventory.txt
             h="$(strings -a "$f" 2>/dev/null | grep -Eai "$PAT" | sort -u | head -n 300 || true)"
-            if [ -n "$h" ]; then
-              { echo "===== $rel ====="; echo "$h"; } >> artifacts/file-content-hits.txt
-            fi
+            [ -z "$h" ] || { echo "===== $rel ====="; echo "$h"; } >> artifacts/file-content-hits.txt
           done < <(find /tmp/apk/full -type f -print0)
 
-          # Identify ZIP/APK/JAR payloads by magic regardless of extension and inspect their members.
           python3 - <<'PY'
           from pathlib import Path
-          import zipfile, re, shutil
-          root=Path('/tmp/apk/full')
-          out=Path('/tmp/apk/nested')
-          inv=[]
+          import zipfile,re
+          root=Path('/tmp/apk/full'); out=Path('/tmp/apk/nested'); inv=[]
           for p in root.rglob('*'):
               if not p.is_file(): continue
               try:
-                  with p.open('rb') as f: magic=f.read(4)
-              except Exception: continue
-              if magic[:2] != b'PK': continue
-              try:
+                  if p.read_bytes()[:2] != b'PK': continue
                   with zipfile.ZipFile(p) as z:
-                      names=z.namelist()
-                      inv.append(f'===== {p.relative_to(root)} ({len(names)} entries) =====')
-                      inv.extend(names[:5000])
-                      safe=re.sub(r'[^A-Za-z0-9_.-]+','_',str(p.relative_to(root)))[:120]
-                      dest=out/safe
-                      dest.mkdir(parents=True,exist_ok=True)
+                      names=z.namelist(); inv += [f'===== {p.relative_to(root)} ({len(names)} entries) =====',*names[:5000]]
+                      dest=out/re.sub(r'[^A-Za-z0-9_.-]+','_',str(p.relative_to(root)))[:120]
                       for n in names:
                           low=n.lower()
                           if low.endswith(('.dex','.jar','.apk','.zip')) or any(x in low for x in ('login','auth','phone','account','userlogin')):
                               try:z.extract(n,dest)
                               except Exception:pass
-              except Exception:
-                  pass
+              except Exception: pass
           Path('artifacts/nested-archive-inventory.txt').write_text('\n'.join(inv)+'\n',encoding='utf-8')
           PY
 
           : > artifacts/nested-content-hits.txt
           while IFS= read -r -d '' f; do
             h="$(strings -a "$f" 2>/dev/null | grep -Eai "$PAT" | sort -u | head -n 400 || true)"
-            if [ -n "$h" ]; then
-              { echo "===== ${f#/tmp/apk/nested/} ====="; echo "$h"; } >> artifacts/nested-content-hits.txt
-            fi
+            [ -z "$h" ] || { echo "===== ${f#/tmp/apk/nested/} ====="; echo "$h"; } >> artifacts/nested-content-hits.txt
           done < <(find /tmp/apk/nested -type f -print0)
 
-          echo '--- direct files containing main phone classes ---'
-          cat artifacts/file-content-hits.txt | head -n 1200 || true
-          echo '--- nested archive hits ---'
-          cat artifacts/nested-content-hits.txt | head -n 1200 || true
-          echo '--- likely plugin/container entries ---'
-          grep -Eai 'plugin|klw|krst|login|userlogin|phone|account|dex|jar|apk|zip' artifacts/suspicious-entries.txt | head -n 1600 || true
+          echo '--- direct content hits ---'; head -n 1200 artifacts/file-content-hits.txt || true
+          echo '--- nested hits ---'; head -n 1200 artifacts/nested-content-hits.txt || true
+          echo '--- suspicious entries ---'; head -n 1600 artifacts/suspicious-entries.txt || true
 
-      - name: Extract login/router strings and manifest component properties
+      - name: Extract login routes and manifest properties
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import pathlib,re,subprocess
-          dexdir=pathlib.Path('/tmp/apk/dex')
           raw=[]
-          for p in sorted(dexdir.glob('classes*.dex')):
-              out=subprocess.run(['strings','-a',str(p)],text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL).stdout
-              raw.extend(out.splitlines())
-          rx=re.compile(r'phone|mobile|login|log_in|log-in|signin|sign_in|verification|sms|kwai://|kwai:|router|uri_router|auth|account|userlogin',re.I)
+          for p in sorted(pathlib.Path('/tmp/apk/dex').glob('classes*.dex')):
+              raw += subprocess.run(['strings','-a',str(p)],text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL).stdout.splitlines()
+          rx=re.compile(r'phone|mobile|login|signin|verification|sms|kwai://|router|auth|account|userlogin',re.I)
           keep=[]; seen=set()
           for s in raw:
               s=s.strip()
-              if not s or len(s)>350 or not rx.search(s) or s in seen: continue
-              seen.add(s); keep.append(s)
+              if s and len(s)<=350 and rx.search(s) and s not in seen: seen.add(s); keep.append(s)
           pathlib.Path('artifacts/login-router-strings.txt').write_text('\n'.join(keep),encoding='utf-8')
-          route=[]
-          for s in keep:
-              low=s.lower()
-              if ('://' in s or s.startswith('/') or 'router' in low or 'phone' in low or 'login' in low or 'userlogin' in low) and len(s)<260:
-                  route.append(s)
+          route=[s for s in keep if len(s)<260 and ('://' in s or 'router' in s.lower() or 'phone' in s.lower() or 'login' in s.lower() or 'userlogin' in s.lower())]
           pathlib.Path('artifacts/route-shortlist.txt').write_text('\n'.join(route[:6000]),encoding='utf-8')
           print('matched_strings=',len(keep),'route_candidates=',len(route))
           for s in route:
               l=s.lower()
-              if ('phone' in l and ('login' in l or 'account' in l)) or 'userlogin' in l or '://' in s:
-                  print(s)
+              if ('phone' in l and ('login' in l or 'account' in l)) or 'userlogin' in l or '://' in s: print(s)
           PY
-
-          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1 || true)"
-          AAPT="$BT/aapt"
-          "$AAPT" dump xmltree /tmp/apk/base.apk AndroidManifest.xml > artifacts/manifest-tree.txt 2>&1 || true
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BT/aapt" dump xmltree /tmp/apk/base.apk AndroidManifest.xml > artifacts/manifest-tree.txt 2>&1 || true
           grep -Eai -B8 -A14 'PhoneAccountActivityV2|ForcePhoneRegisterActivity|PhoneVerifyActivity|CommonLoginActivity|SplashLoginActivity|AutoLoginActivity|UriRouterActivity|ACCESS_REMOTE_LOGIN' artifacts/manifest-tree.txt > artifacts/manifest-login-excerpts.txt || true
-          "$AAPT" dump badging /tmp/apk/base.apk > artifacts/badging.txt 2>&1 || true
-
-          echo '--- manifest login components ---'
-          cat artifacts/manifest-login-excerpts.txt | head -n 1500 || true
+          "$BT/aapt" dump badging /tmp/apk/base.apk > artifacts/badging.txt 2>&1 || true
+          echo '--- manifest login components ---'; head -n 1500 artifacts/manifest-login-excerpts.txt || true
 
       - name: Upload extraction
         if: always()
