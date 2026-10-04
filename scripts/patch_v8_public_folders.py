@@ -237,7 +237,7 @@ text = replace_once(text, anchor, helpers, "MediaStore helpers")
 JAVA.write_text(text, encoding="utf-8")
 
 gradle = GRADLE.read_text(encoding="utf-8")
-gradle = replace_once(gradle, "versionCode 3", "versionCode 4", "versionCode")
+gradle = replace_once(gradle, "versionCode 7", "versionCode 8", "versionCode")
 gradle = replace_once(gradle, "versionName '0.7.0'", "versionName '0.8.0'", "versionName")
 GRADLE.write_text(gradle, encoding="utf-8")
 print("v8 public folders patch applied")
