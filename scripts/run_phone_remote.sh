@@ -34,6 +34,7 @@ if [ "$PHONE_READY" != true ]; then
   echo 'Phone form not reached; no remote access opened.'
   exit 7
 fi
+python3 scripts/kwai_select_brazil.py
 rm -rf artifacts
 adb logcat -c
 env -u GH_TOKEN -u KWAI_REMOTE_EMAIL python3 scripts/kwai_phone_remote.py >/dev/null 2>&1 &
@@ -77,7 +78,7 @@ for _ in range(20):
         raise SystemExit('Access check failed: origin accessible without authentication.')
     time.sleep(3)
 if not verified: raise SystemExit('Protected gateway not confirmed; session closed.')
-payload={'state':'success','context':'kwai/phone-remote','description':'Phone form ready; email-protected session active for 25 minutes','target_url':os.environ['REMOTE_URL']}
+payload={'state':'success','context':'kwai/phone-remote','description':'Brazil +55 selected; protected phone session ready','target_url':os.environ['REMOTE_URL']}
 req=urllib.request.Request('https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/statuses/'+os.environ['GITHUB_SHA'],data=json.dumps(payload).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'},method='POST')
 with urllib.request.urlopen(req,timeout=20) as response:
     assert response.status==201
