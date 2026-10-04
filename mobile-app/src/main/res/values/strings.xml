@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Kwai Phone Helper</string>
+    <string name="accessibility_description">Ajuda a avançar pelas telas de publicação do Kwai somente quando uma postagem é iniciada pelo usuário neste aplicativo.</string>
+</resources>
