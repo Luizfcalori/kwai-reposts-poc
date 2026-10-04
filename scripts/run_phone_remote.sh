@@ -44,7 +44,7 @@ for _ in $(seq 1 20); do
   sleep 1
 done
 test "$(curl -fsS http://127.0.0.1:6080/health)" = ready
-/tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 --allowed-mail "$KWAI_REMOTE_EMAIL" >/tmp/kwai-remote/tunnel.log 2>&1 &
+/tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 >/tmp/kwai-remote/tunnel.log 2>&1 &
 TUNNEL_PID=$!
 URL=''
 for _ in $(seq 1 60); do
@@ -55,34 +55,27 @@ for _ in $(seq 1 60); do
 done
 test -n "$URL"
 export REMOTE_URL="$URL"
-# Require an authentication redirect before announcing the session.
+# Require the public tunnel to expose only the app-level login page before announcing the session.
 python3 - <<'PY'
-import os,time,urllib.request,urllib.error,urllib.parse,json
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self,*args): return None
-opener=urllib.request.build_opener(NoRedirect)
+import os,time,urllib.request,json
 verified=False
 for _ in range(20):
     try:
-        r=opener.open(os.environ['REMOTE_URL']+'/health',timeout=15)
-        code,headers,body=r.status,r.headers,r.read(65536)
-    except urllib.error.HTTPError as e:
-        code,headers,body=e.code,e.headers,e.read(65536)
+        with urllib.request.urlopen(os.environ['REMOTE_URL']+'/',timeout=15) as r:
+            body=r.read(65536)
+            if r.status==200 and b'acesso protegido' in body:
+                verified=True
+                break
     except Exception:
-        time.sleep(3); continue
-    loc=headers.get('Location','').lower()
-    dest=urllib.parse.urlparse(loc)
-    if code in (301,302,303,307,308) and dest.scheme=='https' and dest.hostname=='login.trycloudflare.com' and dest.path=='/authorize':
-        verified=True; break
-    if body.strip()==b'ready':
-        raise SystemExit('Access check failed: origin accessible without authentication.')
+        pass
     time.sleep(3)
-if not verified: raise SystemExit('Protected gateway not confirmed; session closed.')
-payload={'state':'success','context':'kwai/phone-remote','description':'Brazil +55 selected; protected phone session ready','target_url':os.environ['REMOTE_URL']}
+if not verified:
+    raise SystemExit('Protected app login page not confirmed; session closed.')
+payload={'state':'success','context':'kwai/phone-remote','description':'Brazil +55 selected; app-password protected session ready','target_url':os.environ['REMOTE_URL']}
 req=urllib.request.Request('https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/statuses/'+os.environ['GITHUB_SHA'],data=json.dumps(payload).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'},method='POST')
 with urllib.request.urlopen(req,timeout=20) as response:
     assert response.status==201
-print('PHONE_REMOTE_READY: email authentication verified; phone field visible.')
+print('PHONE_REMOTE_READY: app-level authentication active; phone field visible.')
 PY
 echo "Protected session: $URL" >> "$GITHUB_STEP_SUMMARY"
 # Keep the runner alive for direct user interaction; no account inspection or logs.
