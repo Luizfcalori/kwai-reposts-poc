@@ -67,6 +67,14 @@ async function call(data){
     return r;
   }finally{busy=false}
 }
+async function navigateCommand(data){
+  if(busy)throw Error('Aguarde a operação anterior.');
+  busy=true;
+  try{
+    const q=await pack(data);
+    window.location.assign('/cmd?nav=1&q='+encodeURIComponent(q)+'&n='+Date.now());
+  }catch(err){busy=false;throw err}
+}
 async function refresh(){
   if(busy||refreshing)return;
   refreshing=true;
@@ -86,18 +94,18 @@ async function tapScreen(e){
   const w=screen.naturalWidth*scale,h=screen.naturalHeight*scale;
   const x=e.clientX-r.left-(r.width-w)/2,y=e.clientY-r.top-(r.height-h)/2;
   if(x<0||y<0||x>w||y>h)return;
-  try{say('Enviando toque...');await call({op:'tap',fx:x/w,fy:y/h});setTimeout(refresh,300)}catch(err){say(err.message)}
+  try{say('Enviando toque...');await navigateCommand({op:'tap',fx:x/w,fy:y/h})}catch(err){say(err.message)}
 }
 screen.addEventListener('pointerup',tapScreen,{passive:false});
 screen.addEventListener('contextmenu',e=>e.preventDefault());
 screen.addEventListener('dragstart',e=>e.preventDefault());
 document.querySelector('#digits').onsubmit=async e=>{
-  e.preventDefault();const n=document.querySelector('#number');
-  try{say('Focando o campo e digitando...');await call({op:'digits',value:n.value});n.value='';say('Texto enviado ao Kwai.');setTimeout(refresh,300)}catch(err){say(err.message)}
+  e.preventDefault();const n=document.querySelector('#number'),value=n.value;
+  try{say('Focando o campo e digitando...');n.value='';await navigateCommand({op:'digits',value})}catch(err){say(err.message)}
 };
-document.querySelector('#focus').onclick=async()=>{try{say('Localizando campo do Kwai...');await call({op:'focus'});say('Campo do Kwai focado.');setTimeout(refresh,250)}catch(err){say(err.message)}};
-document.querySelector('#scroll').onclick=async()=>{try{await call({op:'scroll'});setTimeout(refresh,300)}catch(err){say(err.message)}};
-document.querySelector('#back').onclick=async()=>{try{await call({op:'back'});setTimeout(refresh,300)}catch(err){say(err.message)}};
+document.querySelector('#focus').onclick=async()=>{try{say('Localizando campo do Kwai...');await navigateCommand({op:'focus'})}catch(err){say(err.message)}};
+document.querySelector('#scroll').onclick=async()=>{try{await navigateCommand({op:'scroll'})}catch(err){say(err.message)}};
+document.querySelector('#back').onclick=async()=>{try{await navigateCommand({op:'back'})}catch(err){say(err.message)}};
 document.querySelector('#refresh').onclick=refresh;
 document.querySelector('#backup').onsubmit=async e=>{
   e.preventDefault();const p=document.querySelector('#pass');
@@ -215,6 +223,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def redirect_root(self):
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def do_GET(self):
         if time.monotonic() > DEADLINE:
             return self.reply(410, "Sessão encerrada.")
@@ -269,6 +283,8 @@ class Handler(BaseHTTPRequestHandler):
                         return self.reply(200, blob, "application/octet-stream")
                     else:
                         raise ValueError("Comando inválido.")
+                if parse_qs(parsed.query).get("nav") == ["1"]:
+                    return self.redirect_root()
                 return self.reply(200, "ok")
             except ValueError as exc:
                 return self.reply(400, str(exc))
