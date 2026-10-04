@@ -31,6 +31,8 @@ jobs:
           BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
           BASE=/tmp/kwai/com.kwai.kuaishou.video.live.apk
           "$BT/aapt" dump badging "$BASE" | head -n1 | tee artifacts/base-badging.txt
+          "$BT/apksigner" verify --print-certs "$BASE" > artifacts/cert.txt 2>&1
+          grep -qi 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047' artifacts/cert.txt
           PKG="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" artifacts/base-badging.txt)"
           test "$PKG" = 'com.kwai.kuaishou.video.live'
           echo "$PKG" > /tmp/pkg
@@ -51,6 +53,7 @@ jobs:
               (A/f'{tag}-window.txt').write_text(sh('dumpsys','window','windows').stdout,encoding='utf-8')
               return act
           def dump(tag):
+              sh('rm','-f','/sdcard/u.xml')
               sh('uiautomator','dump','/sdcard/u.xml')
               adb('pull','/sdcard/u.xml',str(U/f'{tag}.xml'))
               with open(U/f'{tag}.png','wb') as f: subprocess.run(['adb','exec-out','screencap','-p'],stdout=f,stderr=subprocess.DEVNULL)
@@ -66,23 +69,35 @@ jobs:
               if not m:return None
               a,b,c,d=map(int,m.groups()); return (a+c)//2,(b+d)//2
           def tap_phone(root):
-              pats=[r'^Phone$',r'^Telefone$',r'^Celular$',r'continue.*phone',r'usar.*telefone',r'phone login',r'login.*phone']
               for n in root.iter('node'):
-                  s=' '.join(x for x in (n.attrib.get('text',''),n.attrib.get('content-desc',''),n.attrib.get('hint','')) if x)
-                  if s and any(re.search(p,s,re.I) for p in pats):
-                      p=center(n.attrib.get('bounds',''))
-                      if p:
-                          print('TAP_PHONE',s,p); sh('input','tap',str(p[0]),str(p[1])); time.sleep(4); return True
+                  a=n.attrib
+                  label=(a.get('text') or '').strip()
+                  match=re.search(r'\b(?:Phone|Telefone|Celular)\b',label,re.I)
+                  if not match or a.get('enabled') != 'true': continue
+                  bounds=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',a.get('bounds',''))
+                  if not bounds: continue
+                  x1,y1,x2,y2=map(int,bounds.groups())
+                  # Phone is a ClickableSpan inside the combined expansion TextView.
+                  # Use the observed label and live node bounds, not a fixed screen tap.
+                  if a.get('resource-id','').endswith('/login_platform_expand_text'):
+                      fraction=(match.start()+len(match.group())/2)/len(label)
+                      x=round(x1+(x2-x1)*fraction)
+                  elif match.group().lower()==label.lower():
+                      x=(x1+x2)//2
+                  else: continue
+                  y=(y1+y2)//2
+                  print('TAP_PHONE_SPAN',label,x,y,flush=True)
+                  sh('input','tap',str(x),str(y)); time.sleep(5)
+                  return True
               return False
           def phone_screen(root,texts,activities):
-              if 'PhoneAccountActivityV2' in activities:return True
-              t='\n'.join(texts)
-              if any(re.search(p,t,re.I) for p in [r'phone number',r'mobile number',r'country code',r'n[uú]mero de telefone',r'digite.*telefone',r'\+55',r'get code',r'send code']):return True
-              for n in root.iter('node'):
-                  if n.attrib.get('class')=='android.widget.EditText':
-                      s=' '.join((n.attrib.get('text',''),n.attrib.get('hint',''),n.attrib.get('content-desc','')))
-                      if not re.search(r'email|password|senha',s,re.I):return True
-              return False
+              resumed=' '.join(re.findall(r'(?:mResumedActivity|topResumedActivity)[^\n]*',activities))
+              owns_phone=PKG in resumed and 'PhoneAccountActivityV2' in resumed
+              fields=[n for n in root.iter('node') if n.attrib.get('class')=='android.widget.EditText'
+                      and n.attrib.get('package')==PKG and n.attrib.get('enabled')=='true']
+              labels='\n'.join(texts)
+              phone_label=bool(re.search(r'phone number|mobile number|n[uú]mero.*(?:telefone|celular)|country code|\+55',labels,re.I))
+              return bool(fields and (owns_phone or phone_label))
 
           sh('am','force-stop','com.google.android.apps.nexuslauncher')
           sh('am','force-stop','com.android.launcher3')
@@ -94,9 +109,11 @@ jobs:
           root,texts=dump('00-router')
           activities=state('00-router')
           ok=phone_screen(root,texts,activities)
-          if not ok and tap_phone(root):
-              root,texts=dump('01-after-phone-click')
-              activities=state('01-after-phone-click')
+          for attempt in range(3):
+              if ok: break
+              if not tap_phone(root): break
+              root,texts=dump(f'01-after-phone-click-{attempt}')
+              activities=state(f'01-after-phone-click-{attempt}')
               ok=phone_screen(root,texts,activities)
           (A/'logcat.txt').write_text(sh('logcat','-d','-v','brief').stdout[-160000:],encoding='utf-8')
           resumed=''
