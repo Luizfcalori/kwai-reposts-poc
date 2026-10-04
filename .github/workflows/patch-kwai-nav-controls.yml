@@ -1,10 +1,10 @@
-name: Patch Kwai navigation controls
+name: Patch Kwai app auth
 
 on:
   push:
     paths:
       - '.github/workflows/patch-kwai-nav-controls.yml'
-      - 'scripts/patch_kwai_nav_controls.py'
+      - 'scripts/patch_kwai_app_auth.py'
 
 permissions:
   contents: write
@@ -14,11 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Patch control transport to top-level GET navigation
+      - name: Patch remote access to app-level authentication
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/patch_kwai_nav_controls.py
+          python3 scripts/patch_kwai_app_auth.py
           python3 -m py_compile scripts/kwai_phone_remote.py
           git diff --check
           git config user.name 'github-actions[bot]'
@@ -28,5 +28,5 @@ jobs:
             echo 'Patch already applied.'
             exit 0
           fi
-          git commit -m 'Use top-level navigation for protected Kwai controls'
+          git commit -m 'Protect Kwai remote with app-level session auth'
           git push
