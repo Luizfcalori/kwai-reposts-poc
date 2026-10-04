@@ -18,6 +18,7 @@ import android.os.Build;
 import android.os.Environment;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
@@ -44,6 +45,7 @@ import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.text.DateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -64,9 +66,15 @@ public class MainActivity extends Activity {
     private static final String LEGACY_PUBLIC_PUBLISHED = Environment.DIRECTORY_MOVIES + "/KwaiHelper/Publicados/";
     private static final String STATE_RELATIVE_PATH = Environment.DIRECTORY_DOWNLOADS + "/KwaiHelper/";
     private static final String STATE_FILE_NAME = "kwaihelper_publicados.json";
+    private static final String LATEST_INFO_URL =
+            "https://raw.githubusercontent.com/Luizfcalori/kwai-reposts-poc/main/releases/latest.json";
+    private static final String TRUSTED_APK_PREFIX =
+            "https://raw.githubusercontent.com/Luizfcalori/kwai-reposts-poc/";
+    private static final int REQ_IMPORT_HISTORY = 701;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final ExecutorService imageExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService updateExecutor = Executors.newSingleThreadExecutor();
     private final List<QueueItem> pending = new ArrayList<>();
 
     private TextView summaryLabel;
@@ -84,10 +92,13 @@ public class MainActivity extends Activity {
     private Button postedButton;
     private Button skipButton;
     private Button alreadyPostedButton;
+    private Button updateButton;
+    private Button importHistoryButton;
 
     private QueueItem current;
     private File downloadedFile;
     private Uri publicMediaUri;
+    private File pendingUpdateFile;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -101,7 +112,7 @@ public class MainActivity extends Activity {
         box.setBackgroundColor(Color.rgb(247, 247, 247));
 
         TextView title = new TextView(this);
-        title.setText("Kwai Phone Helper v10");
+        title.setText("Kwai Phone Helper v11");
         title.setTextSize(26);
         title.setTextColor(Color.rgb(25, 25, 25));
         title.setPadding(0, 0, 0, dp(4));
@@ -125,6 +136,13 @@ public class MainActivity extends Activity {
         syncButton = button("↻ Sincronizar fila e baixar próximo");
         syncButton.setOnClickListener(v -> syncQueue(true));
         box.addView(syncButton);
+
+        updateButton = button("⬆ Atualizar app");
+        updateButton.setOnClickListener(v -> checkForUpdate());
+
+        importHistoryButton = button("📥 Importar histórico");
+        importHistoryButton.setOnClickListener(v -> chooseHistoryBackup());
+        box.addView(actionRow(updateButton, importHistoryButton));
 
         TextView quickTitle = new TextView(this);
         quickTitle.setText("AÇÕES RÁPIDAS");
@@ -278,6 +296,235 @@ public class MainActivity extends Activity {
         row.addView(left, leftParams);
         row.addView(right, rightParams);
         return row;
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (pendingUpdateFile != null
+                && pendingUpdateFile.exists()
+                && (Build.VERSION.SDK_INT < Build.VERSION_CODES.O
+                || getPackageManager().canRequestPackageInstalls())) {
+            File ready = pendingUpdateFile;
+            pendingUpdateFile = null;
+            installUpdateApk(ready);
+        }
+    }
+
+    private void chooseHistoryBackup() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/json");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        try {
+            startActivityForResult(intent, REQ_IMPORT_HISTORY);
+        } catch (ActivityNotFoundException ex) {
+            intent.setType("*/*");
+            startActivityForResult(intent, REQ_IMPORT_HISTORY);
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_IMPORT_HISTORY || resultCode != RESULT_OK || data == null) return;
+        Uri uri = data.getData();
+        if (uri == null) return;
+
+        try {
+            int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            getContentResolver().takePersistableUriPermission(uri, flags);
+        } catch (Exception ignored) {
+        }
+
+        try {
+            Set<String> imported = readPostedIdsFromUri(uri);
+            if (imported.isEmpty()) {
+                Toast.makeText(this, "O arquivo não contém IDs publicados.", Toast.LENGTH_LONG).show();
+                return;
+            }
+            Set<String> merged = getPostedIds();
+            int before = merged.size();
+            merged.addAll(imported);
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .edit()
+                    .putString("history_backup_uri", uri.toString())
+                    .putStringSet("posted_ids", new HashSet<>(merged))
+                    .apply();
+            saveDurablePostedIds(merged);
+            int added = merged.size() - before;
+            Toast.makeText(this, "Histórico importado: " + added + " IDs recuperados.", Toast.LENGTH_LONG).show();
+            updateSummary();
+            syncQueue(true);
+        } catch (Exception exc) {
+            Toast.makeText(this, "Falha ao importar histórico: " + shortMessage(exc), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private Set<String> readPostedIdsFromUri(Uri uri) throws Exception {
+        Set<String> result = new HashSet<>();
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(getContentResolver().openInputStream(uri), StandardCharsets.UTF_8))) {
+            StringBuilder text = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) text.append(line);
+            if (text.length() == 0) return result;
+            JSONObject root = new JSONObject(text.toString());
+            JSONArray ids = root.optJSONArray("posted_ids");
+            if (ids != null) {
+                for (int i = 0; i < ids.length(); i++) {
+                    String value = ids.optString(i, "").trim();
+                    if (!value.isEmpty()) result.add(value);
+                }
+            }
+        }
+        return result;
+    }
+
+    private void writePostedIdsToUri(Uri uri, Set<String> posted) throws Exception {
+        JSONObject root = new JSONObject();
+        JSONArray ids = new JSONArray();
+        List<String> sorted = new ArrayList<>(posted);
+        java.util.Collections.sort(sorted);
+        for (String value : sorted) ids.put(value);
+        root.put("posted_ids", ids);
+
+        try (OutputStream output = getContentResolver().openOutputStream(uri, "wt")) {
+            if (output == null) throw new IllegalStateException("Não foi possível abrir o arquivo de histórico.");
+            output.write(root.toString().getBytes(StandardCharsets.UTF_8));
+            output.flush();
+        }
+    }
+
+    private void checkForUpdate() {
+        updateButton.setEnabled(false);
+        setStatus("Verificando atualização do Helper...");
+        updateExecutor.execute(() -> {
+            HttpURLConnection connection = null;
+            try {
+                URL url = new URL(LATEST_INFO_URL + "?t=" + System.currentTimeMillis());
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setConnectTimeout(20000);
+                connection.setReadTimeout(30000);
+                connection.setUseCaches(false);
+                connection.setRequestProperty("User-Agent", "KwaiPhoneHelper-Updater/1.0");
+
+                StringBuilder raw = new StringBuilder();
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) raw.append(line);
+                }
+
+                JSONObject info = new JSONObject(raw.toString());
+                long remoteCode = info.optLong("version_code", 0);
+                String remoteName = info.optString("version_name", "nova");
+                String apkUrl = info.optString("apk_url", "");
+                String expectedSha = info.optString("sha256", "").toLowerCase(Locale.ROOT);
+                long currentCode = currentVersionCode();
+
+                if (remoteCode <= currentCode) {
+                    runOnUiThread(() -> {
+                        updateButton.setEnabled(true);
+                        setStatus("Você já está na versão mais recente.");
+                        Toast.makeText(this, "App já está atualizado ✓", Toast.LENGTH_SHORT).show();
+                    });
+                    return;
+                }
+                if (!apkUrl.startsWith(TRUSTED_APK_PREFIX) || expectedSha.length() != 64) {
+                    throw new SecurityException("Metadados de atualização inválidos.");
+                }
+
+                File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                if (dir == null) throw new IllegalStateException("Pasta de atualização indisponível.");
+                if (!dir.exists() && !dir.mkdirs()) throw new IllegalStateException("Não foi possível criar a pasta de atualização.");
+                File target = new File(dir, "kwai-phone-helper-v" + remoteCode + ".apk");
+                downloadUpdateFile(apkUrl, target);
+                String actualSha = sha256(target);
+                if (!actualSha.equalsIgnoreCase(expectedSha)) {
+                    target.delete();
+                    throw new SecurityException("Assinatura SHA-256 do download não confere.");
+                }
+
+                runOnUiThread(() -> {
+                    updateButton.setEnabled(true);
+                    setStatus("Versão " + remoteName + " baixada. O Android vai pedir sua confirmação para atualizar.");
+                    installUpdateApk(target);
+                });
+            } catch (Exception exc) {
+                runOnUiThread(() -> {
+                    updateButton.setEnabled(true);
+                    setStatus("Falha ao atualizar: " + shortMessage(exc));
+                    Toast.makeText(this, "Não consegui atualizar: " + shortMessage(exc), Toast.LENGTH_LONG).show();
+                });
+            } finally {
+                if (connection != null) connection.disconnect();
+            }
+        });
+    }
+
+    private long currentVersionCode() throws Exception {
+        android.content.pm.PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) return info.getLongVersionCode();
+        return info.versionCode;
+    }
+
+    private void downloadUpdateFile(String urlText, File target) throws Exception {
+        HttpURLConnection connection = null;
+        try {
+            connection = (HttpURLConnection) new URL(urlText + "?t=" + System.currentTimeMillis()).openConnection();
+            connection.setConnectTimeout(25000);
+            connection.setReadTimeout(120000);
+            connection.setInstanceFollowRedirects(true);
+            connection.setUseCaches(false);
+            connection.setRequestProperty("User-Agent", "KwaiPhoneHelper-Updater/1.0");
+            int response = connection.getResponseCode();
+            if (response < 200 || response >= 300) throw new IllegalStateException("HTTP " + response);
+            try (InputStream input = new BufferedInputStream(connection.getInputStream());
+                 FileOutputStream output = new FileOutputStream(target)) {
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
+                output.flush();
+            }
+            if (target.length() < 1024 * 100) throw new IllegalStateException("APK recebido parece inválido.");
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+    }
+
+    private String sha256(File file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream input = new BufferedInputStream(new FileInputStream(file))) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = input.read(buffer)) != -1) digest.update(buffer, 0, read);
+        }
+        StringBuilder out = new StringBuilder();
+        for (byte b : digest.digest()) out.append(String.format(Locale.ROOT, "%02x", b & 0xff));
+        return out.toString();
+    }
+
+    private void installUpdateApk(File apk) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !getPackageManager().canRequestPackageInstalls()) {
+            pendingUpdateFile = apk;
+            Intent settings = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:" + getPackageName()));
+            Toast.makeText(this, "Ative 'Permitir desta fonte' e volte ao Helper.", Toast.LENGTH_LONG).show();
+            startActivity(settings);
+            return;
+        }
+
+        Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".files", apk);
+        Intent install = new Intent(Intent.ACTION_VIEW);
+        install.setDataAndType(uri, "application/vnd.android.package-archive");
+        install.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivity(install);
+        } catch (ActivityNotFoundException ex) {
+            Toast.makeText(this, "O instalador do Android não foi encontrado.", Toast.LENGTH_LONG).show();
+        }
     }
 
     private void syncQueue(boolean downloadAfterSync) {
@@ -736,6 +983,10 @@ public class MainActivity extends Activity {
 
     private Set<String> loadDurablePostedIds() {
         Set<String> result = new HashSet<>();
+        String selected = getSharedPreferences(PREFS, MODE_PRIVATE).getString("history_backup_uri", "");
+        if (selected != null && !selected.isEmpty()) {
+            try { result.addAll(readPostedIdsFromUri(Uri.parse(selected))); } catch (Exception ignored) {}
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return result;
         Uri uri = findDurableStateUri();
         if (uri == null) return result;
@@ -782,6 +1033,13 @@ public class MainActivity extends Activity {
     }
 
     private void saveDurablePostedIds(Set<String> posted) {
+        String selected = getSharedPreferences(PREFS, MODE_PRIVATE).getString("history_backup_uri", "");
+        if (selected != null && !selected.isEmpty()) {
+            try {
+                writePostedIdsToUri(Uri.parse(selected), posted);
+                return;
+            } catch (Exception ignored) {}
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
         try {
             Uri uri = findDurableStateUri();
