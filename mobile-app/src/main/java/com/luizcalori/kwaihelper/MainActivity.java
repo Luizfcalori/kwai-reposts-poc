@@ -2,6 +2,7 @@ package com.luizcalori.kwaihelper;
 
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
+import android.content.ContentUris;
 import android.content.ClipData;
 import android.content.ContentValues;
 import android.content.ClipboardManager;
@@ -10,6 +11,7 @@ import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
@@ -59,7 +61,9 @@ public class MainActivity extends Activity {
             "https://raw.githubusercontent.com/Luizfcalori/kwai-reposts-poc/main/data/kwai_queue.json";
     private static final String PREFS = "kwai_queue_state";
     private static final String PUBLIC_DOWNLOADED = Environment.DIRECTORY_MOVIES + "/KwaiHelper/Baixados";
-    private static final String PUBLIC_PUBLISHED = Environment.DIRECTORY_MOVIES + "/KwaiHelper/Publicados";
+    private static final String LEGACY_PUBLIC_PUBLISHED = Environment.DIRECTORY_MOVIES + "/KwaiHelper/Publicados/";
+    private static final String STATE_RELATIVE_PATH = Environment.DIRECTORY_DOWNLOADS + "/KwaiHelper/";
+    private static final String STATE_FILE_NAME = "kwaihelper_publicados.json";
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final ExecutorService imageExecutor = Executors.newSingleThreadExecutor();
@@ -79,6 +83,7 @@ public class MainActivity extends Activity {
     private Button shareButton;
     private Button postedButton;
     private Button skipButton;
+    private Button alreadyPostedButton;
 
     private QueueItem current;
     private File downloadedFile;
@@ -87,6 +92,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        migrateLegacyPublishedFolder();
 
         int pad = dp(16);
         LinearLayout box = new LinearLayout(this);
@@ -95,7 +101,7 @@ public class MainActivity extends Activity {
         box.setBackgroundColor(Color.rgb(247, 247, 247));
 
         TextView title = new TextView(this);
-        title.setText("Kwai Phone Helper v8");
+        title.setText("Kwai Phone Helper v9");
         title.setTextSize(26);
         title.setTextColor(Color.rgb(25, 25, 25));
         title.setPadding(0, 0, 0, dp(4));
@@ -185,7 +191,7 @@ public class MainActivity extends Activity {
         shareButton.setOnClickListener(v -> shareCurrent());
         box.addView(shareButton);
 
-        postedButton = button("✓ Publicado — mover para Publicados e preparar próximo");
+        postedButton = button("✓ Publicado — excluir definitivamente e preparar próximo");
         postedButton.setEnabled(false);
         postedButton.setOnClickListener(v -> markPostedAndDelete());
         box.addView(postedButton);
@@ -194,6 +200,11 @@ public class MainActivity extends Activity {
         skipButton.setEnabled(false);
         skipButton.setOnClickListener(v -> skipCurrent());
         box.addView(skipButton);
+
+        alreadyPostedButton = button("⛔ Já publiquei antes — não mostrar novamente");
+        alreadyPostedButton.setEnabled(false);
+        alreadyPostedButton.setOnClickListener(v -> markAlreadyPosted());
+        box.addView(alreadyPostedButton);
 
         TextView foldersTitle = new TextView(this);
         foldersTitle.setText("PASTAS NO CELULAR");
@@ -205,10 +216,6 @@ public class MainActivity extends Activity {
         Button openDownloaded = button("📂 Abrir KwaiHelper/Baixados");
         openDownloaded.setOnClickListener(v -> openPublicFolder("Movies/KwaiHelper/Baixados"));
         box.addView(openDownloaded);
-
-        Button openPublished = button("📂 Abrir KwaiHelper/Publicados");
-        openPublished.setOnClickListener(v -> openPublicFolder("Movies/KwaiHelper/Publicados"));
-        box.addView(openPublished);
 
         status = new TextView(this);
         status.setText("Pronto para sincronizar.");
@@ -264,7 +271,7 @@ public class MainActivity extends Activity {
                 connection = (HttpURLConnection) url.openConnection();
                 connection.setConnectTimeout(20000);
                 connection.setReadTimeout(30000);
-                connection.setRequestProperty("User-Agent", "KwaiPhoneHelper/0.8 Android");
+                connection.setRequestProperty("User-Agent", "KwaiPhoneHelper/0.9 Android");
                 connection.setUseCaches(false);
 
                 StringBuilder jsonText = new StringBuilder();
@@ -380,6 +387,7 @@ public class MainActivity extends Activity {
             downloadButton.setEnabled(false);
             copyButton.setEnabled(false);
             skipButton.setEnabled(false);
+            alreadyPostedButton.setEnabled(false);
             updateSummary();
             return;
         }
@@ -390,6 +398,7 @@ public class MainActivity extends Activity {
         copyButton.setEnabled(!current.postText.trim().isEmpty());
         downloadButton.setEnabled(true);
         skipButton.setEnabled(pending.size() > 1);
+        alreadyPostedButton.setEnabled(true);
         setChip("AGUARDANDO DOWNLOAD");
         loadThumbnail(current);
         updateSummary();
@@ -409,7 +418,7 @@ public class MainActivity extends Activity {
                 connection = (HttpURLConnection) new URL(item.thumbnailUrl).openConnection();
                 connection.setConnectTimeout(15000);
                 connection.setReadTimeout(20000);
-                connection.setRequestProperty("User-Agent", "KwaiPhoneHelper/0.8 Android");
+                connection.setRequestProperty("User-Agent", "KwaiPhoneHelper/0.9 Android");
                 Bitmap bitmap;
                 try (InputStream input = new BufferedInputStream(connection.getInputStream())) {
                     bitmap = BitmapFactory.decodeStream(input);
@@ -463,7 +472,7 @@ public class MainActivity extends Activity {
                 connection = (HttpURLConnection) new URL(item.mediaUrl).openConnection();
                 connection.setConnectTimeout(25000);
                 connection.setReadTimeout(90000);
-                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) KwaiPhoneHelper/0.8");
+                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) KwaiPhoneHelper/0.9");
                 connection.setInstanceFollowRedirects(true);
 
                 int response = connection.getResponseCode();
@@ -567,14 +576,13 @@ public class MainActivity extends Activity {
         if (current == null) return;
 
         QueueItem postedItem = current;
-        boolean archived = false;
         if (publicMediaUri != null) {
             try {
-                movePublicMedia(publicMediaUri, PUBLIC_PUBLISHED);
-                archived = true;
+                getContentResolver().delete(publicMediaUri, null, null);
             } catch (Exception exc) {
-                Toast.makeText(this, "Publicado, mas não consegui mover a cópia para Publicados: " + shortMessage(exc), Toast.LENGTH_LONG).show();
+                Toast.makeText(this, "Não consegui excluir a cópia visível agora: " + shortMessage(exc), Toast.LENGTH_LONG).show();
             }
+            publicMediaUri = null;
         }
         if (downloadedFile != null && downloadedFile.exists() && !downloadedFile.delete()) {
             Toast.makeText(this, "Não consegui excluir o arquivo temporário do app agora.", Toast.LENGTH_LONG).show();
@@ -582,10 +590,7 @@ public class MainActivity extends Activity {
 
         Set<String> posted = getPostedIds();
         posted.add(postedItem.key());
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
-                .putStringSet("posted_ids", new HashSet<>(posted))
-                .apply();
+        persistPostedIds(posted);
         appendHistory(postedItem);
 
         if (!pending.isEmpty()) pending.remove(0);
@@ -594,10 +599,40 @@ public class MainActivity extends Activity {
         selectFirstPending();
 
         if (current != null) {
-            setStatus(archived ? "Publicado ✓ Movido para Movies/KwaiHelper/Publicados. Preparando o próximo vídeo..." : "Publicado ✓ Preparando o próximo vídeo...");
+            setStatus("Publicado ✓ Vídeo excluído definitivamente do celular. Preparando o próximo...");
             downloadCurrent();
         } else {
             setStatus("Fila concluída. Toque em Sincronizar para verificar novidades.");
+            setChip("FILA CONCLUÍDA");
+        }
+        updateSummary();
+    }
+
+    private void markAlreadyPosted() {
+        if (current == null) return;
+
+        QueueItem item = current;
+        if (publicMediaUri != null) {
+            try { getContentResolver().delete(publicMediaUri, null, null); } catch (Exception ignored) {}
+            publicMediaUri = null;
+        }
+        if (downloadedFile != null && downloadedFile.exists()) downloadedFile.delete();
+
+        Set<String> posted = getPostedIds();
+        posted.add(item.key());
+        persistPostedIds(posted);
+        appendHistory(item);
+
+        if (!pending.isEmpty()) pending.remove(0);
+        downloadedFile = null;
+        refreshHistory();
+        selectFirstPending();
+
+        if (current != null) {
+            setStatus("Marcado como já publicado. Esse vídeo não voltará para a fila. Preparando o próximo...");
+            downloadCurrent();
+        } else {
+            setStatus("Marcado como já publicado. Fila concluída.");
             setChip("FILA CONCLUÍDA");
         }
         updateSummary();
@@ -655,7 +690,158 @@ public class MainActivity extends Activity {
     private Set<String> getPostedIds() {
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         Set<String> stored = prefs.getStringSet("posted_ids", null);
-        return stored == null ? new HashSet<>() : new HashSet<>(stored);
+        Set<String> local = stored == null ? new HashSet<>() : new HashSet<>(stored);
+        Set<String> durable = loadDurablePostedIds();
+        Set<String> merged = new HashSet<>(durable);
+        merged.addAll(local);
+
+        if (!merged.equals(local)) {
+            prefs.edit().putStringSet("posted_ids", new HashSet<>(merged)).apply();
+        }
+        if (!merged.equals(durable)) {
+            saveDurablePostedIds(merged);
+        }
+        return merged;
+    }
+
+    private void persistPostedIds(Set<String> posted) {
+        Set<String> copy = new HashSet<>(posted);
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putStringSet("posted_ids", copy)
+                .apply();
+        saveDurablePostedIds(copy);
+    }
+
+    private Set<String> loadDurablePostedIds() {
+        Set<String> result = new HashSet<>();
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return result;
+        Uri uri = findDurableStateUri();
+        if (uri == null) return result;
+
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(getContentResolver().openInputStream(uri), StandardCharsets.UTF_8))) {
+            StringBuilder text = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) text.append(line);
+            if (text.length() == 0) return result;
+            JSONObject root = new JSONObject(text.toString());
+            JSONArray ids = root.optJSONArray("posted_ids");
+            if (ids != null) {
+                for (int i = 0; i < ids.length(); i++) {
+                    String value = ids.optString(i, "").trim();
+                    if (!value.isEmpty()) result.add(value);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return result;
+    }
+
+    private Uri findDurableStateUri() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null;
+        String[] projection = {MediaStore.Downloads._ID};
+        String selection = MediaStore.Downloads.DISPLAY_NAME + "=? AND "
+                + MediaStore.Downloads.RELATIVE_PATH + "=?";
+        String[] args = {STATE_FILE_NAME, STATE_RELATIVE_PATH};
+        try (Cursor cursor = getContentResolver().query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                projection,
+                selection,
+                args,
+                MediaStore.Downloads.DATE_ADDED + " DESC")) {
+            if (cursor != null && cursor.moveToFirst()) {
+                return ContentUris.withAppendedId(
+                        MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                        cursor.getLong(0));
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private void saveDurablePostedIds(Set<String> posted) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
+        try {
+            Uri uri = findDurableStateUri();
+            boolean created = false;
+            if (uri == null) {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Downloads.DISPLAY_NAME, STATE_FILE_NAME);
+                values.put(MediaStore.Downloads.MIME_TYPE, "application/json");
+                values.put(MediaStore.Downloads.RELATIVE_PATH, STATE_RELATIVE_PATH);
+                values.put(MediaStore.Downloads.IS_PENDING, 1);
+                uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                created = true;
+            }
+            if (uri == null) return;
+
+            JSONObject root = new JSONObject();
+            JSONArray ids = new JSONArray();
+            List<String> sorted = new ArrayList<>(posted);
+            java.util.Collections.sort(sorted);
+            for (String value : sorted) ids.put(value);
+            root.put("posted_ids", ids);
+
+            try (OutputStream output = getContentResolver().openOutputStream(uri, "wt")) {
+                if (output == null) return;
+                output.write(root.toString().getBytes(StandardCharsets.UTF_8));
+                output.flush();
+            }
+
+            if (created) {
+                ContentValues ready = new ContentValues();
+                ready.put(MediaStore.Downloads.IS_PENDING, 0);
+                getContentResolver().update(uri, ready, null, null);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void migrateLegacyPublishedFolder() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
+        Set<String> posted = getPostedIds();
+        List<Uri> toDelete = new ArrayList<>();
+        String[] projection = {
+                MediaStore.Video.Media._ID,
+                MediaStore.Video.Media.DISPLAY_NAME
+        };
+        String selection = MediaStore.Video.Media.RELATIVE_PATH + "=?";
+        String[] args = {LEGACY_PUBLIC_PUBLISHED};
+
+        try (Cursor cursor = getContentResolver().query(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                selection,
+                args,
+                null)) {
+            if (cursor != null) {
+                int idColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID);
+                int nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME);
+                while (cursor.moveToNext()) {
+                    long id = cursor.getLong(idColumn);
+                    String name = cursor.getString(nameColumn);
+                    if (name != null && name.endsWith(".mp4")) {
+                        String base = name.substring(0, name.length() - 4);
+                        int split = base.lastIndexOf('_');
+                        if (split > 0 && split < base.length() - 1) {
+                            String sourceId = base.substring(0, split);
+                            String videoId = base.substring(split + 1);
+                            if (videoId.matches("\d+")) posted.add(sourceId + ":" + videoId);
+                        }
+                    }
+                    toDelete.add(ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id));
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        if (!toDelete.isEmpty()) {
+            persistPostedIds(posted);
+            for (Uri uri : toDelete) {
+                try { getContentResolver().delete(uri, null, null); } catch (Exception ignored) {}
+            }
+        }
     }
 
     private Uri copyToPublicFolder(File source, String relativePath) throws Exception {
@@ -688,14 +874,6 @@ public class MainActivity extends Activity {
         ready.put(MediaStore.Video.Media.IS_PENDING, 0);
         getContentResolver().update(uri, ready, null, null);
         return uri;
-    }
-
-    private void movePublicMedia(Uri uri, String relativePath) {
-        if (uri == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
-        ContentValues values = new ContentValues();
-        values.put(MediaStore.Video.Media.RELATIVE_PATH, relativePath);
-        int updated = getContentResolver().update(uri, values, null, null);
-        if (updated <= 0) throw new IllegalStateException("Android não moveu o vídeo para a pasta Publicados.");
     }
 
     private void openPublicFolder(String relativePath) {
