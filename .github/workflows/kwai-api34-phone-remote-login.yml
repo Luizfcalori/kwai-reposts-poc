@@ -65,3 +65,4 @@ jobs:
 
 # Protected Quick Tunnel controls use encrypted GET requests so browser sessions behind SameSite=Lax auth can interact reliably.
 # Restart 2026-10-04 14:32Z with top-level navigation controls to avoid in-app browser fetch failures.
+# Restart 2026-10-04 15:10Z after app-level access update.
