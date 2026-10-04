@@ -1,0 +1,132 @@
+"""Loopback-only Android viewer; expose only behind verified email authentication."""
+import json
+import os
+import re
+import secrets
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+PKG = 'com.kwai.kuaishou.video.live'
+CSRF = secrets.token_urlsafe(32)
+LOCK = threading.Lock()
+DEADLINE = time.monotonic() + 1500
+PAGE = '''<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kwai — login protegido</title><style>body{font:16px system-ui;background:#151820;color:white;max-width:550px;margin:auto;padding:16px}button,input{font:inherit;padding:12px;margin:4px 0;box-sizing:border-box;max-width:100%}button{cursor:pointer}#screen{width:100%;max-height:70vh;object-fit:contain;touch-action:manipulation}p{line-height:1.4}.row{display:flex;gap:8px}#status{color:#ffd69b}</style>
+<h2>Kwai — login por telefone</h2><p>Toque na tela para selecionar Brasil (+55). Digite seu telefone e o código diretamente aqui. A sessão dura até 25 minutos.</p>
+<img id="screen" alt="Tela ao vivo do Android"><p id="status">Carregando...</p>
+<form id="digits"><input id="number" type="tel" autocomplete="off" placeholder="Número ou código no campo selecionado" pattern="[0-9+ ]{1,30}" required><button>Digitar no Android</button></form>
+<div class="row"><button id="back">Voltar</button><button id="refresh">Atualizar tela</button><button id="scroll">Rolar lista</button></div>
+<hr><h3>Guardar os dados após entrar</h3><p>Quando o Kwai mostrar sua conta, defina uma senha com pelo menos 16 caracteres e baixe o backup criptografado. Guarde a senha: ela não será salva. A restauração do login ainda precisa de teste.</p>
+<form id="backup"><input id="pass" type="password" autocomplete="new-password" minlength="16" required placeholder="Senha do backup (16+ caracteres)"><button>Baixar backup criptografado</button></form>
+<p>O backup interrompe o Kwai para copiar seus dados. Não feche esta página antes de o download terminar.</p>
+<script>
+const token='__CSRF__', screen=document.querySelector('#screen'), status=document.querySelector('#status');let busy=false;
+async function call(path,data){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Kwai-CSRF':token},body:JSON.stringify(data)});if(!r.ok)throw Error(await r.text());return r;}
+async function refresh(){if(busy)return;try{const r=await fetch('/screen',{cache:'no-store'});if(!r.ok)throw Error('Sessão indisponível');const b=await r.blob(),old=screen.src;screen.src=URL.createObjectURL(b);if(old.startsWith('blob:'))URL.revokeObjectURL(old);status.textContent='Conectado — toque na tela para controlar';}catch(e){status.textContent=e.message;}}
+screen.onclick=async e=>{const r=screen.getBoundingClientRect(),scale=Math.min(r.width/screen.naturalWidth,r.height/screen.naturalHeight),w=screen.naturalWidth*scale,h=screen.naturalHeight*scale,x=e.clientX-r.left-(r.width-w)/2,y=e.clientY-r.top-(r.height-h)/2;if(x<0||y<0||x>w||y>h)return;await call('/tap',{x:Math.round(x/scale),y:Math.round(y/scale)});setTimeout(refresh,500);};
+document.querySelector('#digits').onsubmit=async e=>{e.preventDefault();const n=document.querySelector('#number');try{await call('/digits',{value:n.value});n.value='';setTimeout(refresh,500);}catch(e){status.textContent=e.message;}};
+document.querySelector('#scroll').onclick=async()=>{await call('/scroll',{});setTimeout(refresh,500)};
+document.querySelector('#back').onclick=async()=>{await call('/back',{});setTimeout(refresh,500)};document.querySelector('#refresh').onclick=refresh;
+document.querySelector('#backup').onsubmit=async e=>{e.preventDefault();busy=true;status.textContent='Preparando backup criptografado...';try{const p=document.querySelector('#pass');const r=await call('/backup',{passphrase:p.value});p.value='';const u=URL.createObjectURL(await r.blob()),a=document.createElement('a');a.href=u;a.download='kwai-session-encrypted.bin';a.click();setTimeout(()=>URL.revokeObjectURL(u),60000);status.textContent='Backup baixado. Guarde a senha e avise no chat apenas que concluiu.';}catch(e){status.textContent=e.message;}finally{busy=false;}};
+refresh();setInterval(refresh,2500);
+</script>'''
+
+def adb(*args, binary=False, timeout=30):
+    return subprocess.run(['adb', *args], check=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, timeout=timeout).stdout
+
+def encrypted_backup(passphrase):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    if len(passphrase) < 16 or len(passphrase) > 256:
+        raise ValueError('A senha deve ter entre 16 e 256 caracteres.')
+    adb('shell', 'am', 'force-stop', PKG)
+    adb('root')
+    adb('wait-for-device')
+    raw = adb('exec-out', 'tar', '-C', '/data/user/0/' + PKG, '-cf', '-', '.', timeout=180)
+    if len(raw) < 1024:
+        raise RuntimeError('Backup vazio; tente novamente.')
+    salt, nonce = os.urandom(16), os.urandom(12)
+    key = Scrypt(salt=salt, length=32, n=2**15, r=8, p=1).derive(passphrase.encode())
+    header = b'KWAI-APPDATA-V1\n' + salt + nonce
+    result = header + AESGCM(key).encrypt(nonce, raw, header)
+    del raw, key
+    return result
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass  # No URLs, input, screenshots, or account data in public job logs.
+
+    def reply(self, code, body, typ='text/plain; charset=utf-8'):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header('Content-Type', typ)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if time.monotonic() > DEADLINE:
+            return self.reply(410, 'Sessão encerrada.')
+        if self.path == '/':
+            return self.reply(200, PAGE.replace('__CSRF__', CSRF), 'text/html; charset=utf-8')
+        if self.path == '/health':
+            return self.reply(200, 'ready')
+        if self.path == '/screen':
+            try:
+                with LOCK:
+                    png = adb('exec-out', 'screencap', '-p')
+                return self.reply(200, png, 'image/png')
+            except Exception:
+                return self.reply(503, 'Android indisponível.')
+        self.reply(404, 'Não encontrado.')
+
+    def do_POST(self):
+        if time.monotonic() > DEADLINE:
+            return self.reply(410, 'Sessão encerrada.')
+        if not secrets.compare_digest(self.headers.get('X-Kwai-CSRF', ''), CSRF):
+            return self.reply(403, 'Acesso recusado.')
+        origin = self.headers.get('Origin', '')
+        if origin and urlparse(origin).netloc != self.headers.get('Host'):
+            return self.reply(403, 'Origem recusada.')
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            if not 0 < length <= 2048:
+                return self.reply(400, 'Solicitação inválida.')
+            data = json.loads(self.rfile.read(length))
+            with LOCK:
+                if self.path == '/tap':
+                    x, y = int(data['x']), int(data['y'])
+                    if not (0 <= x < 1080 and 0 <= y < 2400):
+                        raise ValueError('Toque fora da tela.')
+                    adb('shell', 'input', 'tap', str(x), str(y))
+                elif self.path == '/digits':
+                    value = data['value']
+                    if not re.fullmatch(r'[0-9+ ]{1,30}', value):
+                        raise ValueError('Use apenas números, espaços ou +.')
+                    adb('shell', 'input', 'text', value.replace(' ', '%s'))
+                elif self.path == '/scroll':
+                    adb('shell', 'input', 'swipe', '540', '1800', '540', '700', '400')
+                elif self.path == '/back':
+                    adb('shell', 'input', 'keyevent', '4')
+                elif self.path == '/backup':
+                    blob = encrypted_backup(data['passphrase'])
+                    return self.reply(200, blob, 'application/octet-stream')
+                else:
+                    return self.reply(404, 'Não encontrado.')
+            self.reply(200, 'ok')
+        except ValueError:
+            self.reply(400, 'Entrada inválida. Confira os dados e o tamanho da senha.')
+        except Exception:
+            self.reply(503, 'Operação não concluída. Tente novamente.')
+
+if __name__ == '__main__':
+    ThreadingHTTPServer(('127.0.0.1', 6080), Handler).serve_forever()

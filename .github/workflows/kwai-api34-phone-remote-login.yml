@@ -1,0 +1,62 @@
+name: Kwai protected phone login
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kwai-api34-phone-remote-login.yml'
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: kwai-phone-remote
+  cancel-in-progress: false
+
+jobs:
+  phone-remote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Check protected access and prepare verified phone route
+        env:
+          KWAI_REMOTE_EMAIL: ${{ secrets.KWAI_REMOTE_EMAIL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$KWAI_REMOTE_EMAIL" || { echo 'Configure KWAI_REMOTE_EMAIL in repository Secrets.'; exit 1; }
+          python3 -m pip install --quiet pyyaml cryptography
+          python3 scripts/prepare_phone_remote.py
+          bash /tmp/prepare-phone.sh
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+          /tmp/cloudflared tunnel --help | grep -q -- '--allowed-mail'
+
+      - name: Boot API34 and open protected phone session
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        env:
+          KWAI_REMOTE_EMAIL: ${{ secrets.KWAI_REMOTE_EMAIL }}
+          GH_TOKEN: ${{ github.token }}
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          heap-size: 768M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -accel on -no-metrics
+          script: bash scripts/run_phone_remote.sh
+
+      - name: Remove temporary data
+        if: always()
+        run: |
+          rm -rf artifacts /tmp/kwai-remote /tmp/kwai
+          echo 'Remote session ended. No screenshots, credentials, account data or unencrypted backups uploaded.' >> "$GITHUB_STEP_SUMMARY"
