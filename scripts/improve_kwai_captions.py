@@ -17,16 +17,21 @@ GENERIC_PHRASES = [
     "venha conferir",
 ]
 
-GENERAL_TAGS = [
-    ["#KwaiBrasil", "#ParaVoce"],
-    ["#VideoDoDia", "#KwaiBrasil"],
-    ["#EmAlta", "#ParaVoce"],
-    ["#KwaiBrasil", "#Confira"],
-]
+GENERAL_TAGS = ["#KwaiBrasil", "#ParaVoce"]
+
+SOURCE_CATEGORY_OVERRIDES = {
+    "cvqjx483": "motivacao",
+    "lideranca00dojob": "motivacao",
+    "gatas_do_mundo": "lifestyle",
+    "princesasdainternet1": "lifestyle",
+    "larissagatinha335": "lifestyle",
+    "colirios01": "lifestyle",
+    "battyboop": "lifestyle",
+}
 
 CATEGORIES = {
     "motivacao": {
-        "keywords": ["motivacao", "motivação", "lideranca", "liderança", "reflexao", "reflexão", "superacao", "superação", "frase", "inspiracao", "inspiração"],
+        "keywords": ["motivacao", "lideranca", "reflexao", "superacao", "frase", "inspiracao"],
         "tags": ["#Motivacao", "#Reflexao", "#Inspiracao"],
         "templates": [
             "Uma mensagem que vale levar para o dia 💭\nO que você achou dessa reflexão?",
@@ -34,17 +39,18 @@ CATEGORIES = {
             "Uma pausa rápida para pensar um pouco 💡\nConcorda com essa ideia?",
         ],
     },
-    "beleza": {
-        "keywords": ["beleza", "maquiagem", "make", "look", "moda", "fashion", "estilo", "princesa", "gata", "gatinha", "colirio", "colírio", "modelo", "biquini", "biquíni"],
-        "tags": ["#Beleza", "#Estilo", "#Lifestyle"],
+    "lifestyle": {
+        "keywords": ["lifestyle", "estilo", "look", "moda", "beleza", "princesa", "gata", "gatinha", "colirio", "modelo"],
+        "tags": ["#Lifestyle", "#Estilo", "#Momentos"],
         "templates": [
-            "Um visual que chama atenção logo de cara ✨\nQual detalhe você curtiu mais?",
-            "Estilo e presença em poucos segundos 👀\nO que você achou desse visual?",
-            "Aquele tipo de vídeo que prende a atenção ✨\nVocê curtiu o estilo?",
+            "Equilíbrio, atitude e uma cena que chama atenção 👀\nO que você achou desse momento?",
+            "Um registro diferente que prende a atenção logo de cara ✨\nCurtiu essa cena?",
+            "Estilo e energia em poucos segundos 👀\nO que mais chamou sua atenção?",
+            "Uma cena marcante para passar na sua timeline ✨\nVocê assistiria de novo?",
         ],
     },
     "danca": {
-        "keywords": ["danca", "dança", "dance", "coreografia", "ritmo", "rebolando", "musica", "música"],
+        "keywords": ["danca", "dance", "coreografia", "ritmo", "rebolando", "musica"],
         "tags": ["#Danca", "#Musica", "#Ritmo"],
         "templates": [
             "Energia e ritmo do começo ao fim 🔥\nCurtiu essa sequência?",
@@ -53,25 +59,25 @@ CATEGORIES = {
         ],
     },
     "humor": {
-        "keywords": ["humor", "engracado", "engraçado", "comedia", "comédia", "meme", "risada", "pegadinha", "zoeira"],
+        "keywords": ["humor", "engracado", "comedia", "meme", "risada", "pegadinha", "zoeira"],
         "tags": ["#Humor", "#Comedia", "#Risadas"],
         "templates": [
             "Essa cena merece replay 😂\nVocê conseguiu segurar a risada?",
-            "Tem vídeo que melhora quando você assiste de novo 😂\nQual foi sua reação?",
             "Do nada uma cena dessas 😅\nVocê esperava por esse final?",
+            "Tem vídeo que melhora quando você assiste de novo 😂\nQual foi sua reação?",
         ],
     },
     "fitness": {
-        "keywords": ["treino", "academia", "fitness", "musculacao", "musculação", "exercicio", "exercício"],
-        "tags": ["#Fitness", "#Treino", "#Academia"],
+        "keywords": ["treino", "academia", "fitness", "musculacao", "exercicio", "equilibrio", "alongamento"],
+        "tags": ["#Fitness", "#Movimento", "#Treino"],
         "templates": [
-            "Foco no treino e consistência 💪\nVocê também está nessa rotina?",
-            "Mais uma dose de motivação para treinar 🔥\nQual seu treino de hoje?",
-            "Disciplina aparecendo na prática 💪\nCurtiu essa rotina?",
+            "Controle e movimento em uma cena que chama atenção 💪\nVocê tentaria algo assim?",
+            "Equilíbrio e concentração aparecendo na prática 👀\nCurtiu esse movimento?",
+            "Uma dose de movimento para a timeline 🔥\nO que você achou?",
         ],
     },
     "viagem": {
-        "keywords": ["praia", "viagem", "natureza", "paisagem", "ferias", "férias", "turismo", "mar"],
+        "keywords": ["praia", "viagem", "natureza", "paisagem", "ferias", "turismo", "mar"],
         "tags": ["#Viagem", "#Natureza", "#Paisagem"],
         "templates": [
             "Um cenário desses já muda o dia 🌴\nVocê iria para esse lugar?",
@@ -98,7 +104,7 @@ CATEGORIES = {
         ],
     },
     "carros": {
-        "keywords": ["carro", "moto", "motor", "automotivo", "automovel", "automóvel"],
+        "keywords": ["carro", "moto", "motor", "automotivo", "automovel"],
         "tags": ["#Carros", "#Automotivo", "#Motores"],
         "templates": [
             "Para quem gosta de máquina, esse vídeo chama atenção 🔥\nO que você achou?",
@@ -117,12 +123,11 @@ CATEGORIES = {
     },
     "geral": {
         "keywords": [],
-        "tags": ["#Video", "#Entretenimento", "#Confira"],
+        "tags": ["#Entretenimento", "#Momentos"],
         "templates": [
             "Esse vídeo chamou atenção por aqui 👀\nO que você achou dessa cena?",
             "Vale assistir até o final 👀\nQual foi a sua reação?",
             "Mais um daqueles vídeos que prendem a atenção ✨\nVocê curtiu?",
-            "Passando na sua timeline com uma cena que chama atenção 👇\nO que você achou?",
         ],
     },
 }
@@ -145,29 +150,33 @@ def clean_caption(text: str) -> str:
 
     lowered = norm(text)
     for phrase in GENERIC_PHRASES:
-        lowered_phrase = norm(phrase)
-        if lowered_phrase in lowered:
-            pattern = re.compile(re.escape(phrase), re.I)
-            text = pattern.sub(" ", text)
-    text = re.sub(r"\s+", " ", text).strip(" -–—|:;,.")
+        if norm(phrase) in lowered:
+            text = re.sub(re.escape(phrase), " ", text, flags=re.I)
+            lowered = norm(text)
 
-    # remove obvious duplicated one-word/handle-like captions
+    text = re.sub(r"\s+", " ", text).strip(" -–—|:;,.")
     parts = [p.strip() for p in re.split(r"[,.|]+", text) if p.strip()]
     if len(parts) == 2 and norm(parts[0]) == norm(parts[1]):
         text = parts[0]
     if re.fullmatch(r"[@A-Za-z0-9_.-]{2,40}", text or ""):
         text = ""
+    if not re.search(r"[A-Za-zÀ-ÿ]{3}", text or ""):
+        text = ""
     return text[:220]
 
 
 def choose_category(item: dict, cleaned: str) -> str:
+    source_id = str(item.get("source_id", ""))
+    if source_id in SOURCE_CATEGORY_OVERRIDES:
+        return SOURCE_CATEGORY_OVERRIDES[source_id]
+
     haystack = " ".join([
         cleaned,
         str(item.get("source_caption", "")),
         str(item.get("page_title", "")),
         str(item.get("source_display_name", "")),
         str(item.get("source_handle", "")),
-        str(item.get("source_id", "")),
+        source_id,
     ])
     n = norm(haystack)
     best = "geral"
@@ -185,9 +194,10 @@ def choose_category(item: dict, cleaned: str) -> str:
 def existing_tags(text: str) -> list[str]:
     out = []
     seen = set()
+    blocked = {"#kwai", "#fyp", "#viral", "#paravoce", "#pravc", "#emalta", "#videododia"}
     for tag in re.findall(r"#[\wÀ-ÿ]+", text or ""):
         key = norm(tag)
-        if key in {"#kwai", "#fyp", "#viral", "#paravoce", "#pravc", "#emalta"}:
+        if key in blocked:
             continue
         if key not in seen:
             seen.add(key)
@@ -197,7 +207,7 @@ def existing_tags(text: str) -> list[str]:
     return out
 
 
-def dedupe_tags(tags: list[str], limit: int = 6) -> list[str]:
+def dedupe_tags(tags: list[str], limit: int = 5) -> list[str]:
     out = []
     seen = set()
     for tag in tags:
@@ -213,7 +223,7 @@ def dedupe_tags(tags: list[str], limit: int = 6) -> list[str]:
     return out
 
 
-def improve(item: dict) -> tuple[str, list[str], str]:
+def improve(item: dict) -> tuple[str, list[str], str, str]:
     video_id = str(item.get("video_id", "0"))
     seed = int(hashlib.sha256(video_id.encode()).hexdigest()[:8], 16)
     raw = str(item.get("source_caption", ""))
@@ -232,13 +242,9 @@ def improve(item: dict) -> tuple[str, list[str], str]:
     else:
         caption = cfg["templates"][seed % len(cfg["templates"])]
 
-    tags = dedupe_tags(
-        existing_tags(raw)
-        + cfg["tags"]
-        + GENERAL_TAGS[(seed // 7) % len(GENERAL_TAGS)]
-    )
+    tags = dedupe_tags(existing_tags(raw) + cfg["tags"] + GENERAL_TAGS)
     post_text = caption + "\n\n" + " ".join(tags)
-    return caption, tags, post_text
+    return caption, tags, post_text, category
 
 
 def main() -> int:
@@ -251,15 +257,20 @@ def main() -> int:
             continue
         if item.get("status") not in {"ready_for_phone", "ready_for_media_refresh"}:
             continue
-        caption, tags, post_text = improve(item)
-        if item.get("generated_caption") != caption or item.get("hashtags") != tags or item.get("post_text") != post_text:
-            item["generated_caption"] = caption
-            item["hashtags"] = tags
-            item["post_text"] = post_text
+        caption, tags, post_text, category = improve(item)
+        updates = {
+            "generated_caption": caption,
+            "hashtags": tags,
+            "post_text": post_text,
+            "caption_category": category,
+            "caption_strategy": "source_aware_v2",
+        }
+        if any(item.get(k) != v for k, v in updates.items()):
+            item.update(updates)
             changed += 1
     if changed:
         QUEUE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"captions_improved": changed}, ensure_ascii=False))
+    print(json.dumps({"captions_improved": changed, "strategy": "source_aware_v2"}, ensure_ascii=False))
     return 0
 
 
