@@ -32,7 +32,7 @@ jobs:
           BASE=/tmp/kwai/com.kwai.kuaishou.video.live.apk
           "$BT/aapt" dump badging "$BASE" | head -n1 | tee artifacts/base-badging.txt
           "$BT/apksigner" verify --print-certs "$BASE" > artifacts/cert.txt 2>&1
-          grep -qi 'bb8d2610b048bee8e9f96cd5456d8b8b5a0806d2a41dffdf744d2a8720e81047' artifacts/cert.txt
+          grep -qi '588774ea798843484c7100da2450005090522fda0dcb64be01c04079349c0acc' artifacts/cert.txt
           PKG="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" artifacts/base-badging.txt)"
           test "$PKG" = 'com.kwai.kuaishou.video.live'
           echo "$PKG" > /tmp/pkg
