@@ -1,0 +1,101 @@
+name: Build v11 updater
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-v11-updater.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Apply v11 patch
+        run: python scripts/patch_v11_updater_import.py
+
+      - name: Commit v11 source changes
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add mobile-app/src/main/java/com/luizcalori/kwaihelper/MainActivity.java \
+                  mobile-app/build.gradle \
+                  mobile-app/src/main/AndroidManifest.xml \
+                  mobile-app/src/main/res/xml/file_paths.xml
+          if ! git diff --cached --quiet; then
+            git commit -m 'Add in-app updater and history import'
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Restore stable debug signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: kwai-phone-helper-debug-keystore-v1
+
+      - name: Verify signing key
+        shell: bash
+        run: |
+          test -f ~/.android/debug.keystore
+          keytool -list -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey >/dev/null
+
+      - name: Install Gradle 8.9
+        shell: bash
+        run: |
+          curl -fsSL https://services.gradle.org/distributions/gradle-8.9-bin.zip -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /opt
+          echo '/opt/gradle-8.9/bin' >> "$GITHUB_PATH"
+
+      - name: Build v11 APK
+        run: gradle --no-daemon :mobile-app:assembleDebug
+
+      - name: Publish latest APK metadata in repository
+        shell: bash
+        run: |
+          mkdir -p releases
+          cp mobile-app/build/outputs/apk/debug/mobile-app-debug.apk releases/kwai-phone-helper-latest.apk
+          SHA=$(sha256sum releases/kwai-phone-helper-latest.apk | awk '{print $1}')
+          cat > releases/latest.json <<EOF
+          {
+            "version_code": 11,
+            "version_name": "1.1.0",
+            "apk_url": "https://raw.githubusercontent.com/Luizfcalori/kwai-reposts-poc/main/releases/kwai-phone-helper-latest.apk",
+            "sha256": "$SHA"
+          }
+          EOF
+          git add -f releases/kwai-phone-helper-latest.apk releases/latest.json
+          git commit -m 'Publish Kwai Phone Helper v11' || true
+          for attempt in 1 2 3; do
+            git pull --rebase origin main && git push origin HEAD:main && break
+            if [ "$attempt" = "3" ]; then exit 1; fi
+            sleep 3
+          done
+
+      - name: Upload v11 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwai-phone-helper-v11
+          path: mobile-app/build/outputs/apk/debug/mobile-app-debug.apk
+          retention-days: 7
