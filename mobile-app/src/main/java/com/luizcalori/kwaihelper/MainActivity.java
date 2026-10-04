@@ -17,7 +17,6 @@ import android.widget.Toast;
 
 public class MainActivity extends Activity {
     private static final int PICK_VIDEO = 1001;
-    private static final String KWAI_PACKAGE = "com.kwai.kuaishou.video.live";
 
     private Uri selectedVideo;
     private TextView selectedLabel;
@@ -33,14 +32,14 @@ public class MainActivity extends Activity {
         box.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Kwai Phone Helper — modo seguro");
+        title.setText("Kwai Phone Helper — modo seguro v3");
         title.setTextSize(24);
         title.setTextColor(Color.BLACK);
         title.setPadding(0, 0, 0, dp(10));
         box.addView(title);
 
         TextView info = new TextView(this);
-        info.setText("Esta versão não usa Acessibilidade nem permissões sensíveis. Ela apenas entrega ao Kwai um vídeo escolhido por você e uma legenda opcional usando o compartilhamento normal do Android.");
+        info.setText("Esta versão não usa Acessibilidade nem permissões sensíveis. Ela usa o compartilhamento normal do Android e não depende do nome interno do pacote do Kwai.");
         info.setTextSize(16);
         info.setTextColor(Color.DKGRAY);
         info.setPadding(0, 0, 0, dp(16));
@@ -63,13 +62,13 @@ public class MainActivity extends Activity {
         box.addView(caption, new LinearLayout.LayoutParams(-1, -2));
 
         TextView note = new TextView(this);
-        note.setText("No primeiro teste queremos confirmar duas coisas: se o APK instala normalmente e se o Kwai recebe o vídeo por compartilhamento direto. O botão final de publicar continuará sob seu controle.");
+        note.setText("Ao tocar em Enviar, o Android mostrará os aplicativos compatíveis. Selecione o Kwai. O botão final de publicar continuará sob seu controle neste teste.");
         note.setTextColor(Color.rgb(90, 90, 90));
         note.setPadding(0, dp(10), 0, dp(12));
         box.addView(note);
 
-        Button send = button("2. Enviar para o Kwai");
-        send.setOnClickListener(v -> shareToKwai());
+        Button send = button("2. Enviar / escolher Kwai");
+        send.setOnClickListener(v -> shareVideo());
         box.addView(send);
 
         ScrollView scroll = new ScrollView(this);
@@ -109,7 +108,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void shareToKwai() {
+    private void shareVideo() {
         if (selectedVideo == null) {
             Toast.makeText(this, "Escolha um vídeo primeiro.", Toast.LENGTH_LONG).show();
             return;
@@ -124,18 +123,14 @@ public class MainActivity extends Activity {
             share.putExtra(Intent.EXTRA_TEXT, text);
         }
         share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        share.setPackage(KWAI_PACKAGE);
+
+        Intent chooser = Intent.createChooser(share, "Escolha o Kwai");
+        chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
 
         try {
-            startActivity(share);
+            startActivity(chooser);
         } catch (ActivityNotFoundException ex) {
-            Intent launch = getPackageManager().getLaunchIntentForPackage(KWAI_PACKAGE);
-            if (launch != null) {
-                startActivity(launch);
-                Toast.makeText(this, "O Kwai não aceitou o compartilhamento direto. Abri o app para verificarmos essa tela.", Toast.LENGTH_LONG).show();
-            } else {
-                Toast.makeText(this, "Kwai não encontrado neste aparelho.", Toast.LENGTH_LONG).show();
-            }
+            Toast.makeText(this, "Nenhum aplicativo compatível com compartilhamento de vídeo foi encontrado.", Toast.LENGTH_LONG).show();
         }
     }
 
