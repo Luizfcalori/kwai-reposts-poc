@@ -827,7 +827,7 @@ public class MainActivity extends Activity {
                         if (split > 0 && split < base.length() - 1) {
                             String sourceId = base.substring(0, split);
                             String videoId = base.substring(split + 1);
-                            if (videoId.matches("\d+")) posted.add(sourceId + ":" + videoId);
+                            if (videoId.matches("\\d+")) posted.add(sourceId + ":" + videoId);
                         }
                     }
                     toDelete.add(ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id));
