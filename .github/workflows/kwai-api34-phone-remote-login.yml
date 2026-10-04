@@ -23,6 +23,47 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Diagnose protected gateway response
+        env:
+          KWAI_REMOTE_EMAIL: ${{ secrets.KWAI_REMOTE_EMAIL }}
+        run: |
+          set -euo pipefail
+          test -n "$KWAI_REMOTE_EMAIL"
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cf
+          chmod +x /tmp/cf
+          mkdir -p /tmp/gateway-probe
+          echo 'GATEWAY_PROBE_ORIGIN' > /tmp/gateway-probe/index.html
+          python3 -m http.server 6080 --bind 127.0.0.1 --directory /tmp/gateway-probe >/dev/null 2>&1 &
+          HPID=$!
+          /tmp/cf tunnel --no-autoupdate --url http://127.0.0.1:6080 --allowed-mail "$KWAI_REMOTE_EMAIL" >/tmp/cf-probe.log 2>&1 &
+          CPID=$!
+          trap 'kill "$HPID" "$CPID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            URL="$(grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cf-probe.log | tail -1 || true)"
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          export PROBE_URL="$URL"
+          python3 - <<'PYCODE'
+          import urllib.request,urllib.error,os,re,time
+          class NR(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,*args):return None
+          op=urllib.request.build_opener(NR)
+          for i in range(5):
+              time.sleep(3)
+              try:
+                  r=op.open(os.environ['PROBE_URL']+'/',timeout=20)
+              except urllib.error.HTTPError as e:r=e
+              body=r.read(65536).decode(errors='replace')
+              print('gateway_http_status=',r.code)
+              print('gateway_location=',r.headers.get('Location','').split('?')[0])
+              print('gateway_title=',re.findall(r'<title[^>]*>(.*?)</title>',body,re.I|re.S))
+              print('gateway_form_inputs=',re.findall(r'<input[^>]+(?:type|name)=[\"\']([^\"\']+)',body,re.I))
+              print('gateway_origin_visible=', 'GATEWAY_PROBE_ORIGIN' in body)
+              print('gateway_text=',re.sub(r'<[^>]+>',' ',body)[-1800:])
+          PYCODE
+          exit 1
+
       - name: Check protected access and prepare verified phone route
         env:
           KWAI_REMOTE_EMAIL: ${{ secrets.KWAI_REMOTE_EMAIL }}
