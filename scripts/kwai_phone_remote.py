@@ -1,9 +1,12 @@
-# Loopback-only Android viewer; expose only behind verified email authentication.
+# Loopback-only Android viewer; expose through an HTTPS tunnel with app-level authentication.
 import base64
+import hashlib
+import hmac
 import io
 import json
 import os
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -16,8 +19,18 @@ from PIL import Image
 PKG = "com.kwai.kuaishou.video.live"
 CONTROL_KEY = os.urandom(32)
 CONTROL_KEY_B64 = base64.urlsafe_b64encode(CONTROL_KEY).decode().rstrip("=")
+AUTH_HASH = "0644b3e91ed4d38920eaf999febbf37bd552f86b3f0fbd99dda542d154503b14"
+SESSION_TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.Lock()
 DEADLINE = time.monotonic() + 1500
+
+LOGIN_PAGE = r'''<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kwai — acesso protegido</title>
+<style>body{font:16px system-ui;background:#151820;color:white;max-width:420px;margin:60px auto;padding:20px}input,button{font:inherit;width:100%;padding:12px;margin:8px 0;box-sizing:border-box}button{cursor:pointer}</style>
+<h2>Kwai — acesso protegido</h2>
+<p>Digite a senha temporária desta sessão.</p>
+<form method="post" action="/login"><input name="password" type="password" autocomplete="current-password" required autofocus><button type="submit">Entrar</button></form>
+'''
 
 PAGE = r'''<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Kwai — login protegido</title>
@@ -30,7 +43,7 @@ p{line-height:1.4}.row{display:flex;gap:8px;flex-wrap:wrap}.row button{flex:1 1 
 #status{color:#ffd69b;min-height:24px}#number{width:100%;font-size:20px}
 </style>
 <h2>Kwai — login por telefone</h2>
-<p>Brasil (+55) já é selecionado automaticamente. O controle usa requisições GET com payload criptografado para funcionar dentro do túnel protegido.</p>
+<p>Brasil (+55) já é selecionado automaticamente. O acesso usa uma sessão protegida própria e os comandos continuam criptografados no navegador.</p>
 <img id="screen" draggable="false" alt="Tela ao vivo do Android"><p id="status">Carregando...</p>
 <form id="digits">
   <input id="number" type="tel" inputmode="numeric" autocomplete="off" placeholder="Telefone ou código recebido" pattern="[0-9+ ]{1,30}" required>
@@ -209,6 +222,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def authenticated(self):
+        cookie = self.headers.get("Cookie", "")
+        for item in cookie.split(";"):
+            name, sep, value = item.strip().partition("=")
+            if sep and name == "kwai_session":
+                return hmac.compare_digest(value, SESSION_TOKEN)
+        return False
+
     def reply(self, code, body, typ="text/plain; charset=utf-8"):
         if isinstance(body, str):
             body = body.encode()
@@ -234,10 +255,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(410, "Sessão encerrada.")
         parsed = urlparse(self.path)
         path = parsed.path
-        if path == "/":
-            return self.reply(200, PAGE.replace("__CONTROL_KEY__", CONTROL_KEY_B64), "text/html; charset=utf-8")
         if path == "/health":
             return self.reply(200, "ready")
+        if path == "/":
+            if not self.authenticated():
+                return self.reply(200, LOGIN_PAGE, "text/html; charset=utf-8")
+            return self.reply(200, PAGE.replace("__CONTROL_KEY__", CONTROL_KEY_B64), "text/html; charset=utf-8")
+        if path in ("/screen", "/cmd") and not self.authenticated():
+            return self.reply(401, "Autenticação necessária.")
         if path == "/screen":
             try:
                 with LOCK:
@@ -293,7 +318,28 @@ class Handler(BaseHTTPRequestHandler):
         return self.reply(404, "Não encontrado.")
 
     def do_POST(self):
-        return self.reply(405, "Método não permitido.")
+        if time.monotonic() > DEADLINE:
+            return self.reply(410, "Sessão encerrada.")
+        parsed = urlparse(self.path)
+        if parsed.path != "/login":
+            return self.reply(405, "Método não permitido.")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > 1024:
+                raise ValueError
+            body = self.rfile.read(length).decode("utf-8")
+            values = parse_qs(body, keep_blank_values=False)
+            password = values.get("password", [""])[0]
+            digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            if not hmac.compare_digest(digest, AUTH_HASH):
+                return self.reply(403, LOGIN_PAGE.replace("</form>", "</form><p>Senha incorreta.</p>"), "text/html; charset=utf-8")
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.send_header("Set-Cookie", f"kwai_session={SESSION_TOKEN}; Path=/; Max-Age=1800; HttpOnly; Secure; SameSite=Strict")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        except Exception:
+            return self.reply(400, "Login inválido.")
 
 if __name__ == "__main__":
     ThreadingHTTPServer(("127.0.0.1", 6080), Handler).serve_forever()
