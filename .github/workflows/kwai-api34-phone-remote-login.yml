@@ -11,7 +11,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: kwai-phone-remote
+  group: kwai-phone-remote-v2
   cancel-in-progress: false
 
 jobs:
@@ -31,7 +31,7 @@ jobs:
           set -euo pipefail
           bash -n scripts/run_phone_remote.sh
           test -n "$KWAI_REMOTE_EMAIL" || { echo 'Configure KWAI_REMOTE_EMAIL in repository Secrets.'; exit 1; }
-          python3 -m pip install --quiet pyyaml cryptography
+          python3 -m pip install --quiet pyyaml cryptography pillow
           python3 scripts/prepare_phone_remote.py
           bash /tmp/prepare-phone.sh
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
