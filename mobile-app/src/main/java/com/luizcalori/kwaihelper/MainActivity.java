@@ -3,6 +3,7 @@ package com.luizcalori.kwaihelper;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.graphics.Color;
 import android.net.Uri;
@@ -32,14 +33,14 @@ public class MainActivity extends Activity {
         box.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Kwai Phone Helper — modo seguro v3");
+        title.setText("Kwai Phone Helper — modo seguro v4");
         title.setTextSize(24);
         title.setTextColor(Color.BLACK);
         title.setPadding(0, 0, 0, dp(10));
         box.addView(title);
 
         TextView info = new TextView(this);
-        info.setText("Esta versão não usa Acessibilidade nem permissões sensíveis. Ela usa o compartilhamento normal do Android e não depende do nome interno do pacote do Kwai.");
+        info.setText("Esta versão não usa Acessibilidade nem permissões sensíveis. Ela compartilha o vídeo pelo Android e copia a legenda para a área de transferência antes de abrir o Kwai.");
         info.setTextSize(16);
         info.setTextColor(Color.DKGRAY);
         info.setPadding(0, 0, 0, dp(16));
@@ -62,12 +63,12 @@ public class MainActivity extends Activity {
         box.addView(caption, new LinearLayout.LayoutParams(-1, -2));
 
         TextView note = new TextView(this);
-        note.setText("Ao tocar em Enviar, o Android mostrará os aplicativos compatíveis. Selecione o Kwai. O botão final de publicar continuará sob seu controle neste teste.");
+        note.setText("Ao tocar em Enviar, a legenda será copiada para a área de transferência e o Android mostrará os aplicativos compatíveis. Selecione o Kwai.");
         note.setTextColor(Color.rgb(90, 90, 90));
         note.setPadding(0, dp(10), 0, dp(12));
         box.addView(note);
 
-        Button send = button("2. Enviar / escolher Kwai");
+        Button send = button("2. Copiar legenda e enviar / escolher Kwai");
         send.setOnClickListener(v -> shareVideo());
         box.addView(send);
 
@@ -114,11 +115,17 @@ public class MainActivity extends Activity {
             return;
         }
 
+        String text = caption.getText().toString().trim();
+        if (!text.isEmpty()) {
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            clipboard.setPrimaryClip(ClipData.newPlainText("Legenda Kwai", text));
+            Toast.makeText(this, "Legenda copiada. Agora escolha o Kwai.", Toast.LENGTH_SHORT).show();
+        }
+
         Intent share = new Intent(Intent.ACTION_SEND);
         share.setType("video/*");
         share.putExtra(Intent.EXTRA_STREAM, selectedVideo);
         share.setClipData(ClipData.newUri(getContentResolver(), "video", selectedVideo));
-        String text = caption.getText().toString().trim();
         if (!text.isEmpty()) {
             share.putExtra(Intent.EXTRA_TEXT, text);
         }
