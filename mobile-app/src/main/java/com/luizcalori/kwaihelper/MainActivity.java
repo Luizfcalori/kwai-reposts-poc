@@ -6,13 +6,17 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
 import android.view.Gravity;
+import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -32,9 +36,14 @@ import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.text.DateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -42,18 +51,26 @@ import java.util.concurrent.Executors;
 public class MainActivity extends Activity {
     private static final String QUEUE_URL =
             "https://raw.githubusercontent.com/Luizfcalori/kwai-reposts-poc/main/data/kwai_queue.json";
+    private static final String PREFS = "kwai_queue_state";
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final ExecutorService imageExecutor = Executors.newSingleThreadExecutor();
     private final List<QueueItem> pending = new ArrayList<>();
 
-    private TextView status;
+    private TextView summaryLabel;
     private TextView sourceLabel;
-    private TextView queueLabel;
+    private TextView statusChip;
+    private TextView status;
+    private TextView historyLabel;
+    private TextView thumbnailHint;
+    private ImageView thumbnail;
     private EditText caption;
     private Button syncButton;
     private Button downloadButton;
+    private Button copyButton;
     private Button shareButton;
     private Button postedButton;
+    private Button skipButton;
 
     private QueueItem current;
     private File downloadedFile;
@@ -62,77 +79,149 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        int pad = dp(18);
+        int pad = dp(16);
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(pad, pad, pad, pad);
+        box.setBackgroundColor(Color.rgb(247, 247, 247));
 
         TextView title = new TextView(this);
-        title.setText("Kwai Phone Helper — fila manual v6");
-        title.setTextSize(24);
-        title.setTextColor(Color.BLACK);
-        title.setPadding(0, 0, 0, dp(8));
+        title.setText("Kwai Phone Helper v7");
+        title.setTextSize(26);
+        title.setTextColor(Color.rgb(25, 25, 25));
+        title.setPadding(0, 0, 0, dp(4));
         box.addView(title);
 
-        TextView info = new TextView(this);
-        info.setText("O app sincroniza a fila autorizada, baixa um vídeo por vez, prepara legenda e hashtags e deixa a publicação final sob seu controle no Kwai. Depois de postar, você pode excluir o arquivo local com um toque.");
-        info.setTextSize(15);
-        info.setTextColor(Color.DKGRAY);
-        info.setPadding(0, 0, 0, dp(14));
-        box.addView(info);
+        TextView subtitle = new TextView(this);
+        subtitle.setText("Fila visual • download 1 por vez • legenda automática • postagem manual");
+        subtitle.setTextSize(14);
+        subtitle.setTextColor(Color.DKGRAY);
+        subtitle.setPadding(0, 0, 0, dp(14));
+        box.addView(subtitle);
 
-        syncButton = button("1. Sincronizar fila e baixar próximo");
+        summaryLabel = new TextView(this);
+        summaryLabel.setText("Pendentes: 0   •   Publicados: " + getPostedIds().size() + "   •   Local: 0 MB");
+        summaryLabel.setTextSize(15);
+        summaryLabel.setTextColor(Color.rgb(55, 55, 55));
+        summaryLabel.setPadding(dp(12), dp(10), dp(12), dp(10));
+        summaryLabel.setBackgroundColor(Color.WHITE);
+        box.addView(summaryLabel, fullWidth());
+
+        syncButton = button("↻ Sincronizar fila e baixar próximo");
         syncButton.setOnClickListener(v -> syncQueue(true));
         box.addView(syncButton);
 
-        queueLabel = new TextView(this);
-        queueLabel.setText("Fila ainda não sincronizada");
-        queueLabel.setTextColor(Color.DKGRAY);
-        queueLabel.setPadding(0, dp(7), 0, dp(7));
-        box.addView(queueLabel);
+        TextView cardTitle = new TextView(this);
+        cardTitle.setText("PRÓXIMO VÍDEO");
+        cardTitle.setTextSize(13);
+        cardTitle.setTextColor(Color.GRAY);
+        cardTitle.setPadding(0, dp(12), 0, dp(6));
+        box.addView(cardTitle);
+
+        thumbnail = new ImageView(this);
+        thumbnail.setBackgroundColor(Color.rgb(225, 225, 225));
+        thumbnail.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        LinearLayout.LayoutParams imageParams = new LinearLayout.LayoutParams(-1, dp(220));
+        box.addView(thumbnail, imageParams);
+
+        thumbnailHint = new TextView(this);
+        thumbnailHint.setText("Sincronize para carregar a miniatura");
+        thumbnailHint.setGravity(Gravity.CENTER);
+        thumbnailHint.setTextColor(Color.GRAY);
+        thumbnailHint.setPadding(0, dp(4), 0, dp(8));
+        box.addView(thumbnailHint);
 
         sourceLabel = new TextView(this);
         sourceLabel.setText("Nenhum vídeo carregado");
-        sourceLabel.setTextSize(17);
+        sourceLabel.setTextSize(19);
         sourceLabel.setTextColor(Color.BLACK);
-        sourceLabel.setPadding(0, dp(5), 0, dp(7));
+        sourceLabel.setPadding(0, dp(4), 0, dp(4));
         box.addView(sourceLabel);
 
+        statusChip = new TextView(this);
+        statusChip.setText("AGUARDANDO SINCRONIZAÇÃO");
+        statusChip.setTextSize(13);
+        statusChip.setTextColor(Color.rgb(90, 90, 90));
+        statusChip.setPadding(dp(10), dp(6), dp(10), dp(6));
+        statusChip.setBackgroundColor(Color.rgb(235, 235, 235));
+        box.addView(statusChip);
+
+        TextView captionTitle = new TextView(this);
+        captionTitle.setText("Legenda + hashtags");
+        captionTitle.setTextSize(15);
+        captionTitle.setTextColor(Color.DKGRAY);
+        captionTitle.setPadding(0, dp(12), 0, dp(4));
+        box.addView(captionTitle);
+
         caption = new EditText(this);
-        caption.setHint("Legenda + hashtags");
+        caption.setHint("A legenda aparecerá aqui automaticamente");
         caption.setMinLines(5);
         caption.setGravity(Gravity.TOP);
-        box.addView(caption, new LinearLayout.LayoutParams(-1, -2));
+        caption.setBackgroundColor(Color.WHITE);
+        caption.setPadding(dp(12), dp(10), dp(12), dp(10));
+        box.addView(caption, fullWidth());
 
-        downloadButton = button("2. Baixar novamente este vídeo");
+        copyButton = button("📋 Copiar legenda + hashtags");
+        copyButton.setEnabled(false);
+        copyButton.setOnClickListener(v -> copyCaption(true));
+        box.addView(copyButton);
+
+        downloadButton = button("⬇ Baixar novamente");
         downloadButton.setEnabled(false);
         downloadButton.setOnClickListener(v -> downloadCurrent());
         box.addView(downloadButton);
 
-        shareButton = button("3. Enviar para o Kwai");
+        shareButton = button("▶ Enviar vídeo para o Kwai");
         shareButton.setEnabled(false);
         shareButton.setOnClickListener(v -> shareCurrent());
         box.addView(shareButton);
 
-        postedButton = button("4. Postado — excluir e preparar próximo");
+        postedButton = button("✓ Publicado — excluir e preparar próximo");
         postedButton.setEnabled(false);
         postedButton.setOnClickListener(v -> markPostedAndDelete());
         box.addView(postedButton);
 
+        skipButton = button("↪ Pular este vídeo");
+        skipButton.setEnabled(false);
+        skipButton.setOnClickListener(v -> skipCurrent());
+        box.addView(skipButton);
+
         status = new TextView(this);
         status.setText("Pronto para sincronizar.");
-        status.setTextColor(Color.rgb(70, 70, 70));
-        status.setPadding(0, dp(12), 0, 0);
+        status.setTextSize(14);
+        status.setTextColor(Color.rgb(65, 65, 65));
+        status.setPadding(0, dp(12), 0, dp(12));
         box.addView(status);
+
+        TextView historyTitle = new TextView(this);
+        historyTitle.setText("ÚLTIMOS PUBLICADOS");
+        historyTitle.setTextSize(13);
+        historyTitle.setTextColor(Color.GRAY);
+        historyTitle.setPadding(0, dp(4), 0, dp(5));
+        box.addView(historyTitle);
+
+        historyLabel = new TextView(this);
+        historyLabel.setTextColor(Color.DKGRAY);
+        historyLabel.setPadding(dp(10), dp(8), dp(10), dp(8));
+        historyLabel.setBackgroundColor(Color.WHITE);
+        box.addView(historyLabel, fullWidth());
+        refreshHistory();
+        updateSummary();
 
         ScrollView scroll = new ScrollView(this);
         scroll.addView(box);
         setContentView(scroll);
     }
 
+    private LinearLayout.LayoutParams fullWidth() {
+        return new LinearLayout.LayoutParams(-1, -2);
+    }
+
     private Button button(String text) {
         Button b = new Button(this);
         b.setText(text);
+        b.setAllCaps(false);
+        b.setTextSize(15);
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
         p.setMargins(0, dp(5), 0, dp(5));
         b.setLayoutParams(p);
@@ -140,7 +229,8 @@ public class MainActivity extends Activity {
     }
 
     private void syncQueue(boolean downloadAfterSync) {
-        setStatus("Sincronizando fila...");
+        setStatus("Sincronizando os canais autorizados...");
+        setChip("SINCRONIZANDO");
         syncButton.setEnabled(false);
 
         executor.execute(() -> {
@@ -150,7 +240,7 @@ public class MainActivity extends Activity {
                 connection = (HttpURLConnection) url.openConnection();
                 connection.setConnectTimeout(20000);
                 connection.setReadTimeout(30000);
-                connection.setRequestProperty("User-Agent", "KwaiPhoneHelper/0.2 Android");
+                connection.setRequestProperty("User-Agent", "KwaiPhoneHelper/0.7 Android");
                 connection.setUseCaches(false);
 
                 StringBuilder jsonText = new StringBuilder();
@@ -170,16 +260,11 @@ public class MainActivity extends Activity {
                 if (items != null) {
                     for (int i = 0; i < items.length(); i++) {
                         JSONObject obj = items.optJSONObject(i);
-                        if (obj == null || !obj.optBoolean("rights_confirmed", false)) {
-                            continue;
-                        }
-                        if (!"ready_for_phone".equals(obj.optString("status"))) {
-                            continue;
-                        }
+                        if (obj == null || !obj.optBoolean("rights_confirmed", false)) continue;
+                        if (!"ready_for_phone".equals(obj.optString("status"))) continue;
+
                         String mediaUrl = obj.optString("media_url", "");
-                        if (!mediaUrl.startsWith("http")) {
-                            continue;
-                        }
+                        if (!mediaUrl.startsWith("http")) continue;
 
                         QueueItem item = new QueueItem();
                         item.sourceId = obj.optString("source_id", "source");
@@ -187,7 +272,9 @@ public class MainActivity extends Activity {
                         item.videoId = obj.optString("video_id", "");
                         item.videoUrl = obj.optString("video_url", "");
                         item.mediaUrl = mediaUrl;
+                        item.thumbnailUrl = obj.optString("thumbnail_url", "");
                         item.postText = obj.optString("post_text", "");
+
                         if (item.postText.isEmpty()) {
                             item.postText = obj.optString("generated_caption", "");
                             JSONArray tags = obj.optJSONArray("hashtags");
@@ -197,25 +284,24 @@ public class MainActivity extends Activity {
                                     if (tagText.length() > 0) tagText.append(' ');
                                     tagText.append(tags.optString(t));
                                 }
-                                if (tagText.length() > 0) {
-                                    item.postText = item.postText + "\n\n" + tagText;
-                                }
+                                if (tagText.length() > 0) item.postText += "\n\n" + tagText;
                             }
                         }
 
-                        if (!item.videoId.isEmpty() && !postedIds.contains(item.key())) {
-                            fresh.add(item);
-                        }
+                        if (!item.videoId.isEmpty() && !postedIds.contains(item.key())) fresh.add(item);
                     }
                 }
 
+                List<QueueItem> balanced = roundRobinBySource(fresh);
                 runOnUiThread(() -> {
                     pending.clear();
-                    pending.addAll(fresh);
+                    pending.addAll(balanced);
                     syncButton.setEnabled(true);
                     selectFirstPending();
+                    updateSummary();
                     if (current == null) {
                         setStatus("Nenhum vídeo novo pronto para o celular.");
+                        setChip("FILA VAZIA");
                     } else if (downloadAfterSync) {
                         downloadCurrent();
                     }
@@ -224,34 +310,103 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     syncButton.setEnabled(true);
                     setStatus("Falha ao sincronizar: " + shortMessage(exc));
+                    setChip("ERRO DE SINCRONIZAÇÃO");
                 });
             } finally {
-                if (connection != null) {
-                    connection.disconnect();
-                }
+                if (connection != null) connection.disconnect();
             }
         });
+    }
+
+    private List<QueueItem> roundRobinBySource(List<QueueItem> input) {
+        Map<String, List<QueueItem>> groups = new LinkedHashMap<>();
+        for (QueueItem item : input) {
+            groups.computeIfAbsent(item.sourceId, key -> new ArrayList<>()).add(item);
+        }
+
+        List<QueueItem> result = new ArrayList<>();
+        int index = 0;
+        boolean added;
+        do {
+            added = false;
+            for (List<QueueItem> group : groups.values()) {
+                if (index < group.size()) {
+                    result.add(group.get(index));
+                    added = true;
+                }
+            }
+            index++;
+        } while (added);
+        return result;
     }
 
     private void selectFirstPending() {
         downloadedFile = null;
         shareButton.setEnabled(false);
         postedButton.setEnabled(false);
+        thumbnail.setImageDrawable(null);
+        thumbnail.setBackgroundColor(Color.rgb(225, 225, 225));
 
         if (pending.isEmpty()) {
             current = null;
             sourceLabel.setText("Nenhum vídeo pendente");
-            queueLabel.setText("Fila: 0 pendentes neste aparelho");
             caption.setText("");
+            thumbnailHint.setText("Fila concluída");
             downloadButton.setEnabled(false);
+            copyButton.setEnabled(false);
+            skipButton.setEnabled(false);
+            updateSummary();
             return;
         }
 
         current = pending.get(0);
-        sourceLabel.setText(current.sourceName + " • vídeo " + current.videoId);
-        queueLabel.setText("Fila: " + pending.size() + " pendente(s) neste aparelho");
+        sourceLabel.setText(current.sourceName + "  •  vídeo " + current.videoId);
         caption.setText(current.postText);
+        copyButton.setEnabled(!current.postText.trim().isEmpty());
         downloadButton.setEnabled(true);
+        skipButton.setEnabled(pending.size() > 1);
+        setChip("AGUARDANDO DOWNLOAD");
+        loadThumbnail(current);
+        updateSummary();
+    }
+
+    private void loadThumbnail(QueueItem item) {
+        if (item == null || item.thumbnailUrl == null || !item.thumbnailUrl.startsWith("http")) {
+            thumbnailHint.setText("Miniatura não disponível");
+            return;
+        }
+
+        thumbnailHint.setText("Carregando miniatura...");
+        String expectedKey = item.key();
+        imageExecutor.execute(() -> {
+            HttpURLConnection connection = null;
+            try {
+                connection = (HttpURLConnection) new URL(item.thumbnailUrl).openConnection();
+                connection.setConnectTimeout(15000);
+                connection.setReadTimeout(20000);
+                connection.setRequestProperty("User-Agent", "KwaiPhoneHelper/0.7 Android");
+                Bitmap bitmap;
+                try (InputStream input = new BufferedInputStream(connection.getInputStream())) {
+                    bitmap = BitmapFactory.decodeStream(input);
+                }
+                if (bitmap != null) {
+                    runOnUiThread(() -> {
+                        if (current != null && expectedKey.equals(current.key())) {
+                            thumbnail.setImageBitmap(bitmap);
+                            thumbnailHint.setText("Prévia do vídeo");
+                        }
+                    });
+                }
+            } catch (Exception ignored) {
+                runOnUiThread(() -> {
+                    if (current != null && expectedKey.equals(current.key())) {
+                        thumbnailHint.setText("Não consegui carregar a miniatura");
+                    }
+                });
+            } finally {
+                if (connection != null) connection.disconnect();
+            }
+        });
     }
 
     private void downloadCurrent() {
@@ -261,7 +416,8 @@ public class MainActivity extends Activity {
             return;
         }
 
-        setStatus("Baixando vídeo " + item.videoId + "...");
+        setStatus("Baixando vídeo de " + item.sourceName + "...");
+        setChip("BAIXANDO");
         downloadButton.setEnabled(false);
         shareButton.setEnabled(false);
         postedButton.setEnabled(false);
@@ -270,7 +426,7 @@ public class MainActivity extends Activity {
             HttpURLConnection connection = null;
             File partial = null;
             try {
-                File base = new File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "KwaiHelper");
+                File base = videoFolder();
                 if (!base.exists() && !base.mkdirs()) {
                     throw new IllegalStateException("Não foi possível criar a pasta local.");
                 }
@@ -279,55 +435,70 @@ public class MainActivity extends Activity {
                 partial = new File(base, target.getName() + ".part");
                 if (partial.exists()) partial.delete();
 
-                URL url = new URL(item.mediaUrl);
-                connection = (HttpURLConnection) url.openConnection();
+                connection = (HttpURLConnection) new URL(item.mediaUrl).openConnection();
                 connection.setConnectTimeout(25000);
                 connection.setReadTimeout(90000);
-                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) KwaiPhoneHelper/0.2");
+                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) KwaiPhoneHelper/0.7");
                 connection.setInstanceFollowRedirects(true);
 
                 int response = connection.getResponseCode();
                 if (response < 200 || response >= 300) {
-                    throw new IllegalStateException("Servidor respondeu HTTP " + response + ". Sincronize a fila novamente.");
+                    throw new IllegalStateException("Servidor respondeu HTTP " + response + ". Sincronize novamente.");
                 }
 
+                long total = 0;
                 try (InputStream input = new BufferedInputStream(connection.getInputStream());
                      FileOutputStream output = new FileOutputStream(partial)) {
                     byte[] buffer = new byte[64 * 1024];
                     int read;
-                    long total = 0;
                     while ((read = input.read(buffer)) != -1) {
                         output.write(buffer, 0, read);
                         total += read;
                     }
                     output.flush();
-                    if (total < 1024) {
-                        throw new IllegalStateException("O arquivo recebido parece inválido.");
-                    }
                 }
 
+                if (total < 1024) throw new IllegalStateException("O arquivo recebido parece inválido.");
                 if (target.exists()) target.delete();
-                if (!partial.renameTo(target)) {
-                    throw new IllegalStateException("Não foi possível finalizar o arquivo baixado.");
-                }
+                if (!partial.renameTo(target)) throw new IllegalStateException("Não foi possível finalizar o arquivo.");
 
                 downloadedFile = target;
                 runOnUiThread(() -> {
                     downloadButton.setEnabled(true);
                     shareButton.setEnabled(true);
                     postedButton.setEnabled(true);
-                    setStatus("Vídeo baixado no celular. Revise a legenda e toque em Enviar para o Kwai.");
+                    copyButton.setEnabled(!caption.getText().toString().trim().isEmpty());
+                    setStatus("Vídeo pronto. Copie a legenda e envie para o Kwai.");
+                    setChip("PRONTO PARA ENVIAR");
+                    updateSummary();
                 });
             } catch (Exception exc) {
                 if (partial != null && partial.exists()) partial.delete();
                 runOnUiThread(() -> {
                     downloadButton.setEnabled(true);
                     setStatus("Falha no download: " + shortMessage(exc));
+                    setChip("ERRO NO DOWNLOAD");
+                    updateSummary();
                 });
             } finally {
                 if (connection != null) connection.disconnect();
             }
         });
+    }
+
+    private boolean copyCaption(boolean showToast) {
+        String text = caption.getText().toString().trim();
+        if (text.isEmpty()) {
+            if (showToast) Toast.makeText(this, "A legenda está vazia.", Toast.LENGTH_LONG).show();
+            return false;
+        }
+
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        clipboard.setPrimaryClip(ClipData.newPlainText("Legenda Kwai", text));
+        setChip("LEGENDA COPIADA ✓");
+        setStatus("Legenda + hashtags copiadas. No Kwai, toque no campo de descrição e use Colar.");
+        if (showToast) Toast.makeText(this, "Legenda + hashtags copiadas ✓", Toast.LENGTH_SHORT).show();
+        return true;
     }
 
     private void shareCurrent() {
@@ -337,29 +508,20 @@ public class MainActivity extends Activity {
         }
 
         String text = caption.getText().toString().trim();
-        if (!text.isEmpty()) {
-            ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-            clipboard.setPrimaryClip(ClipData.newPlainText("Legenda Kwai", text));
-        }
+        if (!text.isEmpty()) copyCaption(false);
 
-        Uri videoUri = FileProvider.getUriForFile(
-                this,
-                getPackageName() + ".files",
-                downloadedFile
-        );
-
+        Uri videoUri = FileProvider.getUriForFile(this, getPackageName() + ".files", downloadedFile);
         Intent share = new Intent(Intent.ACTION_SEND);
         share.setType("video/mp4");
         share.putExtra(Intent.EXTRA_STREAM, videoUri);
-        if (!text.isEmpty()) {
-            share.putExtra(Intent.EXTRA_TEXT, text);
-        }
+        if (!text.isEmpty()) share.putExtra(Intent.EXTRA_TEXT, text);
         share.setClipData(ClipData.newUri(getContentResolver(), "video", videoUri));
         share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
 
         try {
             startActivity(Intent.createChooser(share, "Escolha o Kwai"));
-            setStatus("Vídeo enviado ao compartilhamento. A legenda também está copiada para você colar no Kwai, se necessário.");
+            setStatus("Vídeo enviado. A legenda está copiada — cole no campo de descrição do Kwai.");
+            setChip("ENVIADO AO KWAI • TEXTO COPIADO");
         } catch (ActivityNotFoundException ex) {
             Toast.makeText(this, "Nenhum aplicativo compatível foi encontrado.", Toast.LENGTH_LONG).show();
         }
@@ -368,44 +530,124 @@ public class MainActivity extends Activity {
     private void markPostedAndDelete() {
         if (current == null) return;
 
+        QueueItem postedItem = current;
         if (downloadedFile != null && downloadedFile.exists() && !downloadedFile.delete()) {
             Toast.makeText(this, "Não consegui excluir o arquivo local agora.", Toast.LENGTH_LONG).show();
         }
 
         Set<String> posted = getPostedIds();
-        posted.add(current.key());
-        getSharedPreferences("kwai_queue_state", MODE_PRIVATE)
+        posted.add(postedItem.key());
+        getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
                 .putStringSet("posted_ids", new HashSet<>(posted))
                 .apply();
+        appendHistory(postedItem);
 
         if (!pending.isEmpty()) pending.remove(0);
         downloadedFile = null;
+        refreshHistory();
         selectFirstPending();
 
         if (current != null) {
-            setStatus("Postagem marcada como concluída. Baixando o próximo vídeo...");
+            setStatus("Publicado ✓ Arquivo excluído. Preparando o próximo vídeo...");
             downloadCurrent();
         } else {
-            setStatus("Tudo concluído nesta fila. Sincronize novamente quando quiser verificar novos vídeos.");
+            setStatus("Fila concluída. Toque em Sincronizar para verificar novidades.");
+            setChip("FILA CONCLUÍDA");
         }
+        updateSummary();
+    }
+
+    private void skipCurrent() {
+        if (current == null || pending.size() <= 1) {
+            Toast.makeText(this, "Não há outro vídeo na fila agora.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        if (downloadedFile != null && downloadedFile.exists()) downloadedFile.delete();
+        QueueItem skipped = pending.remove(0);
+        pending.add(skipped);
+        downloadedFile = null;
+        selectFirstPending();
+        setStatus("Vídeo pulado. Baixando o próximo da fila...");
+        downloadCurrent();
+    }
+
+    private void appendHistory(QueueItem item) {
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String old = prefs.getString("history", "");
+        String when = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, new Locale("pt", "BR")).format(new Date());
+        String line = when + " • " + item.sourceName + " • " + item.videoId;
+        String combined = line + (old.isEmpty() ? "" : "\n" + old);
+        String[] lines = combined.split("\n");
+        StringBuilder trimmed = new StringBuilder();
+        for (int i = 0; i < lines.length && i < 20; i++) {
+            if (i > 0) trimmed.append('\n');
+            trimmed.append(lines[i]);
+        }
+        prefs.edit().putString("history", trimmed.toString()).apply();
+    }
+
+    private void refreshHistory() {
+        String history = getSharedPreferences(PREFS, MODE_PRIVATE).getString("history", "");
+        if (history == null || history.trim().isEmpty()) {
+            historyLabel.setText("Nenhuma publicação marcada ainda.");
+            return;
+        }
+        String[] lines = history.split("\n");
+        StringBuilder visible = new StringBuilder();
+        for (int i = 0; i < lines.length && i < 5; i++) {
+            if (i > 0) visible.append('\n');
+            visible.append("• ").append(lines[i]);
+        }
+        historyLabel.setText(visible.toString());
     }
 
     private Set<String> getPostedIds() {
-        SharedPreferences prefs = getSharedPreferences("kwai_queue_state", MODE_PRIVATE);
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         Set<String> stored = prefs.getStringSet("posted_ids", null);
         return stored == null ? new HashSet<>() : new HashSet<>(stored);
+    }
+
+    private File videoFolder() {
+        return new File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "KwaiHelper");
+    }
+
+    private long localBytes() {
+        File folder = videoFolder();
+        if (!folder.exists()) return 0;
+        File[] files = folder.listFiles();
+        if (files == null) return 0;
+        long total = 0;
+        for (File file : files) if (file.isFile()) total += file.length();
+        return total;
+    }
+
+    private String formatBytes(long bytes) {
+        double mb = bytes / (1024.0 * 1024.0);
+        if (mb < 1024) return String.format(Locale.getDefault(), "%.1f MB", mb);
+        return String.format(Locale.getDefault(), "%.2f GB", mb / 1024.0);
+    }
+
+    private void updateSummary() {
+        summaryLabel.setText(
+                "Pendentes: " + pending.size()
+                        + "   •   Publicados: " + getPostedIds().size()
+                        + "   •   Local: " + formatBytes(localBytes())
+        );
     }
 
     private void setStatus(String text) {
         status.setText(text);
     }
 
+    private void setChip(String text) {
+        statusChip.setText(text);
+    }
+
     private String shortMessage(Exception exc) {
         String message = exc.getMessage();
-        if (message == null || message.trim().isEmpty()) {
-            return exc.getClass().getSimpleName();
-        }
+        if (message == null || message.trim().isEmpty()) return exc.getClass().getSimpleName();
         return message.length() > 160 ? message.substring(0, 160) : message;
     }
 
@@ -421,6 +663,7 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         super.onDestroy();
         executor.shutdownNow();
+        imageExecutor.shutdownNow();
     }
 
     private static class QueueItem {
@@ -429,6 +672,7 @@ public class MainActivity extends Activity {
         String videoId;
         String videoUrl;
         String mediaUrl;
+        String thumbnailUrl;
         String postText;
 
         String key() {
