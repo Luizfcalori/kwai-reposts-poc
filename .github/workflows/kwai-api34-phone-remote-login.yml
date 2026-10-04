@@ -63,3 +63,5 @@ jobs:
           echo 'Remote session ended. No screenshots, credentials, account data or unencrypted backups uploaded.' >> "$GITHUB_STEP_SUMMARY"
 
 # Session requested 2026-10-04, morning: retry verified cold-start phone route.
+
+# Retry transient APK delivery after 37206090453.
