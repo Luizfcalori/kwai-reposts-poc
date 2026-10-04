@@ -1,5 +1,7 @@
 """Loopback-only Android viewer; expose only behind verified email authentication."""
 import json
+import io
+from PIL import Image
 import os
 import re
 import secrets
@@ -23,15 +25,15 @@ PAGE = '''<!doctype html><meta charset="utf-8"><meta name="viewport" content="wi
 <form id="backup"><input id="pass" type="password" autocomplete="new-password" minlength="16" required placeholder="Senha do backup (16+ caracteres)"><button>Baixar backup criptografado</button></form>
 <p>O backup interrompe o Kwai para copiar seus dados. Não feche esta página antes de o download terminar.</p>
 <script>
-const token='__CSRF__', screen=document.querySelector('#screen'), status=document.querySelector('#status');let busy=false;
-async function call(path,data){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Kwai-CSRF':token},body:JSON.stringify(data)});if(!r.ok)throw Error(await r.text());return r;}
-async function refresh(){if(busy)return;try{const r=await fetch('/screen',{cache:'no-store'});if(!r.ok)throw Error('Sessão indisponível');const b=await r.blob(),old=screen.src;screen.src=URL.createObjectURL(b);if(old.startsWith('blob:'))URL.revokeObjectURL(old);status.textContent='Conectado — toque na tela para controlar';}catch(e){status.textContent=e.message;}}
-screen.onclick=async e=>{const r=screen.getBoundingClientRect(),scale=Math.min(r.width/screen.naturalWidth,r.height/screen.naturalHeight),w=screen.naturalWidth*scale,h=screen.naturalHeight*scale,x=e.clientX-r.left-(r.width-w)/2,y=e.clientY-r.top-(r.height-h)/2;if(x<0||y<0||x>w||y>h)return;await call('/tap',{x:Math.round(x/scale),y:Math.round(y/scale)});setTimeout(refresh,500);};
+const token='__CSRF__', screen=document.querySelector('#screen'), status=document.querySelector('#status');let busy=false, refreshing=false;
+async function call(path,data){busy=true;try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Kwai-CSRF':token},body:JSON.stringify(data)});if(!r.ok)throw Error(await r.text());return r;}finally{busy=false;}}
+async function refresh(){if(busy||refreshing)return;refreshing=true;try{const r=await fetch('/screen',{cache:'no-store',signal:AbortSignal.timeout(15000)});if(!r.ok)throw Error('Sessão indisponível');const b=await r.blob(),old=screen.src;screen.src=URL.createObjectURL(b);await screen.decode();if(old.startsWith('blob:'))URL.revokeObjectURL(old);status.textContent='Conectado — toque na tela para controlar';}catch(e){status.textContent='Aguardando atualização da tela...';}finally{refreshing=false;}}
+screen.onclick=async e=>{const r=screen.getBoundingClientRect(),scale=Math.min(r.width/screen.naturalWidth,r.height/screen.naturalHeight),w=screen.naturalWidth*scale,h=screen.naturalHeight*scale,x=e.clientX-r.left-(r.width-w)/2,y=e.clientY-r.top-(r.height-h)/2;if(x<0||y<0||x>w||y>h)return;await call('/tap',{x:Math.round(x/w*1080),y:Math.round(y/h*2400)});setTimeout(refresh,500);};
 document.querySelector('#digits').onsubmit=async e=>{e.preventDefault();const n=document.querySelector('#number');try{await call('/digits',{value:n.value});n.value='';setTimeout(refresh,500);}catch(e){status.textContent=e.message;}};
 document.querySelector('#scroll').onclick=async()=>{await call('/scroll',{});setTimeout(refresh,500)};
 document.querySelector('#back').onclick=async()=>{await call('/back',{});setTimeout(refresh,500)};document.querySelector('#refresh').onclick=refresh;
 document.querySelector('#backup').onsubmit=async e=>{e.preventDefault();busy=true;status.textContent='Preparando backup criptografado...';try{const p=document.querySelector('#pass');const r=await call('/backup',{passphrase:p.value});p.value='';const u=URL.createObjectURL(await r.blob()),a=document.createElement('a');a.href=u;a.download='kwai-session-encrypted.bin';a.click();setTimeout(()=>URL.revokeObjectURL(u),60000);status.textContent='Backup baixado. Guarde a senha e avise no chat apenas que concluiu.';}catch(e){status.textContent=e.message;}finally{busy=false;}};
-refresh();setInterval(refresh,2500);
+async function loop(){await refresh();setTimeout(loop,1800);}loop();
 </script>'''
 
 def adb(*args, binary=False, timeout=30):
@@ -84,7 +86,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with LOCK:
                     png = adb('exec-out', 'screencap', '-p')
-                return self.reply(200, png, 'image/png')
+                frame=Image.open(io.BytesIO(png)).convert('RGB')
+                frame.thumbnail((540,1200))
+                out=io.BytesIO()
+                frame.save(out,format='JPEG',quality=65)
+                return self.reply(200, out.getvalue(), 'image/jpeg')
             except Exception:
                 return self.reply(503, 'Android indisponível.')
         self.reply(404, 'Não encontrado.')
