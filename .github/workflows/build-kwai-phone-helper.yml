@@ -7,6 +7,7 @@ on:
       - 'mobile-app/**'
       - 'build.gradle'
       - 'settings.gradle'
+      - 'gradle.properties'
       - '.github/workflows/build-kwai-phone-helper.yml'
 
 permissions:
