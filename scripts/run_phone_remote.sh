@@ -35,7 +35,7 @@ test -n "$URL"
 export REMOTE_URL="$URL"
 # Require an authentication redirect before announcing the session.
 python3 - <<'PY'
-import os,time,urllib.request,urllib.error,json
+import os,time,urllib.request,urllib.error,urllib.parse,json
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args): return None
 opener=urllib.request.build_opener(NoRedirect)
@@ -49,7 +49,8 @@ for _ in range(20):
     except Exception:
         time.sleep(3); continue
     loc=headers.get('Location','').lower()
-    if code in (301,302,303,307,308) and ('cloudflareaccess' in loc or '/cdn-cgi/access/' in loc or '/access/login' in loc):
+    dest=urllib.parse.urlparse(loc)
+    if code in (301,302,303,307,308) and dest.scheme=='https' and dest.hostname=='login.trycloudflare.com' and dest.path=='/authorize':
         verified=True; break
     if body.strip()==b'ready':
         raise SystemExit('Access check failed: origin accessible without authentication.')
