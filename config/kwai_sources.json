@@ -143,6 +143,15 @@
       "profile_url": "https://www.kwai.com/@kleberaugusto449",
       "enabled": true,
       "rights_confirmed": true
+    },
+    {
+      "id": "efabreu",
+      "display_name": "efabreu",
+      "handle": "efabreu",
+      "share_url": "https://k.kwai.com/u/@efabreu/BkQCFg0Z",
+      "profile_url": "https://www.kwai.com/@efabreu",
+      "enabled": true,
+      "rights_confirmed": true
     }
   ]
 }
