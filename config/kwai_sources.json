@@ -7,7 +7,7 @@
       "share_url": "https://k.kwai.com/u/@cvqjx483/KF5jBCNk",
       "profile_url": "https://www.kwai.com/@cvqjx483",
       "enabled": true,
-      "rights_confirmed": false
+      "rights_confirmed": true
     },
     {
       "id": "gatas_do_mundo",
@@ -16,7 +16,7 @@
       "share_url": "https://k.kwai.com/u/@Gatas_do_Mundo/xCChTrhm",
       "profile_url": "https://www.kwai.com/@Gatas_do_Mundo",
       "enabled": true,
-      "rights_confirmed": false
+      "rights_confirmed": true
     }
   ]
 }
