@@ -2,6 +2,8 @@ plugins {
     id 'com.android.application'
 }
 
+def stableKeystore = file('signing/kwai-helper.keystore')
+
 android {
     namespace 'com.luizcalori.kwaihelper'
     compileSdk 35
@@ -10,16 +12,27 @@ android {
         applicationId 'com.luizcalori.kwaihelper'
         minSdk 26
         targetSdk 35
-        versionCode 11
-        versionName '1.1.0'
+        versionCode 12
+        versionName '1.2.0'
+    }
+
+    signingConfigs {
+        stable {
+            storeFile stableKeystore
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
     }
 
     buildTypes {
         debug {
             debuggable true
+            signingConfig signingConfigs.stable
         }
         release {
             minifyEnabled false
+            signingConfig signingConfigs.stable
         }
     }
 
