@@ -112,7 +112,7 @@ public class MainActivity extends Activity {
         box.setBackgroundColor(Color.rgb(247, 247, 247));
 
         TextView title = new TextView(this);
-        title.setText("Kwai Phone Helper v11");
+        title.setText("Kwai Phone Helper v12");
         title.setTextSize(26);
         title.setTextColor(Color.rgb(25, 25, 25));
         title.setPadding(0, 0, 0, dp(4));
@@ -519,12 +519,8 @@ public class MainActivity extends Activity {
         Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".files", apk);
         Intent install = new Intent(Intent.ACTION_VIEW);
         install.setDataAndType(uri, "application/vnd.android.package-archive");
-        install.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        try {
-            startActivity(install);
-        } catch (ActivityNotFoundException ex) {
-            Toast.makeText(this, "O instalador do Android não foi encontrado.", Toast.LENGTH_LONG).show();
-        }
+        install.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(install);
     }
 
     private void syncQueue(boolean downloadAfterSync) {
@@ -921,137 +917,207 @@ public class MainActivity extends Activity {
         pending.add(skipped);
         downloadedFile = null;
         selectFirstPending();
-        setStatus("Vídeo pulado. Baixando o próximo da fila...");
+        setStatus("Vídeo pulado nesta sessão. Preparando o próximo...");
         downloadCurrent();
     }
 
-    private void appendHistory(QueueItem item) {
-        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        String old = prefs.getString("history", "");
-        String when = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, new Locale("pt", "BR")).format(new Date());
-        String line = when + " • " + item.sourceName + " • " + item.videoId;
-        String combined = line + (old.isEmpty() ? "" : "\n" + old);
-        String[] lines = combined.split("\n");
-        StringBuilder trimmed = new StringBuilder();
-        for (int i = 0; i < lines.length && i < 20; i++) {
-            if (i > 0) trimmed.append('\n');
-            trimmed.append(lines[i]);
-        }
-        prefs.edit().putString("history", trimmed.toString()).apply();
+    private File videoFolder() {
+        File root = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+        if (root == null) root = getFilesDir();
+        return new File(root, "KwaiHelper");
     }
 
-    private void refreshHistory() {
-        String history = getSharedPreferences(PREFS, MODE_PRIVATE).getString("history", "");
-        if (history == null || history.trim().isEmpty()) {
-            historyLabel.setText("Nenhuma publicação marcada ainda.");
-            return;
+    private Uri copyToPublicFolder(File source, String relativePath) throws Exception {
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Video.Media.DISPLAY_NAME, source.getName());
+        values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+        values.put(MediaStore.Video.Media.RELATIVE_PATH, relativePath);
+        values.put(MediaStore.Video.Media.IS_PENDING, 1);
+
+        Uri uri = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
+        if (uri == null) throw new IllegalStateException("MediaStore não criou o arquivo.");
+
+        try {
+            try (InputStream input = new BufferedInputStream(new FileInputStream(source));
+                 OutputStream output = getContentResolver().openOutputStream(uri, "w")) {
+                if (output == null) throw new IllegalStateException("Não foi possível abrir o destino.");
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
+                output.flush();
+            }
+            ContentValues ready = new ContentValues();
+            ready.put(MediaStore.Video.Media.IS_PENDING, 0);
+            getContentResolver().update(uri, ready, null, null);
+            return uri;
+        } catch (Exception exc) {
+            try { getContentResolver().delete(uri, null, null); } catch (Exception ignored) {}
+            throw exc;
         }
-        String[] lines = history.split("\n");
-        StringBuilder visible = new StringBuilder();
-        for (int i = 0; i < lines.length && i < 5; i++) {
-            if (i > 0) visible.append('\n');
-            visible.append("• ").append(lines[i]);
+    }
+
+    private void openPublicFolder(String initialPath) {
+        try {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Uri initial = DocumentsContract.buildDocumentUri(
+                        "com.android.externalstorage.documents",
+                        "primary:" + initialPath);
+                intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, initial);
+            }
+            startActivity(intent);
+        } catch (Exception exc) {
+            Toast.makeText(this, "Abra Meus Arquivos > Armazenamento interno > Movies > KwaiHelper > Baixados.", Toast.LENGTH_LONG).show();
         }
-        historyLabel.setText(visible.toString());
+    }
+
+    private void migrateLegacyPublishedFolder() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
+        executor.execute(() -> {
+            Set<String> migrated = getPostedIds();
+            boolean changed = false;
+            Cursor cursor = null;
+            try {
+                String[] projection = {
+                        MediaStore.Video.Media._ID,
+                        MediaStore.Video.Media.DISPLAY_NAME
+                };
+                String selection = MediaStore.Video.Media.RELATIVE_PATH + "=?";
+                String[] args = { LEGACY_PUBLIC_PUBLISHED };
+                cursor = getContentResolver().query(
+                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                        projection,
+                        selection,
+                        args,
+                        null);
+                if (cursor != null) {
+                    int idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID);
+                    int nameCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME);
+                    while (cursor.moveToNext()) {
+                        long rowId = cursor.getLong(idCol);
+                        String displayName = cursor.getString(nameCol);
+                        String key = keyFromDownloadedFileName(displayName);
+                        if (key != null && !key.isEmpty()) {
+                            migrated.add(key);
+                            changed = true;
+                        }
+                        Uri uri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, rowId);
+                        try { getContentResolver().delete(uri, null, null); } catch (Exception ignored) {}
+                    }
+                }
+            } catch (Exception ignored) {
+            } finally {
+                if (cursor != null) cursor.close();
+            }
+            if (changed) {
+                persistPostedIds(migrated);
+                runOnUiThread(() -> {
+                    refreshHistory();
+                    updateSummary();
+                });
+            }
+        });
+    }
+
+    private String keyFromDownloadedFileName(String displayName) {
+        if (displayName == null) return null;
+        String clean = displayName;
+        if (clean.endsWith(".mp4")) clean = clean.substring(0, clean.length() - 4);
+        int underscore = clean.lastIndexOf('_');
+        if (underscore <= 0 || underscore >= clean.length() - 1) return null;
+        String source = clean.substring(0, underscore);
+        String video = clean.substring(underscore + 1);
+        if (!video.matches("\\d+")) return null;
+        return source + ":" + video;
     }
 
     private Set<String> getPostedIds() {
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        Set<String> stored = prefs.getStringSet("posted_ids", null);
-        Set<String> local = stored == null ? new HashSet<>() : new HashSet<>(stored);
-        Set<String> durable = loadDurablePostedIds();
-        Set<String> merged = new HashSet<>(durable);
-        merged.addAll(local);
-
-        if (!merged.equals(local)) {
-            prefs.edit().putStringSet("posted_ids", new HashSet<>(merged)).apply();
-        }
-        if (!merged.equals(durable)) {
-            saveDurablePostedIds(merged);
-        }
-        return merged;
-    }
-
-    private void persistPostedIds(Set<String> posted) {
-        Set<String> copy = new HashSet<>(posted);
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
-                .putStringSet("posted_ids", copy)
-                .apply();
-        saveDurablePostedIds(copy);
-    }
-
-    private Set<String> loadDurablePostedIds() {
-        Set<String> result = new HashSet<>();
-        String selected = getSharedPreferences(PREFS, MODE_PRIVATE).getString("history_backup_uri", "");
-        if (selected != null && !selected.isEmpty()) {
-            try { result.addAll(readPostedIdsFromUri(Uri.parse(selected))); } catch (Exception ignored) {}
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return result;
-        Uri uri = findDurableStateUri();
-        if (uri == null) return result;
-
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(getContentResolver().openInputStream(uri), StandardCharsets.UTF_8))) {
-            StringBuilder text = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) text.append(line);
-            if (text.length() == 0) return result;
-            JSONObject root = new JSONObject(text.toString());
-            JSONArray ids = root.optJSONArray("posted_ids");
-            if (ids != null) {
-                for (int i = 0; i < ids.length(); i++) {
-                    String value = ids.optString(i, "").trim();
-                    if (!value.isEmpty()) result.add(value);
-                }
+        Set<String> result = new HashSet<>(prefs.getStringSet("posted_ids", new HashSet<>()));
+        result.addAll(readDurablePostedIds());
+        String backupUri = prefs.getString("history_backup_uri", "");
+        if (backupUri != null && !backupUri.isEmpty()) {
+            try {
+                result.addAll(readPostedIdsFromUri(Uri.parse(backupUri)));
+            } catch (Exception ignored) {
             }
-        } catch (Exception ignored) {
         }
         return result;
     }
 
-    private Uri findDurableStateUri() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null;
-        String[] projection = {MediaStore.Downloads._ID};
-        String selection = MediaStore.Downloads.DISPLAY_NAME + "=? AND "
-                + MediaStore.Downloads.RELATIVE_PATH + "=?";
-        String[] args = {STATE_FILE_NAME, STATE_RELATIVE_PATH};
-        try (Cursor cursor = getContentResolver().query(
-                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                projection,
-                selection,
-                args,
-                MediaStore.Downloads.DATE_ADDED + " DESC")) {
-            if (cursor != null && cursor.moveToFirst()) {
-                return ContentUris.withAppendedId(
-                        MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                        cursor.getLong(0));
+    private Set<String> readDurablePostedIds() {
+        Set<String> result = new HashSet<>();
+        Cursor cursor = null;
+        try {
+            Uri collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+            String[] projection = { MediaStore.Downloads._ID };
+            String selection = MediaStore.Downloads.RELATIVE_PATH + "=? AND "
+                    + MediaStore.Downloads.DISPLAY_NAME + "=?";
+            String[] args = { STATE_RELATIVE_PATH, STATE_FILE_NAME };
+            cursor = getContentResolver().query(collection, projection, selection, args, null);
+            if (cursor == null || !cursor.moveToFirst()) return result;
+            long id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID));
+            Uri uri = ContentUris.withAppendedId(collection, id);
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                    getContentResolver().openInputStream(uri), StandardCharsets.UTF_8))) {
+                StringBuilder text = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) text.append(line);
+                if (text.length() > 0) {
+                    JSONObject root = new JSONObject(text.toString());
+                    JSONArray ids = root.optJSONArray("posted_ids");
+                    if (ids != null) {
+                        for (int i = 0; i < ids.length(); i++) {
+                            String value = ids.optString(i, "").trim();
+                            if (!value.isEmpty()) result.add(value);
+                        }
+                    }
+                }
             }
         } catch (Exception ignored) {
+        } finally {
+            if (cursor != null) cursor.close();
         }
-        return null;
+        return result;
+    }
+
+    private void persistPostedIds(Set<String> posted) {
+        Set<String> safe = new HashSet<>(posted);
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putStringSet("posted_ids", safe).apply();
+        saveDurablePostedIds(safe);
+        String backupUri = getSharedPreferences(PREFS, MODE_PRIVATE).getString("history_backup_uri", "");
+        if (backupUri != null && !backupUri.isEmpty()) {
+            try {
+                writePostedIdsToUri(Uri.parse(backupUri), safe);
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     private void saveDurablePostedIds(Set<String> posted) {
-        String selected = getSharedPreferences(PREFS, MODE_PRIVATE).getString("history_backup_uri", "");
-        if (selected != null && !selected.isEmpty()) {
-            try {
-                writePostedIdsToUri(Uri.parse(selected), posted);
-                return;
-            } catch (Exception ignored) {}
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
+        Cursor cursor = null;
+        Uri uri = null;
         try {
-            Uri uri = findDurableStateUri();
-            boolean created = false;
+            Uri collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+            String[] projection = { MediaStore.Downloads._ID };
+            String selection = MediaStore.Downloads.RELATIVE_PATH + "=? AND "
+                    + MediaStore.Downloads.DISPLAY_NAME + "=?";
+            String[] args = { STATE_RELATIVE_PATH, STATE_FILE_NAME };
+            cursor = getContentResolver().query(collection, projection, selection, args, null);
+            if (cursor != null && cursor.moveToFirst()) {
+                long id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID));
+                uri = ContentUris.withAppendedId(collection, id);
+            }
+            if (cursor != null) {
+                cursor.close();
+                cursor = null;
+            }
             if (uri == null) {
                 ContentValues values = new ContentValues();
                 values.put(MediaStore.Downloads.DISPLAY_NAME, STATE_FILE_NAME);
                 values.put(MediaStore.Downloads.MIME_TYPE, "application/json");
                 values.put(MediaStore.Downloads.RELATIVE_PATH, STATE_RELATIVE_PATH);
-                values.put(MediaStore.Downloads.IS_PENDING, 1);
-                uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
-                created = true;
+                uri = getContentResolver().insert(collection, values);
             }
             if (uri == null) return;
 
@@ -1063,176 +1129,80 @@ public class MainActivity extends Activity {
             root.put("posted_ids", ids);
 
             try (OutputStream output = getContentResolver().openOutputStream(uri, "wt")) {
-                if (output == null) return;
-                output.write(root.toString().getBytes(StandardCharsets.UTF_8));
-                output.flush();
-            }
-
-            if (created) {
-                ContentValues ready = new ContentValues();
-                ready.put(MediaStore.Downloads.IS_PENDING, 0);
-                getContentResolver().update(uri, ready, null, null);
-            }
-        } catch (Exception ignored) {
-        }
-    }
-
-    private void migrateLegacyPublishedFolder() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
-        Set<String> posted = getPostedIds();
-        List<Uri> toDelete = new ArrayList<>();
-        String[] projection = {
-                MediaStore.Video.Media._ID,
-                MediaStore.Video.Media.DISPLAY_NAME
-        };
-        String selection = MediaStore.Video.Media.RELATIVE_PATH + "=?";
-        String[] args = {LEGACY_PUBLIC_PUBLISHED};
-
-        try (Cursor cursor = getContentResolver().query(
-                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                projection,
-                selection,
-                args,
-                null)) {
-            if (cursor != null) {
-                int idColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID);
-                int nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME);
-                while (cursor.moveToNext()) {
-                    long id = cursor.getLong(idColumn);
-                    String name = cursor.getString(nameColumn);
-                    if (name != null && name.endsWith(".mp4")) {
-                        String base = name.substring(0, name.length() - 4);
-                        int split = base.lastIndexOf('_');
-                        if (split > 0 && split < base.length() - 1) {
-                            String sourceId = base.substring(0, split);
-                            String videoId = base.substring(split + 1);
-                            if (videoId.matches("\\d+")) posted.add(sourceId + ":" + videoId);
-                        }
-                    }
-                    toDelete.add(ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id));
+                if (output != null) {
+                    output.write(root.toString().getBytes(StandardCharsets.UTF_8));
+                    output.flush();
                 }
             }
         } catch (Exception ignored) {
-        }
-
-        if (!toDelete.isEmpty()) {
-            persistPostedIds(posted);
-            for (Uri uri : toDelete) {
-                try { getContentResolver().delete(uri, null, null); } catch (Exception ignored) {}
-            }
+        } finally {
+            if (cursor != null) cursor.close();
         }
     }
 
-    private Uri copyToPublicFolder(File source, String relativePath) throws Exception {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            return null;
+    private void appendHistory(QueueItem item) {
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String currentHistory = prefs.getString("history", "");
+        String line = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+                .format(new Date()) + "  •  " + item.sourceName + "  •  " + item.videoId;
+        String merged = line + (currentHistory.isEmpty() ? "" : "\n" + currentHistory);
+        String[] lines = merged.split("\n");
+        StringBuilder limited = new StringBuilder();
+        for (int i = 0; i < Math.min(lines.length, 8); i++) {
+            if (i > 0) limited.append('\n');
+            limited.append(lines[i]);
         }
-
-        ContentValues values = new ContentValues();
-        values.put(MediaStore.Video.Media.DISPLAY_NAME, source.getName());
-        values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
-        values.put(MediaStore.Video.Media.RELATIVE_PATH, relativePath);
-        values.put(MediaStore.Video.Media.IS_PENDING, 1);
-
-        Uri uri = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
-        if (uri == null) throw new IllegalStateException("MediaStore não criou o arquivo visível.");
-
-        try (InputStream input = new FileInputStream(source);
-             OutputStream output = getContentResolver().openOutputStream(uri, "w")) {
-            if (output == null) throw new IllegalStateException("Não foi possível abrir a pasta pública.");
-            byte[] buffer = new byte[64 * 1024];
-            int read;
-            while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
-            output.flush();
-        } catch (Exception exc) {
-            try { getContentResolver().delete(uri, null, null); } catch (Exception ignored) {}
-            throw exc;
-        }
-
-        ContentValues ready = new ContentValues();
-        ready.put(MediaStore.Video.Media.IS_PENDING, 0);
-        getContentResolver().update(uri, ready, null, null);
-        return uri;
+        prefs.edit().putString("history", limited.toString()).apply();
     }
 
-    private void openPublicFolder(String relativePath) {
-        String documentId = "primary:" + relativePath;
-        Uri uri = DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", documentId);
-        try {
-            Intent view = new Intent(Intent.ACTION_VIEW);
-            view.setDataAndType(uri, "vnd.android.document/directory");
-            view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            startActivity(view);
-        } catch (Exception first) {
-            try {
-                Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-                picker.putExtra(DocumentsContract.EXTRA_INITIAL_URI, uri);
-                startActivity(picker);
-                Toast.makeText(this, "Pasta: Armazenamento interno/" + relativePath, Toast.LENGTH_LONG).show();
-            } catch (Exception second) {
-                Toast.makeText(this, "Abra Meus Arquivos > Armazenamento interno > " + relativePath, Toast.LENGTH_LONG).show();
-            }
-        }
-    }
-
-    private File videoFolder() {
-        return new File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "KwaiHelper");
-    }
-
-    private long localBytes() {
-        File folder = videoFolder();
-        if (!folder.exists()) return 0;
-        File[] files = folder.listFiles();
-        if (files == null) return 0;
-        long total = 0;
-        for (File file : files) if (file.isFile()) total += file.length();
-        return total;
-    }
-
-    private String formatBytes(long bytes) {
-        double mb = bytes / (1024.0 * 1024.0);
-        if (mb < 1024) return String.format(Locale.getDefault(), "%.1f MB", mb);
-        return String.format(Locale.getDefault(), "%.2f GB", mb / 1024.0);
+    private void refreshHistory() {
+        String history = getSharedPreferences(PREFS, MODE_PRIVATE).getString("history", "");
+        historyLabel.setText(history == null || history.trim().isEmpty()
+                ? "Ainda não há publicações registradas nesta instalação."
+                : history);
     }
 
     private void updateSummary() {
-        summaryLabel.setText(
-                "Pendentes: " + pending.size()
-                        + "   •   Publicados: " + getPostedIds().size()
-                        + "   •   Local: " + formatBytes(localBytes())
-        );
+        long bytes = folderBytes(videoFolder());
+        summaryLabel.setText(String.format(Locale.getDefault(),
+                "Pendentes: %d   •   Publicados: %d   •   Local: %.1f MB",
+                pending.size(), getPostedIds().size(), bytes / 1024d / 1024d));
     }
 
-    private void setStatus(String text) {
-        status.setText(text);
+    private long folderBytes(File folder) {
+        if (folder == null || !folder.exists()) return 0;
+        File[] files = folder.listFiles();
+        if (files == null) return 0;
+        long total = 0;
+        for (File file : files) {
+            if (file.isFile()) total += file.length();
+        }
+        return total;
     }
 
-    private void setChip(String text) {
-        statusChip.setText(text);
+    private void setStatus(String value) {
+        status.setText(value);
     }
 
-    private String shortMessage(Exception exc) {
-        String message = exc.getMessage();
-        if (message == null || message.trim().isEmpty()) return exc.getClass().getSimpleName();
-        return message.length() > 160 ? message.substring(0, 160) : message;
-    }
-
-    private String safeFileName(String value) {
-        return value.replaceAll("[^A-Za-z0-9._-]", "_");
+    private void setChip(String value) {
+        statusChip.setText(value);
     }
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        executor.shutdownNow();
-        imageExecutor.shutdownNow();
+    private String safeFileName(String value) {
+        return value.replaceAll("[^a-zA-Z0-9._-]", "_");
     }
 
-    private static class QueueItem {
+    private String shortMessage(Throwable error) {
+        String message = error.getMessage();
+        if (message == null || message.trim().isEmpty()) return error.getClass().getSimpleName();
+        return message.length() > 150 ? message.substring(0, 150) : message;
+    }
+
+    private static final class QueueItem {
         String sourceId;
         String sourceName;
         String videoId;
