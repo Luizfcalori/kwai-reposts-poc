@@ -8,6 +8,7 @@ on:
     paths:
       - 'config/kwai_sources.json'
       - 'scripts/scan_kwai_sources.py'
+      - 'scripts/improve_kwai_captions.py'
       - '.github/workflows/scan-kwai-sources.yml'
 
 permissions:
@@ -35,6 +36,9 @@ jobs:
 
       - name: Scan configured Kwai sources
         run: python scripts/scan_kwai_sources.py
+
+      - name: Improve captions and hashtags
+        run: python scripts/improve_kwai_captions.py
 
       - name: Persist newly detected videos
         shell: bash
