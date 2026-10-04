@@ -44,6 +44,22 @@ jobs:
           path: ~/.android/debug.keystore
           key: kwai-phone-helper-debug-keystore-v1
 
+      - name: Ensure stable debug signing key exists
+        shell: bash
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore ~/.android/debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -dname 'CN=Android Debug,O=Android,C=US' \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000
+          fi
+
       - name: Install Gradle 8.9
         shell: bash
         run: |
