@@ -1,0 +1,41 @@
+name: Fix v9 regex and rebuild
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-v9-regex.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fix Java regex escape
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('mobile-app/src/main/java/com/luizcalori/kwaihelper/MainActivity.java')
+          text = p.read_text(encoding='utf-8')
+          old = 'videoId.matches("\\d+")'
+          new = 'videoId.matches("\\\\d+")'
+          if old not in text:
+              raise SystemExit('regex anchor not found')
+          p.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
+      - name: Commit fix
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add mobile-app/src/main/java/com/luizcalori/kwaihelper/MainActivity.java
+          git commit -m 'Fix v9 Java regex escape'
+          git push
