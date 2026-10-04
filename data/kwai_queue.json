@@ -1,3 +1,124 @@
 {
-  "items": []
+  "items": [
+    {
+      "source_id": "cvqjx483",
+      "source_handle": "cvqjx483",
+      "source_display_name": "raguel Araújo",
+      "video_id": "5201244730479040936",
+      "video_url": "https://www.kwai.com/@cvqjx483/video/5201244730479040936",
+      "discovered_at": "2026-10-04T18:06:22Z",
+      "rights_confirmed": false,
+      "status": "awaiting_rights_confirmation"
+    },
+    {
+      "source_id": "cvqjx483",
+      "source_handle": "cvqjx483",
+      "source_display_name": "raguel Araújo",
+      "video_id": "5193644906253248771",
+      "video_url": "https://www.kwai.com/@cvqjx483/video/5193644906253248771",
+      "discovered_at": "2026-10-04T18:06:22Z",
+      "rights_confirmed": false,
+      "status": "awaiting_rights_confirmation"
+    },
+    {
+      "source_id": "cvqjx483",
+      "source_handle": "cvqjx483",
+      "source_display_name": "raguel Araújo",
+      "video_id": "5216162906826472555",
+      "video_url": "https://www.kwai.com/@cvqjx483/video/5216162906826472555",
+      "discovered_at": "2026-10-04T18:06:22Z",
+      "rights_confirmed": false,
+      "status": "awaiting_rights_confirmation"
+    },
+    {
+      "source_id": "cvqjx483",
+      "source_handle": "cvqjx483",
+      "source_display_name": "raguel Araújo",
+      "video_id": "5227140430630119043",
+      "video_url": "https://www.kwai.com/@cvqjx483/video/5227140430630119043",
+      "discovered_at": "2026-10-04T18:06:22Z",
+      "rights_confirmed": false,
+      "status": "awaiting_rights_confirmation"
+    },
+    {
+      "source_id": "cvqjx483",
+      "source_handle": "cvqjx483",
+      "source_display_name": "raguel Araújo",
+      "video_id": "5242058601220135835",
+      "video_url": "https://www.kwai.com/@cvqjx483/video/5242058601220135835",
+      "discovered_at": "2026-10-04T18:06:22Z",
+      "rights_confirmed": false,
+      "status": "awaiting_rights_confirmation"
+    },
+    {
+      "source_id": "cvqjx483",
+      "source_handle": "cvqjx483",
+      "source_display_name": "raguel Araújo",
+      "video_id": "5249658427700023548",
+      "video_url": "https://www.kwai.com/@cvqjx483/video/5249658427700023548",
+      "discovered_at": "2026-10-04T18:06:22Z",
+      "rights_confirmed": false,
+      "status": "awaiting_rights_confirmation"
+    },
+    {
+      "source_id": "gatas_do_mundo",
+      "source_handle": "Gatas_do_Mundo",
+      "source_display_name": "BigMonster",
+      "video_id": "5219822078411267769",
+      "video_url": "https://www.kwai.com/@Gatas_do_Mundo/video/5219822078411267769",
+      "discovered_at": "2026-10-04T18:06:36Z",
+      "rights_confirmed": false,
+      "status": "awaiting_rights_confirmation"
+    },
+    {
+      "source_id": "gatas_do_mundo",
+      "source_handle": "Gatas_do_Mundo",
+      "source_display_name": "BigMonster",
+      "video_id": "5234740252893501177",
+      "video_url": "https://www.kwai.com/@Gatas_do_Mundo/video/5234740252893501177",
+      "discovered_at": "2026-10-04T18:06:36Z",
+      "rights_confirmed": false,
+      "status": "awaiting_rights_confirmation"
+    },
+    {
+      "source_id": "gatas_do_mundo",
+      "source_handle": "Gatas_do_Mundo",
+      "source_display_name": "BigMonster",
+      "video_id": "5222073876963214619",
+      "video_url": "https://www.kwai.com/@Gatas_do_Mundo/video/5222073876963214619",
+      "discovered_at": "2026-10-04T18:06:36Z",
+      "rights_confirmed": false,
+      "status": "awaiting_rights_confirmation"
+    },
+    {
+      "source_id": "gatas_do_mundo",
+      "source_handle": "Gatas_do_Mundo",
+      "source_display_name": "BigMonster",
+      "video_id": "5204340954738153484",
+      "video_url": "https://www.kwai.com/@Gatas_do_Mundo/video/5204340954738153484",
+      "discovered_at": "2026-10-04T18:06:36Z",
+      "rights_confirmed": false,
+      "status": "awaiting_rights_confirmation"
+    },
+    {
+      "source_id": "gatas_do_mundo",
+      "source_handle": "Gatas_do_Mundo",
+      "source_display_name": "BigMonster",
+      "video_id": "5237273527472228895",
+      "video_url": "https://www.kwai.com/@Gatas_do_Mundo/video/5237273527472228895",
+      "discovered_at": "2026-10-04T18:06:36Z",
+      "rights_confirmed": false,
+      "status": "awaiting_rights_confirmation"
+    },
+    {
+      "source_id": "gatas_do_mundo",
+      "source_handle": "Gatas_do_Mundo",
+      "source_display_name": "BigMonster",
+      "video_id": "5224325678310615188",
+      "video_url": "https://www.kwai.com/@Gatas_do_Mundo/video/5224325678310615188",
+      "discovered_at": "2026-10-04T18:06:36Z",
+      "rights_confirmed": false,
+      "status": "awaiting_rights_confirmation"
+    }
+  ]
 }
