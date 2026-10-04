@@ -3,6 +3,7 @@ package com.luizcalori.kwaihelper;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
+import android.content.ContentValues;
 import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -11,7 +12,10 @@ import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.Environment;
+import android.provider.DocumentsContract;
+import android.provider.MediaStore;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
@@ -31,6 +35,8 @@ import java.io.BufferedInputStream;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FileInputStream;
+import java.io.OutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
@@ -52,6 +58,8 @@ public class MainActivity extends Activity {
     private static final String QUEUE_URL =
             "https://raw.githubusercontent.com/Luizfcalori/kwai-reposts-poc/main/data/kwai_queue.json";
     private static final String PREFS = "kwai_queue_state";
+    private static final String PUBLIC_DOWNLOADED = Environment.DIRECTORY_MOVIES + "/KwaiHelper/Baixados";
+    private static final String PUBLIC_PUBLISHED = Environment.DIRECTORY_MOVIES + "/KwaiHelper/Publicados";
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final ExecutorService imageExecutor = Executors.newSingleThreadExecutor();
@@ -74,6 +82,7 @@ public class MainActivity extends Activity {
 
     private QueueItem current;
     private File downloadedFile;
+    private Uri publicMediaUri;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -86,7 +95,7 @@ public class MainActivity extends Activity {
         box.setBackgroundColor(Color.rgb(247, 247, 247));
 
         TextView title = new TextView(this);
-        title.setText("Kwai Phone Helper v7");
+        title.setText("Kwai Phone Helper v8");
         title.setTextSize(26);
         title.setTextColor(Color.rgb(25, 25, 25));
         title.setPadding(0, 0, 0, dp(4));
@@ -176,7 +185,7 @@ public class MainActivity extends Activity {
         shareButton.setOnClickListener(v -> shareCurrent());
         box.addView(shareButton);
 
-        postedButton = button("✓ Publicado — excluir e preparar próximo");
+        postedButton = button("✓ Publicado — mover para Publicados e preparar próximo");
         postedButton.setEnabled(false);
         postedButton.setOnClickListener(v -> markPostedAndDelete());
         box.addView(postedButton);
@@ -185,6 +194,21 @@ public class MainActivity extends Activity {
         skipButton.setEnabled(false);
         skipButton.setOnClickListener(v -> skipCurrent());
         box.addView(skipButton);
+
+        TextView foldersTitle = new TextView(this);
+        foldersTitle.setText("PASTAS NO CELULAR");
+        foldersTitle.setTextSize(13);
+        foldersTitle.setTextColor(Color.GRAY);
+        foldersTitle.setPadding(0, dp(10), 0, dp(4));
+        box.addView(foldersTitle);
+
+        Button openDownloaded = button("📂 Abrir KwaiHelper/Baixados");
+        openDownloaded.setOnClickListener(v -> openPublicFolder("Movies/KwaiHelper/Baixados"));
+        box.addView(openDownloaded);
+
+        Button openPublished = button("📂 Abrir KwaiHelper/Publicados");
+        openPublished.setOnClickListener(v -> openPublicFolder("Movies/KwaiHelper/Publicados"));
+        box.addView(openPublished);
 
         status = new TextView(this);
         status.setText("Pronto para sincronizar.");
@@ -240,7 +264,7 @@ public class MainActivity extends Activity {
                 connection = (HttpURLConnection) url.openConnection();
                 connection.setConnectTimeout(20000);
                 connection.setReadTimeout(30000);
-                connection.setRequestProperty("User-Agent", "KwaiPhoneHelper/0.7 Android");
+                connection.setRequestProperty("User-Agent", "KwaiPhoneHelper/0.8 Android");
                 connection.setUseCaches(false);
 
                 StringBuilder jsonText = new StringBuilder();
@@ -342,6 +366,7 @@ public class MainActivity extends Activity {
 
     private void selectFirstPending() {
         downloadedFile = null;
+        publicMediaUri = null;
         shareButton.setEnabled(false);
         postedButton.setEnabled(false);
         thumbnail.setImageDrawable(null);
@@ -384,7 +409,7 @@ public class MainActivity extends Activity {
                 connection = (HttpURLConnection) new URL(item.thumbnailUrl).openConnection();
                 connection.setConnectTimeout(15000);
                 connection.setReadTimeout(20000);
-                connection.setRequestProperty("User-Agent", "KwaiPhoneHelper/0.7 Android");
+                connection.setRequestProperty("User-Agent", "KwaiPhoneHelper/0.8 Android");
                 Bitmap bitmap;
                 try (InputStream input = new BufferedInputStream(connection.getInputStream())) {
                     bitmap = BitmapFactory.decodeStream(input);
@@ -438,7 +463,7 @@ public class MainActivity extends Activity {
                 connection = (HttpURLConnection) new URL(item.mediaUrl).openConnection();
                 connection.setConnectTimeout(25000);
                 connection.setReadTimeout(90000);
-                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) KwaiPhoneHelper/0.7");
+                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) KwaiPhoneHelper/0.8");
                 connection.setInstanceFollowRedirects(true);
 
                 int response = connection.getResponseCode();
@@ -463,12 +488,23 @@ public class MainActivity extends Activity {
                 if (!partial.renameTo(target)) throw new IllegalStateException("Não foi possível finalizar o arquivo.");
 
                 downloadedFile = target;
+                String publicNote = "";
+                try {
+                    if (publicMediaUri != null) {
+                        try { getContentResolver().delete(publicMediaUri, null, null); } catch (Exception ignored) {}
+                    }
+                    publicMediaUri = copyToPublicFolder(target, PUBLIC_DOWNLOADED);
+                } catch (Exception storageExc) {
+                    publicMediaUri = null;
+                    publicNote = " A cópia visível não pôde ser criada: " + shortMessage(storageExc);
+                }
+                String finalPublicNote = publicNote;
                 runOnUiThread(() -> {
                     downloadButton.setEnabled(true);
                     shareButton.setEnabled(true);
                     postedButton.setEnabled(true);
                     copyButton.setEnabled(!caption.getText().toString().trim().isEmpty());
-                    setStatus("Vídeo pronto. Copie a legenda e envie para o Kwai.");
+                    setStatus("Vídeo pronto em Movies/KwaiHelper/Baixados. Copie a legenda e envie para o Kwai." + finalPublicNote);
                     setChip("PRONTO PARA ENVIAR");
                     updateSummary();
                 });
@@ -531,8 +567,17 @@ public class MainActivity extends Activity {
         if (current == null) return;
 
         QueueItem postedItem = current;
+        boolean archived = false;
+        if (publicMediaUri != null) {
+            try {
+                movePublicMedia(publicMediaUri, PUBLIC_PUBLISHED);
+                archived = true;
+            } catch (Exception exc) {
+                Toast.makeText(this, "Publicado, mas não consegui mover a cópia para Publicados: " + shortMessage(exc), Toast.LENGTH_LONG).show();
+            }
+        }
         if (downloadedFile != null && downloadedFile.exists() && !downloadedFile.delete()) {
-            Toast.makeText(this, "Não consegui excluir o arquivo local agora.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Não consegui excluir o arquivo temporário do app agora.", Toast.LENGTH_LONG).show();
         }
 
         Set<String> posted = getPostedIds();
@@ -549,7 +594,7 @@ public class MainActivity extends Activity {
         selectFirstPending();
 
         if (current != null) {
-            setStatus("Publicado ✓ Arquivo excluído. Preparando o próximo vídeo...");
+            setStatus(archived ? "Publicado ✓ Movido para Movies/KwaiHelper/Publicados. Preparando o próximo vídeo..." : "Publicado ✓ Preparando o próximo vídeo...");
             downloadCurrent();
         } else {
             setStatus("Fila concluída. Toque em Sincronizar para verificar novidades.");
@@ -565,6 +610,10 @@ public class MainActivity extends Activity {
         }
 
         if (downloadedFile != null && downloadedFile.exists()) downloadedFile.delete();
+        if (publicMediaUri != null) {
+            try { getContentResolver().delete(publicMediaUri, null, null); } catch (Exception ignored) {}
+            publicMediaUri = null;
+        }
         QueueItem skipped = pending.remove(0);
         pending.add(skipped);
         downloadedFile = null;
@@ -607,6 +656,66 @@ public class MainActivity extends Activity {
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         Set<String> stored = prefs.getStringSet("posted_ids", null);
         return stored == null ? new HashSet<>() : new HashSet<>(stored);
+    }
+
+    private Uri copyToPublicFolder(File source, String relativePath) throws Exception {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return null;
+        }
+
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Video.Media.DISPLAY_NAME, source.getName());
+        values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+        values.put(MediaStore.Video.Media.RELATIVE_PATH, relativePath);
+        values.put(MediaStore.Video.Media.IS_PENDING, 1);
+
+        Uri uri = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
+        if (uri == null) throw new IllegalStateException("MediaStore não criou o arquivo visível.");
+
+        try (InputStream input = new FileInputStream(source);
+             OutputStream output = getContentResolver().openOutputStream(uri, "w")) {
+            if (output == null) throw new IllegalStateException("Não foi possível abrir a pasta pública.");
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
+            output.flush();
+        } catch (Exception exc) {
+            try { getContentResolver().delete(uri, null, null); } catch (Exception ignored) {}
+            throw exc;
+        }
+
+        ContentValues ready = new ContentValues();
+        ready.put(MediaStore.Video.Media.IS_PENDING, 0);
+        getContentResolver().update(uri, ready, null, null);
+        return uri;
+    }
+
+    private void movePublicMedia(Uri uri, String relativePath) {
+        if (uri == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Video.Media.RELATIVE_PATH, relativePath);
+        int updated = getContentResolver().update(uri, values, null, null);
+        if (updated <= 0) throw new IllegalStateException("Android não moveu o vídeo para a pasta Publicados.");
+    }
+
+    private void openPublicFolder(String relativePath) {
+        String documentId = "primary:" + relativePath;
+        Uri uri = DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", documentId);
+        try {
+            Intent view = new Intent(Intent.ACTION_VIEW);
+            view.setDataAndType(uri, "vnd.android.document/directory");
+            view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(view);
+        } catch (Exception first) {
+            try {
+                Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                picker.putExtra(DocumentsContract.EXTRA_INITIAL_URI, uri);
+                startActivity(picker);
+                Toast.makeText(this, "Pasta: Armazenamento interno/" + relativePath, Toast.LENGTH_LONG).show();
+            } catch (Exception second) {
+                Toast.makeText(this, "Abra Meus Arquivos > Armazenamento interno > " + relativePath, Toast.LENGTH_LONG).show();
+            }
+        }
     }
 
     private File videoFolder() {
