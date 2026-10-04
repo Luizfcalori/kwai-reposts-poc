@@ -1,0 +1,39 @@
+name: Apply v14 performance preview
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/patch_v14_perf_preview.py'
+      - '.github/workflows/apply-v14-perf-preview.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply v14 patch
+        run: python scripts/patch_v14_perf_preview.py
+
+      - name: Commit v14 source changes
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add mobile-app/src/main/java/com/luizcalori/kwaihelper/MainActivity.java mobile-app/build.gradle
+          if git diff --cached --quiet; then
+            echo 'No source changes to commit.'
+            exit 0
+          fi
+          git commit -m 'Optimize Helper v14 and enlarge video preview'
+          for attempt in 1 2 3; do
+            git pull --rebase origin main && git push origin HEAD:main && break
+            if [ "$attempt" = "3" ]; then exit 1; fi
+            sleep 3
+          done
