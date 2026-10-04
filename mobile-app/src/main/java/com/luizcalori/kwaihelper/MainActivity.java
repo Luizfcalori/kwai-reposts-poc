@@ -30,6 +30,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.core.content.FileProvider;
+import androidx.documentfile.provider.DocumentFile;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -71,6 +72,7 @@ public class MainActivity extends Activity {
     private static final String TRUSTED_APK_PREFIX =
             "https://raw.githubusercontent.com/Luizfcalori/kwai-reposts-poc/";
     private static final int REQ_IMPORT_HISTORY = 701;
+    private static final int REQ_IMPORT_HISTORY_FOLDER = 702;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final ExecutorService imageExecutor = Executors.newSingleThreadExecutor();
@@ -140,8 +142,8 @@ public class MainActivity extends Activity {
         updateButton = button("⬆ Atualizar app");
         updateButton.setOnClickListener(v -> checkForUpdate());
 
-        importHistoryButton = button("📥 Importar histórico");
-        importHistoryButton.setOnClickListener(v -> chooseHistoryBackup());
+        importHistoryButton = button("🧹 Consolidar histórico");
+        importHistoryButton.setOnClickListener(v -> chooseHistoryFolder());
         box.addView(actionRow(updateButton, importHistoryButton));
 
         TextView quickTitle = new TextView(this);
@@ -311,6 +313,21 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void chooseHistoryFolder() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                Uri initial = DocumentsContract.buildDocumentUri(
+                        "com.android.externalstorage.documents",
+                        "primary:" + Environment.DIRECTORY_DOWNLOADS + "/KwaiHelper");
+                intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, initial);
+            } catch (Exception ignored) {}
+        }
+        startActivityForResult(intent, REQ_IMPORT_HISTORY_FOLDER);
+    }
+
     private void chooseHistoryBackup() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
@@ -328,6 +345,16 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_IMPORT_HISTORY_FOLDER) {
+            if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+            Uri folderUri = data.getData();
+            try {
+                int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                getContentResolver().takePersistableUriPermission(folderUri, flags);
+            } catch (Exception ignored) {}
+            consolidateHistoryFolder(folderUri);
+            return;
+        }
         if (requestCode != REQ_IMPORT_HISTORY || resultCode != RESULT_OK || data == null) return;
         Uri uri = data.getData();
         if (uri == null) return;
@@ -359,6 +386,90 @@ public class MainActivity extends Activity {
             syncQueue(true);
         } catch (Exception exc) {
             Toast.makeText(this, "Falha ao importar histórico: " + shortMessage(exc), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void consolidateHistoryFolder(Uri folderUri) {
+        try {
+            DocumentFile folder = DocumentFile.fromTreeUri(this, folderUri);
+            if (folder == null || !folder.isDirectory()) {
+                Toast.makeText(this, "Escolha a pasta Downloads/KwaiHelper.", Toast.LENGTH_LONG).show();
+                return;
+            }
+
+            Set<String> merged = new HashSet<>(getPostedIds());
+            List<DocumentFile> historyFiles = new ArrayList<>();
+            DocumentFile canonical = null;
+
+            for (DocumentFile file : folder.listFiles()) {
+                if (!file.isFile()) continue;
+                String name = file.getName();
+                if (name == null) continue;
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (!lower.startsWith("kwaihelper_publicados") || !lower.endsWith(".json")) continue;
+                historyFiles.add(file);
+                try { merged.addAll(readPostedIdsFromUri(file.getUri())); } catch (Exception ignored) {}
+                if (STATE_FILE_NAME.equals(name)) canonical = file;
+            }
+
+            if (canonical == null) {
+                canonical = folder.createFile("application/json", STATE_FILE_NAME);
+            }
+            if (canonical == null) throw new IllegalStateException("Não consegui criar o histórico mestre.");
+
+            writePostedIdsToUri(canonical.getUri(), merged);
+            int removed = 0;
+            for (DocumentFile file : historyFiles) {
+                if (file.getUri().equals(canonical.getUri())) continue;
+                try { if (file.delete()) removed++; } catch (Exception ignored) {}
+            }
+
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putString("history_folder_uri", folderUri.toString())
+                    .putString("history_backup_uri", canonical.getUri().toString())
+                    .putStringSet("posted_ids", new HashSet<>(merged))
+                    .apply();
+
+            Toast.makeText(this, "Histórico consolidado: " + merged.size() + " IDs • " + removed + " duplicados removidos.", Toast.LENGTH_LONG).show();
+            updateSummary();
+            syncQueue(true);
+        } catch (Exception exc) {
+            Toast.makeText(this, "Falha ao consolidar histórico: " + shortMessage(exc), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private Set<String> readPostedIdsFromHistoryFolder(Uri folderUri) {
+        Set<String> result = new HashSet<>();
+        try {
+            DocumentFile folder = DocumentFile.fromTreeUri(this, folderUri);
+            if (folder == null || !folder.isDirectory()) return result;
+            for (DocumentFile file : folder.listFiles()) {
+                if (!file.isFile()) continue;
+                String name = file.getName();
+                if (name == null) continue;
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (lower.startsWith("kwaihelper_publicados") && lower.endsWith(".json")) {
+                    try { result.addAll(readPostedIdsFromUri(file.getUri())); } catch (Exception ignored) {}
+                }
+            }
+        } catch (Exception ignored) {}
+        return result;
+    }
+
+    private boolean writePostedIdsToHistoryFolder(Uri folderUri, Set<String> posted) {
+        try {
+            DocumentFile folder = DocumentFile.fromTreeUri(this, folderUri);
+            if (folder == null || !folder.isDirectory()) return false;
+            DocumentFile canonical = folder.findFile(STATE_FILE_NAME);
+            if (canonical == null) canonical = folder.createFile("application/json", STATE_FILE_NAME);
+            if (canonical == null) return false;
+            writePostedIdsToUri(canonical.getUri(), posted);
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putString("history_backup_uri", canonical.getUri().toString())
+                    .apply();
+            return true;
+        } catch (Exception ignored) {
+            return false;
         }
     }
 
@@ -1035,6 +1146,10 @@ public class MainActivity extends Activity {
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         Set<String> result = new HashSet<>(prefs.getStringSet("posted_ids", new HashSet<>()));
         result.addAll(readDurablePostedIds());
+        String folderUri = prefs.getString("history_folder_uri", "");
+        if (folderUri != null && !folderUri.isEmpty()) {
+            result.addAll(readPostedIdsFromHistoryFolder(Uri.parse(folderUri)));
+        }
         String backupUri = prefs.getString("history_backup_uri", "");
         if (backupUri != null && !backupUri.isEmpty()) {
             try {
@@ -1050,29 +1165,17 @@ public class MainActivity extends Activity {
         Cursor cursor = null;
         try {
             Uri collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
-            String[] projection = { MediaStore.Downloads._ID };
+            String[] projection = { MediaStore.Downloads._ID, MediaStore.Downloads.DISPLAY_NAME };
             String selection = MediaStore.Downloads.RELATIVE_PATH + "=? AND "
-                    + MediaStore.Downloads.DISPLAY_NAME + "=?";
-            String[] args = { STATE_RELATIVE_PATH, STATE_FILE_NAME };
+                    + MediaStore.Downloads.DISPLAY_NAME + " LIKE ?";
+            String[] args = { STATE_RELATIVE_PATH, "kwaihelper_publicados%" };
             cursor = getContentResolver().query(collection, projection, selection, args, null);
-            if (cursor == null || !cursor.moveToFirst()) return result;
-            long id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID));
-            Uri uri = ContentUris.withAppendedId(collection, id);
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(
-                    getContentResolver().openInputStream(uri), StandardCharsets.UTF_8))) {
-                StringBuilder text = new StringBuilder();
-                String line;
-                while ((line = reader.readLine()) != null) text.append(line);
-                if (text.length() > 0) {
-                    JSONObject root = new JSONObject(text.toString());
-                    JSONArray ids = root.optJSONArray("posted_ids");
-                    if (ids != null) {
-                        for (int i = 0; i < ids.length(); i++) {
-                            String value = ids.optString(i, "").trim();
-                            if (!value.isEmpty()) result.add(value);
-                        }
-                    }
-                }
+            if (cursor == null) return result;
+            int idCol = cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID);
+            while (cursor.moveToNext()) {
+                long id = cursor.getLong(idCol);
+                Uri uri = ContentUris.withAppendedId(collection, id);
+                try { result.addAll(readPostedIdsFromUri(uri)); } catch (Exception ignored) {}
             }
         } catch (Exception ignored) {
         } finally {
@@ -1083,9 +1186,15 @@ public class MainActivity extends Activity {
 
     private void persistPostedIds(Set<String> posted) {
         Set<String> safe = new HashSet<>(posted);
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putStringSet("posted_ids", safe).apply();
-        saveDurablePostedIds(safe);
-        String backupUri = getSharedPreferences(PREFS, MODE_PRIVATE).getString("history_backup_uri", "");
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        prefs.edit().putStringSet("posted_ids", safe).apply();
+        String folderUri = prefs.getString("history_folder_uri", "");
+        boolean savedToFolder = false;
+        if (folderUri != null && !folderUri.isEmpty()) {
+            savedToFolder = writePostedIdsToHistoryFolder(Uri.parse(folderUri), safe);
+        }
+        if (!savedToFolder) saveDurablePostedIds(safe);
+        String backupUri = prefs.getString("history_backup_uri", "");
         if (backupUri != null && !backupUri.isEmpty()) {
             try {
                 writePostedIdsToUri(Uri.parse(backupUri), safe);
@@ -1097,18 +1206,22 @@ public class MainActivity extends Activity {
     private void saveDurablePostedIds(Set<String> posted) {
         Cursor cursor = null;
         Uri uri = null;
+        Set<String> merged = new HashSet<>(posted);
         try {
             Uri collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
-            String[] projection = { MediaStore.Downloads._ID };
+            String[] projection = { MediaStore.Downloads._ID, MediaStore.Downloads.DISPLAY_NAME };
             String selection = MediaStore.Downloads.RELATIVE_PATH + "=? AND "
-                    + MediaStore.Downloads.DISPLAY_NAME + "=?";
-            String[] args = { STATE_RELATIVE_PATH, STATE_FILE_NAME };
+                    + MediaStore.Downloads.DISPLAY_NAME + " LIKE ?";
+            String[] args = { STATE_RELATIVE_PATH, "kwaihelper_publicados%" };
             cursor = getContentResolver().query(collection, projection, selection, args, null);
-            if (cursor != null && cursor.moveToFirst()) {
-                long id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID));
-                uri = ContentUris.withAppendedId(collection, id);
-            }
             if (cursor != null) {
+                int idCol = cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID);
+                while (cursor.moveToNext()) {
+                    long id = cursor.getLong(idCol);
+                    Uri candidate = ContentUris.withAppendedId(collection, id);
+                    if (uri == null) uri = candidate;
+                    try { merged.addAll(readPostedIdsFromUri(candidate)); } catch (Exception ignored) {}
+                }
                 cursor.close();
                 cursor = null;
             }
@@ -1120,20 +1233,7 @@ public class MainActivity extends Activity {
                 uri = getContentResolver().insert(collection, values);
             }
             if (uri == null) return;
-
-            JSONObject root = new JSONObject();
-            JSONArray ids = new JSONArray();
-            List<String> sorted = new ArrayList<>(posted);
-            java.util.Collections.sort(sorted);
-            for (String value : sorted) ids.put(value);
-            root.put("posted_ids", ids);
-
-            try (OutputStream output = getContentResolver().openOutputStream(uri, "wt")) {
-                if (output != null) {
-                    output.write(root.toString().getBytes(StandardCharsets.UTF_8));
-                    output.flush();
-                }
-            }
+            writePostedIdsToUri(uri, merged);
         } catch (Exception ignored) {
         } finally {
             if (cursor != null) cursor.close();
