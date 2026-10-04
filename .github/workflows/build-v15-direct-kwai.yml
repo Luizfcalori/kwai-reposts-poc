@@ -32,37 +32,51 @@ jobs:
           text = path.read_text(encoding='utf-8')
           text = text.replace('title.setText("Kwai Phone Helper v14");', 'title.setText("Kwai Phone Helper v15");')
 
-          old = '''        try {
-              startActivity(Intent.createChooser(share, "Escolha o Kwai"));
-              setStatus("Vídeo enviado. A legenda está copiada — cole no campo de descrição do Kwai.");
-              setChip("ENVIADO AO KWAI • TEXTO COPIADO");
-          } catch (ActivityNotFoundException ex) {
-              Toast.makeText(this, "Nenhum aplicativo compatível foi encontrado.", Toast.LENGTH_LONG).show();
-          }
-          '''
+          chooser_line = '            startActivity(Intent.createChooser(share, "Escolha o Kwai"));'
+          direct_lines = (
+              '            final String kwaiPackage = "com.kwai.video";\n'
+              '            grantUriPermission(kwaiPackage, videoUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);\n'
+              '            share.setPackage(kwaiPackage);\n'
+              '            startActivity(share);'
+          )
+          if chooser_line not in text:
+              raise SystemExit('chooser call not found; refusing to build an unpatched APK')
+          text = text.replace(chooser_line, direct_lines, 1)
+          text = text.replace(
+              '            setStatus("Vídeo enviado. A legenda está copiada — cole no campo de descrição do Kwai.");',
+              '            setStatus("Abrindo direto no Kwai. A legenda está copiada — cole no campo de descrição.");',
+              1,
+          )
+          text = text.replace(
+              '            setChip("ENVIADO AO KWAI • TEXTO COPIADO");',
+              '            setChip("ABERTO DIRETO NO KWAI • TEXTO COPIADO");',
+              1,
+          )
 
-          new = '''        try {
-              final String kwaiPackage = "com.kwai.video";
-              grantUriPermission(kwaiPackage, videoUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-              share.setPackage(kwaiPackage);
-              startActivity(share);
-              setStatus("Abrindo direto no Kwai. A legenda está copiada — cole no campo de descrição.");
-              setChip("ABERTO DIRETO NO KWAI • TEXTO COPIADO");
-          } catch (ActivityNotFoundException | SecurityException ex) {
-              try {
-                  share.setPackage(null);
-                  startActivity(Intent.createChooser(share, "Escolha o Kwai"));
-                  setStatus("Não consegui abrir o Kwai diretamente. Use o seletor desta vez.");
-                  setChip("SELETOR DE COMPARTILHAMENTO");
-              } catch (ActivityNotFoundException fallbackEx) {
-                  Toast.makeText(this, "Nenhum aplicativo compatível foi encontrado.", Toast.LENGTH_LONG).show();
-              }
-          }
-          '''
-
-          if old not in text:
-              raise SystemExit('shareCurrent block not found; refusing to build an unpatched APK')
-          text = text.replace(old, new, 1)
+          old_catch = (
+              '        } catch (ActivityNotFoundException ex) {\n'
+              '            Toast.makeText(this, "Nenhum aplicativo compatível foi encontrado.", Toast.LENGTH_LONG).show();\n'
+              '        }\n'
+              '    }\n\n'
+              '    private void markPostedAndDelete() {'
+          )
+          new_catch = (
+              '        } catch (ActivityNotFoundException | SecurityException ex) {\n'
+              '            try {\n'
+              '                share.setPackage(null);\n'
+              '                startActivity(Intent.createChooser(share, "Escolha o Kwai"));\n'
+              '                setStatus("Não consegui abrir o Kwai diretamente. Use o seletor desta vez.");\n'
+              '                setChip("SELETOR DE COMPARTILHAMENTO");\n'
+              '            } catch (ActivityNotFoundException fallbackEx) {\n'
+              '                Toast.makeText(this, "Nenhum aplicativo compatível foi encontrado.", Toast.LENGTH_LONG).show();\n'
+              '            }\n'
+              '        }\n'
+              '    }\n\n'
+              '    private void markPostedAndDelete() {'
+          )
+          if old_catch not in text:
+              raise SystemExit('shareCurrent catch block not found; refusing to build an unpatched APK')
+          text = text.replace(old_catch, new_catch, 1)
           path.write_text(text, encoding='utf-8')
           PY
 
