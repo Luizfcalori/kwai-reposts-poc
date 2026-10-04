@@ -19,7 +19,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts /tmp/jadx-out
-          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
+          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions,aab=1/language=pt_PT/country=br'
           curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
           python3 - <<'PY'
           import json,pathlib
@@ -62,7 +62,6 @@ jobs:
             'PhoneNumberLogin','PhoneLogin','MobileLogin','buildLoginIntent','inject_kwai_force_login',
             'setUriRouterUrl','getUrlFromRouter','KwaiAuthActivity','UriRouterActivity'
           ]
-          hits=[]
           files=[]
           for p in src.rglob('*.java'):
             try:s=p.read_text(errors='ignore')
@@ -112,3 +111,5 @@ jobs:
           path: artifacts/
           if-no-files-found: error
           retention-days: 1
+
+# rerun: trace current phone-login caller
