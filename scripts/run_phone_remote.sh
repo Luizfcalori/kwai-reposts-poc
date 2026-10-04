@@ -37,6 +37,18 @@ fi
 python3 scripts/kwai_select_brazil.py
 rm -rf artifacts
 adb logcat -c
+# Bind the app-level password to the already configured private email secret without logging it.
+python3 - <<'PY'
+from pathlib import Path
+import hashlib, os, re
+p = Path('scripts/kwai_phone_remote.py')
+s = p.read_text()
+digest = hashlib.sha256(os.environ['KWAI_REMOTE_EMAIL'].encode('utf-8')).hexdigest()
+new, count = re.subn(r'AUTH_HASH = "[0-9a-f]{64}"', f'AUTH_HASH = "{digest}"', s, count=1)
+if count != 1:
+    raise SystemExit('AUTH_HASH marker not found')
+p.write_text(new)
+PY
 env -u GH_TOKEN -u KWAI_REMOTE_EMAIL python3 scripts/kwai_phone_remote.py >/dev/null 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 20); do
