@@ -64,3 +64,4 @@ jobs:
           echo 'Remote session ended. No screenshots, credentials, account data or unencrypted backups uploaded.' >> "$GITHUB_STEP_SUMMARY"
 
 # Protected Quick Tunnel controls use encrypted GET requests so browser sessions behind SameSite=Lax auth can interact reliably.
+# Restart 2026-10-04 14:32Z with top-level navigation controls to avoid in-app browser fetch failures.
