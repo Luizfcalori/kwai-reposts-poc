@@ -60,7 +60,8 @@ jobs:
             'SIGNUP_PHONE','INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS','PHONE_ONE_KEY_LOGIN_OPTIMIZED_PAGE',
             'PhoneAccountActivityV2','PhoneAccountActivity','PhoneVerifyActivity','ForcePhoneRegisterActivity',
             'PhoneNumberLogin','PhoneLogin','MobileLogin','buildLoginIntent','inject_kwai_force_login',
-            'setUriRouterUrl','getUrlFromRouter','KwaiAuthActivity','UriRouterActivity'
+            'setUriRouterUrl','getUrlFromRouter','KwaiAuthActivity','UriRouterActivity',
+            'TinyLoginActivity','arg_tiny_login_source','loginInfoSetting','ITinyLoginPlugin'
           ]
           files=[]
           for p in src.rglob('*.java'):
@@ -99,7 +100,7 @@ jobs:
           PY
 
           echo '=== strongest hit files ==='
-          grep -Eai 'PhoneAccountActivity|PhoneVerifyActivity|ForcePhoneRegisterActivity|PhoneNumberLogin|PhoneLogin|buildLoginIntent|inject_kwai_force_login|PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|SIGNUP_PHONE|UriRouterActivity' artifacts/hit-files.txt | head -n 220 || true
+          grep -Eai 'TinyLoginActivity|arg_tiny_login_source|loginInfoSetting|ITinyLoginPlugin|PhoneAccountActivity|PhoneVerifyActivity|ForcePhoneRegisterActivity|PhoneNumberLogin|PhoneLogin|buildLoginIntent|inject_kwai_force_login|PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|SIGNUP_PHONE|UriRouterActivity' artifacts/hit-files.txt | head -n 300 || true
           echo '=== uri literals ==='
           grep -Eai 'ikwai|kwai|phone|login|signup' artifacts/login-uri-literals.txt | head -n 260 || true
 
