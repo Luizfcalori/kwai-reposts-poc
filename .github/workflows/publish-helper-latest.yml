@@ -32,16 +32,20 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
 
-      - name: Restore stable debug signing key
+      - name: Restore permanent Kwai signing key
         uses: actions/cache@v4
         with:
           path: ~/.android/debug.keystore
           key: kwai-phone-helper-debug-keystore-v1
 
-      - name: Verify signing key
+      - name: Pin signing key into project build
+        shell: bash
         run: |
           test -f ~/.android/debug.keystore
-          keytool -list -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey >/dev/null
+          mkdir -p mobile-app/signing
+          cp ~/.android/debug.keystore mobile-app/signing/kwai-helper.keystore
+          echo 'Persistent signing certificate:'
+          keytool -list -v -keystore mobile-app/signing/kwai-helper.keystore -storepass android -alias androiddebugkey | grep 'SHA256:'
 
       - name: Install Gradle 8.9
         run: |
@@ -49,8 +53,16 @@ jobs:
           unzip -q /tmp/gradle.zip -d /opt
           echo '/opt/gradle-8.9/bin' >> "$GITHUB_PATH"
 
-      - name: Build APK
+      - name: Build APK with pinned key
         run: gradle --no-daemon :mobile-app:assembleDebug
+
+      - name: Verify APK certificate matches pinned key
+        shell: bash
+        run: |
+          APK=mobile-app/build/outputs/apk/debug/mobile-app-debug.apk
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          test -x "$APKSIGNER"
+          "$APKSIGNER" verify --print-certs "$APK"
 
       - name: Publish updater files
         shell: bash
