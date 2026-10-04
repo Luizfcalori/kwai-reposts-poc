@@ -78,6 +78,8 @@ public class MainActivity extends Activity {
     private final ExecutorService imageExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService updateExecutor = Executors.newSingleThreadExecutor();
     private final List<QueueItem> pending = new ArrayList<>();
+    private final Object postedIdsLock = new Object();
+    private Set<String> postedIdsCache = null;
 
     private TextView summaryLabel;
     private TextView sourceLabel;
@@ -114,7 +116,7 @@ public class MainActivity extends Activity {
         box.setBackgroundColor(Color.rgb(247, 247, 247));
 
         TextView title = new TextView(this);
-        title.setText("Kwai Phone Helper v12");
+        title.setText("Kwai Phone Helper v14");
         title.setTextSize(26);
         title.setTextColor(Color.rgb(25, 25, 25));
         title.setPadding(0, 0, 0, dp(4));
@@ -128,7 +130,7 @@ public class MainActivity extends Activity {
         box.addView(subtitle);
 
         summaryLabel = new TextView(this);
-        summaryLabel.setText("Pendentes: 0   •   Publicados: " + getPostedIds().size() + "   •   Local: 0 MB");
+        summaryLabel.setText("Pendentes: 0   •   Publicados: carregando...   •   Local: 0 MB");
         summaryLabel.setTextSize(15);
         summaryLabel.setTextColor(Color.rgb(55, 55, 55));
         summaryLabel.setPadding(dp(12), dp(10), dp(12), dp(10));
@@ -189,8 +191,8 @@ public class MainActivity extends Activity {
 
         thumbnail = new ImageView(this);
         thumbnail.setBackgroundColor(Color.rgb(225, 225, 225));
-        thumbnail.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        LinearLayout.LayoutParams imageParams = new LinearLayout.LayoutParams(-1, dp(150));
+        thumbnail.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        LinearLayout.LayoutParams imageParams = new LinearLayout.LayoutParams(-1, dp(280));
         box.addView(thumbnail, imageParams);
 
         thumbnailHint = new TextView(this);
@@ -261,11 +263,11 @@ public class MainActivity extends Activity {
         historyLabel.setBackgroundColor(Color.WHITE);
         box.addView(historyLabel, fullWidth());
         refreshHistory();
-        updateSummary();
 
         ScrollView scroll = new ScrollView(this);
         scroll.addView(box);
         setContentView(scroll);
+        warmPostedIdsCache();
     }
 
     private LinearLayout.LayoutParams fullWidth() {
@@ -379,6 +381,7 @@ public class MainActivity extends Activity {
                     .putString("history_backup_uri", uri.toString())
                     .putStringSet("posted_ids", new HashSet<>(merged))
                     .apply();
+            setPostedIdsCache(merged);
             saveDurablePostedIds(merged);
             int added = merged.size() - before;
             Toast.makeText(this, "Histórico importado: " + added + " IDs recuperados.", Toast.LENGTH_LONG).show();
@@ -429,6 +432,7 @@ public class MainActivity extends Activity {
                     .putString("history_backup_uri", canonical.getUri().toString())
                     .putStringSet("posted_ids", new HashSet<>(merged))
                     .apply();
+            setPostedIdsCache(merged);
 
             Toast.makeText(this, "Histórico consolidado: " + merged.size() + " IDs • " + removed + " duplicados removidos.", Toast.LENGTH_LONG).show();
             updateSummary();
@@ -1142,7 +1146,24 @@ public class MainActivity extends Activity {
         return source + ":" + video;
     }
 
+    private void warmPostedIdsCache() {
+        executor.execute(() -> {
+            getPostedIds();
+            runOnUiThread(this::updateSummary);
+        });
+    }
+
+    private void setPostedIdsCache(Set<String> ids) {
+        synchronized (postedIdsLock) {
+            postedIdsCache = new HashSet<>(ids);
+        }
+    }
+
     private Set<String> getPostedIds() {
+        synchronized (postedIdsLock) {
+            if (postedIdsCache != null) return new HashSet<>(postedIdsCache);
+        }
+
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         Set<String> result = new HashSet<>(prefs.getStringSet("posted_ids", new HashSet<>()));
         result.addAll(readDurablePostedIds());
@@ -1157,7 +1178,12 @@ public class MainActivity extends Activity {
             } catch (Exception ignored) {
             }
         }
-        return result;
+
+        synchronized (postedIdsLock) {
+            if (postedIdsCache == null) postedIdsCache = new HashSet<>(result);
+            else postedIdsCache.addAll(result);
+            return new HashSet<>(postedIdsCache);
+        }
     }
 
     private Set<String> readDurablePostedIds() {
@@ -1186,6 +1212,7 @@ public class MainActivity extends Activity {
 
     private void persistPostedIds(Set<String> posted) {
         Set<String> safe = new HashSet<>(posted);
+        setPostedIdsCache(safe);
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         prefs.edit().putStringSet("posted_ids", safe).apply();
         String folderUri = prefs.getString("history_folder_uri", "");
