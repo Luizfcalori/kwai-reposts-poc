@@ -1,0 +1,90 @@
+name: Publish latest Kwai Helper
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'mobile-app/**'
+
+permissions:
+  contents: write
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Restore stable debug signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: kwai-phone-helper-debug-keystore-v1
+
+      - name: Verify signing key
+        run: |
+          test -f ~/.android/debug.keystore
+          keytool -list -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey >/dev/null
+
+      - name: Install Gradle 8.9
+        run: |
+          curl -fsSL https://services.gradle.org/distributions/gradle-8.9-bin.zip -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /opt
+          echo '/opt/gradle-8.9/bin' >> "$GITHUB_PATH"
+
+      - name: Build APK
+        run: gradle --no-daemon :mobile-app:assembleDebug
+
+      - name: Publish updater files
+        shell: bash
+        run: |
+          VERSION_CODE=$(grep -E '^[[:space:]]*versionCode ' mobile-app/build.gradle | awk '{print $2}')
+          VERSION_NAME=$(grep -E '^[[:space:]]*versionName ' mobile-app/build.gradle | sed -E "s/.*versionName[[:space:]]+'([^']+)'.*/\1/")
+          mkdir -p releases
+          cp mobile-app/build/outputs/apk/debug/mobile-app-debug.apk releases/kwai-phone-helper-latest.apk
+          SHA=$(sha256sum releases/kwai-phone-helper-latest.apk | awk '{print $1}')
+          cat > releases/latest.json <<EOF
+          {
+            "version_code": $VERSION_CODE,
+            "version_name": "$VERSION_NAME",
+            "apk_url": "https://raw.githubusercontent.com/Luizfcalori/kwai-reposts-poc/main/releases/kwai-phone-helper-latest.apk",
+            "sha256": "$SHA"
+          }
+          EOF
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f releases/kwai-phone-helper-latest.apk releases/latest.json
+          if git diff --cached --quiet; then
+            echo 'Updater files already current.'
+            exit 0
+          fi
+          git commit -m "Publish Kwai Phone Helper v${VERSION_CODE}"
+          for attempt in 1 2 3; do
+            git pull --rebase origin main && git push origin HEAD:main && break
+            if [ "$attempt" = "3" ]; then exit 1; fi
+            sleep 3
+          done
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwai-phone-helper-latest
+          path: mobile-app/build/outputs/apk/debug/mobile-app-debug.apk
+          retention-days: 7
