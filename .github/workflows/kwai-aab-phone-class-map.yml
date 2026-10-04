@@ -1,4 +1,4 @@
-name: Kwai AAB phone class map
+name: Kwai complete bundle phone class map
 
 on:
   workflow_dispatch:
@@ -14,202 +14,108 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Download and scan every AAB split
+      - name: Download complete Kwai bundle from APKPure
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifacts /tmp/kwai/splits /tmp/kwai/decompiled
-          API='https://ws75.aptoide.com/api/7/app/get/package_name=com.kwai.video/nodes=meta,versions/aab=1/language=pt_PT/country=br'
-          curl -LsS --retry 4 --retry-delay 2 "$API" -o /tmp/meta.json
+          mkdir -p artifacts apks /tmp/kwai-package /tmp/dex
+          docker run --rm -v "$PWD/apks:/output" ghcr.io/efforg/apkeep:stable \
+            -a com.kwai.video -d apk-pure \
+            -o 'acknowledge_dangers=true,arch=x86_64;x86' /output \
+            2>&1 | tee artifacts/apkeep-download.txt
 
-          python3 - <<'PY'
-          import json,pathlib,re
-          d=json.load(open('/tmp/meta.json',encoding='utf-8'))
-          m=((d.get('nodes') or {}).get('meta') or {}).get('data') or {}
-          f=m.get('file') or {}
-          aab=m.get('aab') or {}
-          splits=aab.get('splits') or []
-          pathlib.Path('artifacts/version.txt').write_text(
-              f"version={f.get('vername')}\nversionCode={f.get('vercode')}\nbaseMd5={f.get('md5sum')}\n",
-              encoding='utf-8')
-          rows=[]
-          with open('/tmp/urls.tsv','w',encoding='utf-8') as out:
-              base=f.get('path') or f.get('path_alt')
-              if base: out.write('base\tBASE\tbase\t'+base+'\n')
-              for i,s in enumerate(splits):
-                  if not isinstance(s,dict): continue
-                  name=str(s.get('name') or f'split{i}')
-                  typ=str(s.get('type') or '')
-                  path=s.get('path') or s.get('path_alt')
-                  rows.append({k:s.get(k) for k in ('name','type','filesize','md5sum','path') if s.get(k) is not None})
-                  if isinstance(path,str) and path.startswith('http'):
-                      safe=re.sub(r'[^A-Za-z0-9_.-]+','_',name)[:100]
-                      out.write(f'{i}\t{typ}\t{safe}\t{path}\n')
-          pathlib.Path('artifacts/aab-splits.txt').write_text('\n'.join(str(r) for r in rows)+'\n',encoding='utf-8')
-          pathlib.Path('artifacts/aab-count.txt').write_text(f'splits={len(splits)}\n',encoding='utf-8')
-          PY
+          BUNDLE="$(find apks -maxdepth 1 -type f | head -n1)"
+          test -n "$BUNDLE"
+          echo "bundle=$BUNDLE" | tee artifacts/bundle.txt
+          case "$BUNDLE" in
+            *.xapk|*.zip) unzip -q "$BUNDLE" -d /tmp/kwai-package ;;
+            *.apk) cp "$BUNDLE" /tmp/kwai-package/base.apk ;;
+            *) echo "Unsupported bundle: $BUNDLE"; exit 1 ;;
+          esac
+          find /tmp/kwai-package -type f -name '*.apk' -printf '%p\t%s bytes\n' | sort > artifacts/apk-inventory.txt
+          cat artifacts/apk-inventory.txt
 
-          while IFS=$'\t' read -r idx typ name url; do
-            out="/tmp/kwai/splits/${idx}-${typ}-${name}.apk"
-            echo "Downloading $idx type=$typ name=$name"
-            curl -fL --retry 3 --retry-delay 2 "$url" -o "$out" || rm -f "$out"
-          done < /tmp/urls.tsv
-
-          find /tmp/kwai/splits -type f -name '*.apk' -printf '%f %s bytes\n' | sort > artifacts/downloaded.txt
-
-          PAT='PhoneAccountActivityV2|PhoneAccountActivity|ForcePhoneRegisterActivity|PhoneVerifyActivity|BindPhoneActivity|ChangePhoneActivity|PhoneResetPsdActivity|VerifyPhoneActivity|SplashLoginActivity|CommonLoginActivity|AutoLoginActivity|TinyLoginActivity|TinyLoginPluginImpl|ITinyLoginPlugin|arg_tiny_login_source|PHONE_NUMBER_LOGIN_PAGE|PHONE_LOGIN_NEW|CLICK_PHONE_LOGIN|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|UNIFIED_SIGNUP_LOGIN|FORCE_SIGNUP_LOGIN|userlogin|phone.?login|login.?phone'
-          STRONG='PhoneAccountActivityV2|PhoneAccountActivity|ForcePhoneRegisterActivity|PhoneVerifyActivity|CommonLoginActivity|AutoLoginActivity|TinyLoginActivity|TinyLoginPluginImpl|ITinyLoginPlugin|arg_tiny_login_source|userlogin|PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN'
-          : > artifacts/class-hits.txt
-          : > artifacts/route-hits.txt
-          : > artifacts/matching-apks.txt
-          : > artifacts/strong-matching-apks.txt
-          : > artifacts/manifest-hits.txt
-
+      - name: Scan all package APKs and DEX for real login implementation
+        shell: bash
+        run: |
+          set -euo pipefail
           BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
           AAPT="$BT/aapt"
+          APKSIGNER="$BT/apksigner"
+          PAT='PhoneAccountActivityV2|PhoneAccountActivity|PhoneVerifyActivity|ForcePhoneRegisterActivity|CommonLoginActivity|SplashLoginActivity|AutoLoginActivity|AutoLogoutActivity|BindPhoneActivity|PhoneResetPsdActivity|userlogin|PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS|PURE_PHONE_QUICK_LOGIN|RouterPlugin|UriRouterActivity'
+          EXACT='Lcom/yxcorp/gifshow/login/PhoneAccountActivityV2;|Lcom/yxcorp/gifshow/login/PhoneVerifyActivity;|Lcom/yxcorp/gifshow/login/ForcePhoneRegisterActivity;|Lcom/yxcorp/gifshow/login/activity/CommonLoginActivity;|Lcom/yxcorp/login/userlogin/activity/AutoLoginActivity;'
+          : > artifacts/certificates.txt
+          : > artifacts/badging.txt
+          : > artifacts/dex-hits.txt
+          : > artifacts/exact-class-apks.txt
+          : > artifacts/manifest-hits.txt
+          : > artifacts/dex-inventory.txt
 
-          for apk in /tmp/kwai/splits/*.apk; do
-            [ -f "$apk" ] || continue
-            b="$(basename "$apk")"
-            hit=0
-            strong=0
-
-            if "$AAPT" dump xmltree "$apk" AndroidManifest.xml > /tmp/manifest.txt 2>/dev/null; then
-              mh="$(grep -Ei -C 6 "$PAT" /tmp/manifest.txt || true)"
-              if [ -n "$mh" ]; then
-                hit=1
-                { echo "===== $b ====="; echo "$mh"; } >> artifacts/manifest-hits.txt
-              fi
-              if grep -Eiq "$STRONG" /tmp/manifest.txt; then strong=1; fi
-            fi
-
-            tmp="$(mktemp -d)"
-            unzip -qq "$apk" 'classes*.dex' -d "$tmp" 2>/dev/null || true
-            for dex in "$tmp"/classes*.dex; do
+          n=0
+          while IFS= read -r -d '' apk; do
+            n=$((n+1)); b="$(basename "$apk")"; d="/tmp/dex/$n"; mkdir -p "$d"
+            echo "===== $b =====" >> artifacts/certificates.txt
+            "$APKSIGNER" verify --print-certs "$apk" >> artifacts/certificates.txt 2>&1 || true
+            echo "===== $b =====" >> artifacts/badging.txt
+            "$AAPT" dump badging "$apk" >> artifacts/badging.txt 2>&1 || true
+            "$AAPT" dump xmltree "$apk" AndroidManifest.xml > "$d/manifest.txt" 2>/dev/null || true
+            mh="$(grep -Eai -C 6 "$PAT" "$d/manifest.txt" || true)"
+            [ -z "$mh" ] || { echo "===== $b ====="; echo "$mh"; } >> artifacts/manifest-hits.txt
+            unzip -qq "$apk" 'classes*.dex' -d "$d" 2>/dev/null || true
+            for dex in "$d"/classes*.dex; do
               [ -f "$dex" ] || continue
-              cls="$(strings -a "$dex" | grep -Ei "$PAT" | sort -u || true)"
-              if [ -n "$cls" ]; then
-                hit=1
-                { echo "===== $b :: $(basename "$dex") ====="; echo "$cls"; } >> artifacts/class-hits.txt
-              fi
-              if strings -a "$dex" | grep -Eiq "$STRONG"; then strong=1; fi
-              routes="$(strings -a "$dex" | grep -Ei '(i?kwai|kwaiapp)://[^ ]*(login|phone|auth|account|register|verify)|(login|phone|auth|account|register|verify)[^ ]*(i?kwai|kwaiapp)://' || true)"
-              if [ -n "$routes" ]; then
-                { echo "===== $b :: $(basename "$dex") ====="; echo "$routes"; } >> artifacts/route-hits.txt
+              echo "$b :: $(basename "$dex") :: $(stat -c%s "$dex")" >> artifacts/dex-inventory.txt
+              h="$(strings -a "$dex" | grep -Eai "$PAT" | sort -u || true)"
+              [ -z "$h" ] || { echo "===== $b :: $(basename "$dex") ====="; echo "$h"; } >> artifacts/dex-hits.txt
+              if strings -a "$dex" | grep -Eq "$EXACT"; then
+                echo "$apk" >> artifacts/exact-class-apks.txt
+                echo "EXACT_CLASS_DEX=$dex" >> artifacts/exact-class-apks.txt
               fi
             done
-            rm -rf "$tmp"
-            [ "$hit" -eq 1 ] && echo "$apk" >> artifacts/matching-apks.txt
-            [ "$strong" -eq 1 ] && echo "$apk" >> artifacts/strong-matching-apks.txt
-          done
+          done < <(find /tmp/kwai-package -type f -name '*.apk' -print0)
 
-          echo '--- AAB split inventory ---'
-          cat artifacts/aab-count.txt
-          cat artifacts/downloaded.txt
-          echo '--- strong matching APKs ---'
-          cat artifacts/strong-matching-apks.txt || true
-          echo '--- class hits ---'
-          head -n 1800 artifacts/class-hits.txt || true
-          echo '--- manifest hits ---'
-          head -n 1000 artifacts/manifest-hits.txt || true
-          echo '--- route hits ---'
-          head -n 1200 artifacts/route-hits.txt || true
+          sort -u artifacts/exact-class-apks.txt -o artifacts/exact-class-apks.txt
+          echo '--- exact implementation APKs ---'; cat artifacts/exact-class-apks.txt || true
+          echo '--- strongest DEX hits ---'; grep -Eai -C 3 'PhoneAccountActivityV2|PhoneVerifyActivity|ForcePhoneRegisterActivity|CommonLoginActivity|AutoLoginActivity|userlogin' artifacts/dex-hits.txt | head -n 1600 || true
+          echo '--- package/version ---'; grep -E "package: name='com.kwai.video'|versionCode=|versionName=" artifacts/badging.txt | head -n 30 || true
 
-      - name: Decompile auth-bearing splits and trace callers
+      - name: Extract exact login-class neighborhood when present
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL --retry 4 --retry-delay 2 \
-            'https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip' \
-            -o /tmp/jadx.zip
-          unzip -q /tmp/jadx.zip -d /tmp/jadx
-          /tmp/jadx/bin/jadx --version | tee artifacts/jadx-version.txt
-
           python3 - <<'PY'
           from pathlib import Path
           import re, subprocess
-
-          strong=Path('artifacts/strong-matching-apks.txt')
-          apks=[Path(x.strip()) for x in strong.read_text(errors='ignore').splitlines() if x.strip()] if strong.exists() else []
-          if not apks:
-              m=Path('artifacts/matching-apks.txt')
-              apks=[Path(x.strip()) for x in m.read_text(errors='ignore').splitlines() if x.strip()] if m.exists() else []
-          apks=apks[:12]
-
-          needles=[
-              'PhoneAccountActivityV2','PhoneAccountActivity','PhoneVerifyActivity','ForcePhoneRegisterActivity',
-              'CommonLoginActivity','AutoLoginActivity','TinyLoginActivity','TinyLoginPluginImpl','ITinyLoginPlugin',
-              'arg_tiny_login_source','PHONE_NUMBER_LOGIN_PAGE','PHONE_LOGIN_NEW','CLICK_PHONE_LOGIN',
-              'INPUT_PHONE_NUMBER_IN_LOGIN_PROCESS','UNIFIED_SIGNUP_LOGIN','FORCE_SIGNUP_LOGIN',
-              'SIGNUP_PHONE','PURE_PHONE_QUICK_LOGIN','userlogin','phoneLogin','phone_login','mobileLogin',
-              'getLoginIntent','buildLoginIntent'
+          pats=[
+            b'Lcom/yxcorp/gifshow/login/PhoneAccountActivityV2;',
+            b'Lcom/yxcorp/gifshow/login/PhoneVerifyActivity;',
+            b'Lcom/yxcorp/gifshow/login/ForcePhoneRegisterActivity;',
+            b'Lcom/yxcorp/gifshow/login/activity/CommonLoginActivity;',
+            b'Lcom/yxcorp/login/userlogin/activity/AutoLoginActivity;'
           ]
-          route_rx=re.compile(r'"([^"\\]*(?:ikwai|kwai|login|phone|signup|auth|account|verify)[^"\\]*)"',re.I)
-          trace=[]; callers=[]; routes=[]; fmap=[]
-
-          for idx,apk in enumerate(apks,1):
-              out=Path(f'/tmp/kwai/decompiled/split-{idx}')
-              proc=subprocess.run(['/tmp/jadx/bin/jadx','--no-res','--show-bad-code','--deobf','-d',str(out),str(apk)],
-                                  text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-              fmap.append(f'{idx}\t{apk.name}\trc={proc.returncode}')
-              src=out/'sources'
-              if not src.exists(): continue
-              for p in src.rglob('*.java'):
-                  try:s=p.read_text(errors='ignore')
-                  except Exception:continue
-                  found=[n for n in needles if n in s]
-                  if not found: continue
-                  rel=f'{apk.name}::{p.relative_to(src)}'
-                  lines=s.splitlines()
-                  trace.append(f'===== {rel} | {found} =====')
-                  idxs=[i for i,l in enumerate(lines) if any(n in l for n in found)]
-                  ranges=[]
-                  for i in idxs:
-                      a=max(0,i-24); b=min(len(lines),i+50)
-                      if ranges and a<=ranges[-1][1]+4: ranges[-1]=(ranges[-1][0],max(ranges[-1][1],b))
-                      else:ranges.append((a,b))
-                  for a,b in ranges:
-                      for j in range(a,b): trace.append(f'{j+1}: {lines[j]}')
-                      trace.append('---')
-
-                  if ('ITinyLoginPlugin' in s or 'TinyLoginActivity' in s or 'arg_tiny_login_source' in s or
-                      'PhoneAccountActivity' in s or 'userlogin' in s):
-                      callers.append(f'===== {rel} =====')
-                      for i,l in enumerate(lines):
-                          if ('ITinyLoginPlugin' in l or 'TinyLoginActivity' in l or 'arg_tiny_login_source' in l or
-                              'PhoneAccountActivity' in l or 'userlogin' in l or re.search(r'\.login\s*\(',l)):
-                              a=max(0,i-14); b=min(len(lines),i+28)
-                              for j in range(a,b): callers.append(f'{j+1}: {lines[j]}')
-                              callers.append('---')
-
-                  for m in route_rx.finditer(s):
-                      val=m.group(1)
-                      if len(val)<280: routes.append(f'{rel}: {val}')
-
-          Path('artifacts/decompiled-map.txt').write_text('\n'.join(fmap)+'\n',encoding='utf-8')
-          Path('artifacts/phone-login-code-trace.txt').write_text('\n'.join(trace),encoding='utf-8')
-          Path('artifacts/phone-login-callers.txt').write_text('\n'.join(callers),encoding='utf-8')
-          Path('artifacts/phone-login-route-literals.txt').write_text('\n'.join(dict.fromkeys(routes)),encoding='utf-8')
-          print('candidate_apks=',len(apks))
-          print('trace_lines=',len(trace))
-          print('caller_lines=',len(callers))
-          print('route_literals=',len(routes))
+          out=[]
+          for dex in Path('/tmp/dex').rglob('classes*.dex'):
+              data=dex.read_bytes()
+              if not any(p in data for p in pats): continue
+              ss=subprocess.run(['strings','-a',str(dex)],text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL).stdout.splitlines()
+              out.append(f'===== {dex} =====')
+              rx=re.compile(r'PhoneAccount|PhoneVerify|ForcePhone|CommonLogin|AutoLogin|userlogin|phone.{0,30}login|login.{0,30}phone|kwai://|ikwai://|route|router|source|loginType',re.I)
+              hits=[(i,s) for i,s in enumerate(ss) if rx.search(s)]
+              used=set()
+              for i,s in hits:
+                  for j in range(max(0,i-4),min(len(ss),i+5)):
+                      if j not in used: out.append(f'{j}: {ss[j]}'); used.add(j)
+                  out.append('---')
+          Path('artifacts/exact-login-neighborhood.txt').write_text('\n'.join(out),encoding='utf-8')
+          print('neighborhood_lines=',len(out))
           PY
-
-          echo '--- decompiled map ---'
-          cat artifacts/decompiled-map.txt || true
-          echo '--- phone/login code trace ---'
-          grep -Eai -C 14 'PhoneAccountActivity|PhoneVerifyActivity|ForcePhoneRegisterActivity|AutoLoginActivity|TinyLoginActivity|arg_tiny_login_source|PHONE_NUMBER_LOGIN_PAGE|CLICK_PHONE_LOGIN|UNIFIED_SIGNUP_LOGIN|userlogin|buildLoginIntent' artifacts/phone-login-code-trace.txt | head -n 2600 || true
-          echo '--- callers ---'
-          head -n 2200 artifacts/phone-login-callers.txt || true
-          echo '--- route literals ---'
-          grep -Eai 'ikwai|kwai|login|phone|signup|auth|account|verify' artifacts/phone-login-route-literals.txt | head -n 1400 || true
+          head -n 2400 artifacts/exact-login-neighborhood.txt || true
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: kwai-aab-phone-class-map-${{ github.run_id }}
+          name: kwai-complete-bundle-phone-map-${{ github.run_id }}
           path: artifacts/
           if-no-files-found: error
           retention-days: 1
